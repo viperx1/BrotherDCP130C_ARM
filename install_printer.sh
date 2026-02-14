@@ -313,6 +313,26 @@ extract_and_modify_drivers() {
     # Modify control files to remove architecture restrictions
     sed -i 's/Architecture: .*/Architecture: all/' lpr_extract/DEBIAN/control
     sed -i 's/Architecture: .*/Architecture: all/' cups_extract/DEBIAN/control
+    
+    # Remove the placeholder CONFLICT_PACKAGE from CUPS wrapper control
+    sed -i '/^Conflicts: CONFLICT_PACKAGE$/d' cups_extract/DEBIAN/control
+    
+    # Fix maintainer scripts that reference /etc/init.d/lpd which doesn't
+    # exist on modern systems and causes "Permission denied" errors.
+    # Replace calls to /etc/init.d/lpd with a harmless no-op.
+    for script_dir in lpr_extract/DEBIAN cups_extract/DEBIAN; do
+        for script in preinst postinst prerm postrm; do
+            if [[ -f "$script_dir/$script" ]]; then
+                if grep -q '/etc/init.d/lpd' "$script_dir/$script"; then
+                    log_debug "Patching $script_dir/$script: removing /etc/init.d/lpd references"
+                    sed -i 's|/etc/init.d/lpd|/bin/true|g' "$script_dir/$script"
+                fi
+                # Ensure script is executable
+                chmod 755 "$script_dir/$script"
+            fi
+        done
+    done
+    
     log_debug "LPR control after modification:"
     log_debug "$(cat lpr_extract/DEBIAN/control)"
     log_debug "CUPS wrapper control after modification:"
@@ -338,17 +358,27 @@ repackage_drivers() {
 install_drivers() {
     log_info "Installing printer drivers..."
     
+    # Clean up any broken dpkg state from previous failed installs
+    if dpkg -s dcp130clpr &>/dev/null && dpkg -s dcp130clpr 2>/dev/null | grep -q "needs to be reinstalled\|half-installed\|half-configured"; then
+        log_warn "Cleaning up broken dcp130clpr package state from previous install..."
+        sudo dpkg --remove --force-remove-reinstreq dcp130clpr 2>/dev/null || true
+    fi
+    if dpkg -s dcp130ccupswrapper &>/dev/null && dpkg -s dcp130ccupswrapper 2>/dev/null | grep -q "needs to be reinstalled\|half-installed\|half-configured"; then
+        log_warn "Cleaning up broken dcp130ccupswrapper package state from previous install..."
+        sudo dpkg --remove --force-remove-reinstreq dcp130ccupswrapper 2>/dev/null || true
+    fi
+    
     # Install LPR driver
     log_info "Installing LPR driver..."
     log_debug "LPR package: $(ls -lh dcp130clpr_arm.deb)"
-    if ! sudo dpkg -i --force-architecture dcp130clpr_arm.deb; then
+    if ! sudo dpkg -i --force-all dcp130clpr_arm.deb; then
         log_warn "LPR driver installation reported errors, attempting to fix dependencies..."
     fi
     
     # Install CUPS wrapper driver
     log_info "Installing CUPS wrapper driver..."
     log_debug "CUPS wrapper package: $(ls -lh dcp130ccupswrapper_arm.deb)"
-    if ! sudo dpkg -i --force-architecture dcp130ccupswrapper_arm.deb; then
+    if ! sudo dpkg -i --force-all dcp130ccupswrapper_arm.deb; then
         log_warn "CUPS wrapper driver installation reported errors, attempting to fix dependencies..."
     fi
     
@@ -408,14 +438,120 @@ configure_printer() {
         sudo lpadmin -x "$PRINTER_NAME"
     }
     
-    # Check for PPD file
-    local ppd_file="/usr/share/cups/model/Brother/brother_dcp130c_printer_en.ppd"
-    log_debug "Looking for PPD file: $ppd_file"
-    if [[ -f "$ppd_file" ]]; then
-        log_debug "PPD file found: $(ls -lh "$ppd_file")"
-    else
-        log_warn "PPD file not found at $ppd_file"
-        log_debug "Available Brother PPDs: $(find /usr/share/cups/model/ -iname '*brother*' 2>/dev/null || echo 'none')"
+    # Search for PPD file in common locations
+    local ppd_file=""
+    local ppd_search_paths=(
+        "/usr/share/cups/model/Brother/brother_dcp130c_printer_en.ppd"
+        "/usr/share/cups/model/brother_dcp130c_printer_en.ppd"
+    )
+    
+    # Also search dynamically
+    log_debug "Searching for DCP-130C PPD files..."
+    local found_ppd
+    found_ppd=$(find /usr/share/cups/model/ /usr/share/ppd/ /opt/brother/ -iname '*dcp130c*.ppd' 2>/dev/null | head -n 1)
+    if [[ -n "$found_ppd" ]]; then
+        ppd_search_paths=("$found_ppd" "${ppd_search_paths[@]}")
+    fi
+    
+    for path in "${ppd_search_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            ppd_file="$path"
+            log_debug "PPD file found: $(ls -lh "$ppd_file")"
+            break
+        fi
+    done
+    
+    # Check if we also have a PPD via lpinfo -m (CUPS driver list)
+    if [[ -z "$ppd_file" ]]; then
+        log_debug "No PPD file found on disk, checking CUPS driver list..."
+        local cups_driver
+        cups_driver=$(lpinfo -m 2>/dev/null | grep -i "dcp.*130c\|DCP-130C" | awk '{print $1}' | head -n 1)
+        if [[ -n "$cups_driver" ]]; then
+            log_info "Found CUPS driver: $cups_driver"
+            log_info "Adding printer to CUPS using driver..."
+            log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -m $cups_driver -E -o printer-is-shared=false"
+            sudo lpadmin -p "$PRINTER_NAME" \
+                -v "$PRINTER_URI" \
+                -m "$cups_driver" \
+                -E \
+                -o printer-is-shared=false
+            
+            sudo lpadmin -d "$PRINTER_NAME"
+            sudo cupsenable "$PRINTER_NAME"
+            sudo cupsaccept "$PRINTER_NAME"
+            log_info "Printer configured successfully."
+            return
+        fi
+    fi
+    
+    if [[ -z "$ppd_file" ]]; then
+        log_warn "PPD file not found. Generating a basic PPD for Brother DCP-130C..."
+        ppd_file=$(mktemp /tmp/brother_dcp130c.XXXXXX.ppd)
+        cat > "$ppd_file" << 'PPEOF'
+*PPD-Adobe: "4.3"
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "DCP130C.PPD"
+*Manufacturer: "Brother"
+*Product: "(Brother DCP-130C)"
+*ModelName: "Brother DCP-130C"
+*ShortNickName: "Brother DCP-130C"
+*NickName: "Brother DCP-130C"
+*PSVersion: "(3010.000) 550"
+*LanguageLevel: "3"
+*ColorDevice: True
+*DefaultColorSpace: RGB
+*FileSystem: False
+*Throughput: "12"
+*LandscapeOrientation: Plus90
+*TTRasterizer: Type42
+*cupsFilter: "application/vnd.cups-raster 0 brlpdwrapperdcp130c"
+*cupsModelNumber: 0
+
+*OpenUI *PageSize/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: Letter
+*PageSize Letter/US Letter: "<</PageSize[612 792]>>setpagedevice"
+*PageSize A4/A4: "<</PageSize[595 842]>>setpagedevice"
+*PageSize Legal/US Legal: "<</PageSize[612 1008]>>setpagedevice"
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: Letter
+*PageRegion Letter/US Letter: "<</PageRegion[612 792]>>setpagedevice"
+*PageRegion A4/A4: "<</PageRegion[595 842]>>setpagedevice"
+*PageRegion Legal/US Legal: "<</PageRegion[612 1008]>>setpagedevice"
+*CloseUI: *PageRegion
+
+*DefaultImageableArea: Letter
+*ImageableArea Letter/US Letter: "18 18 594 774"
+*ImageableArea A4/A4: "18 18 577 824"
+*ImageableArea Legal/US Legal: "18 18 594 990"
+
+*DefaultPaperDimension: Letter
+*PaperDimension Letter/US Letter: "612 792"
+*PaperDimension A4/A4: "595 842"
+*PaperDimension Legal/US Legal: "612 1008"
+
+*OpenUI *Resolution/Resolution: PickOne
+*OrderDependency: 20 AnySetup *Resolution
+*DefaultResolution: 600dpi
+*Resolution 300dpi/300 DPI: "<</HWResolution[300 300]>>setpagedevice"
+*Resolution 600dpi/600 DPI: "<</HWResolution[600 600]>>setpagedevice"
+*Resolution 1200dpi/1200 DPI: "<</HWResolution[1200 1200]>>setpagedevice"
+*CloseUI: *Resolution
+
+*OpenUI *ColorModel/Color Mode: PickOne
+*OrderDependency: 10 AnySetup *ColorModel
+*DefaultColorModel: RGB
+*ColorModel RGB/Color: "<</cupsColorOrder 0/cupsColorSpace 1/cupsCompression 1/cupsBitsPerColor 8>>setpagedevice"
+*ColorModel Gray/Grayscale: "<</cupsColorOrder 0/cupsColorSpace 0/cupsCompression 1/cupsBitsPerColor 8>>setpagedevice"
+*CloseUI: *ColorModel
+PPEOF
+        log_debug "Generated basic PPD at $ppd_file"
     fi
     
     # Add the printer
