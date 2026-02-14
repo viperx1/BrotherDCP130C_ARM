@@ -114,11 +114,17 @@ download_drivers() {
     
     # Download LPR driver
     log_info "Downloading LPR driver..."
-    wget -O dcp130clpr.deb "$DRIVER_LPR_URL"
+    wget --secure-protocol=auto --https-only -O dcp130clpr.deb "$DRIVER_LPR_URL" || {
+        log_error "Failed to download LPR driver. Please check your internet connection."
+        exit 1
+    }
     
     # Download CUPS wrapper driver
     log_info "Downloading CUPS wrapper driver..."
-    wget -O dcp130ccupswrapper.deb "$DRIVER_CUPS_URL"
+    wget --secure-protocol=auto --https-only -O dcp130ccupswrapper.deb "$DRIVER_CUPS_URL" || {
+        log_error "Failed to download CUPS wrapper driver. Please check your internet connection."
+        exit 1
+    }
     
     log_info "Drivers downloaded successfully."
 }
@@ -283,8 +289,13 @@ EOF
 cleanup() {
     log_info "Cleaning up temporary files..."
     cd ~
-    rm -rf "$TMP_DIR"
-    log_info "Cleanup complete."
+    # Safety check: only remove if TMP_DIR is set and not empty
+    if [[ -n "$TMP_DIR" && "$TMP_DIR" != "/" ]]; then
+        rm -rf "$TMP_DIR"
+        log_info "Cleanup complete."
+    else
+        log_warn "Skipping cleanup: TMP_DIR not properly set."
+    fi
 }
 
 # Display printer information
