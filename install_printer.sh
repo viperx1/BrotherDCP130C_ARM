@@ -76,15 +76,42 @@ check_architecture() {
     fi
 }
 
+# Check if a package (or its t64 variant) is already installed.
+# Returns 0 if installed, 1 otherwise. Prints the installed package name.
+is_package_installed() {
+    local pkg="$1"
+    if dpkg -s "$pkg" &>/dev/null; then
+        log_debug "is_package_installed: '$pkg' is installed"
+        echo "$pkg"
+        return 0
+    fi
+    local t64_pkg="${pkg}t64"
+    if dpkg -s "$t64_pkg" &>/dev/null; then
+        log_debug "is_package_installed: '$t64_pkg' is installed (t64 variant of '$pkg')"
+        echo "$t64_pkg"
+        return 0
+    fi
+    log_debug "is_package_installed: '$pkg' is NOT installed"
+    return 1
+}
+
 # Resolve a package name, preferring the original but falling back to the t64 variant.
 # On newer Debian/Raspbian (trixie+), some libraries were renamed with a t64 suffix
 # (e.g. libcups2 -> libcups2t64). This function detects which variant is available.
+# It first checks if the package is already installed, then falls back to apt-cache.
 resolve_package() {
     local pkg="$1"
+    local installed
+    # Check if already installed (original or t64 variant)
+    if installed=$(is_package_installed "$pkg"); then
+        log_debug "resolve_package: '$pkg' already installed as '$installed'"
+        echo "$installed"
+        return
+    fi
+    # Not installed - check which variant is available in apt
     local policy
     local candidate
-    # Check if the original package has an installable candidate
-    log_debug "resolve_package: checking original package '$pkg'"
+    log_debug "resolve_package: checking apt for '$pkg'"
     policy=$(apt-cache policy "$pkg" 2>/dev/null)
     candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
     log_debug "resolve_package: '$pkg' candidate='$candidate'"
@@ -116,23 +143,35 @@ install_dependencies() {
     log_debug "Running apt-get update..."
     sudo apt-get update
     
+    # Detect CUPS status
+    if command -v systemctl &>/dev/null && systemctl is-active cups &>/dev/null; then
+        log_info "CUPS is already running on this system."
+        log_debug "CUPS version: $(cups-config --version 2>/dev/null || dpkg -s cups 2>/dev/null | awk '/^Version:/ {print $2}' || echo 'unknown')"
+    fi
+    
     # Resolve library package names that may differ across Debian/Raspbian versions
-    log_debug "Resolving library package names..."
+    # On trixie+, libcups2 -> libcups2t64, libcupsimage2 -> libcupsimage2t64
+    log_info "Detecting correct package names for this system..."
     LIBCUPS=$(resolve_package "libcups2")
     LIBCUPSIMAGE=$(resolve_package "libcupsimage2")
-    log_info "Using packages: $LIBCUPS, $LIBCUPSIMAGE"
+    log_info "Resolved: libcups2 -> $LIBCUPS, libcupsimage2 -> $LIBCUPSIMAGE"
     
-    # Install CUPS and required tools
-    log_debug "Installing CUPS packages: cups, cups-client, cups-bsd, $LIBCUPS, $LIBCUPSIMAGE, printer-driver-all, psutils, a2ps"
-    sudo apt-get install -y \
-        cups \
-        cups-client \
-        cups-bsd \
-        "$LIBCUPS" \
-        "$LIBCUPSIMAGE" \
-        printer-driver-all \
-        psutils \
+    # Build list of packages to install
+    local packages=(
+        cups
+        cups-client
+        cups-bsd
+        "$LIBCUPS"
+        "$LIBCUPSIMAGE"
+        printer-driver-all
+        psutils
         a2ps
+    )
+
+    log_debug "Final package list: ${packages[*]}"
+
+    # Install CUPS and required tools
+    sudo apt-get install -y "${packages[@]}"
     
     # Try to install 32-bit libraries (may not be available on all ARM systems)
     sudo apt-get install -y \
