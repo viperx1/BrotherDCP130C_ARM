@@ -7,10 +7,19 @@
 
 set -e  # Exit on error
 
+# Enable debug mode via --debug flag or DEBUG=1 environment variable
+DEBUG="${DEBUG:-0}"
+for arg in "$@"; do
+    if [[ "$arg" == "--debug" ]]; then
+        DEBUG=1
+    fi
+done
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Logging functions
@@ -26,6 +35,12 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+log_debug() {
+    if [[ "$DEBUG" == "1" ]]; then
+        echo -e "${CYAN}[DEBUG]${NC} $1" >&2
+    fi
+}
+
 # Variables
 PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
@@ -35,6 +50,7 @@ DRIVER_CUPS_URL="https://download.brother.com/welcome/dlf006648/dcp130ccupswrapp
 
 # Check if running as root
 check_root() {
+    log_debug "EUID=$EUID, USER=$USER"
     if [[ $EUID -eq 0 ]]; then
         log_warn "Running as root. This is recommended for installation."
     else
@@ -47,6 +63,8 @@ check_architecture() {
     log_info "Checking system architecture..."
     ARCH=$(uname -m)
     log_info "Detected architecture: $ARCH"
+    log_debug "Kernel: $(uname -r)"
+    log_debug "OS: $(grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null | tr '\n' ' ')"
     
     if [[ "$ARCH" != "armv7l" && "$ARCH" != "armv6l" && "$ARCH" != "aarch64" ]]; then
         log_warn "This script is designed for ARM architecture (Raspberry Pi). Detected: $ARCH"
@@ -64,22 +82,30 @@ check_architecture() {
 resolve_package() {
     local pkg="$1"
     local policy
+    local candidate
     # Check if the original package has an installable candidate
+    log_debug "resolve_package: checking original package '$pkg'"
     policy=$(apt-cache policy "$pkg" 2>/dev/null)
-    if echo "$policy" | grep -q "Candidate:" && \
-       ! echo "$policy" | grep -q "Candidate: (none)"; then
+    candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
+    log_debug "resolve_package: '$pkg' candidate='$candidate'"
+    if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
+        log_debug "resolve_package: resolved '$pkg' -> '$pkg'"
         echo "$pkg"
         return
     fi
     # Try the t64 variant
     local t64_pkg="${pkg}t64"
+    log_debug "resolve_package: trying t64 variant '$t64_pkg'"
     policy=$(apt-cache policy "$t64_pkg" 2>/dev/null)
-    if echo "$policy" | grep -q "Candidate:" && \
-       ! echo "$policy" | grep -q "Candidate: (none)"; then
+    candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
+    log_debug "resolve_package: '$t64_pkg' candidate='$candidate'"
+    if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
+        log_debug "resolve_package: resolved '$pkg' -> '$t64_pkg'"
         echo "$t64_pkg"
         return
     fi
     # Fall back to the original name and let apt-get report the error
+    log_debug "resolve_package: no candidate found, falling back to '$pkg'"
     echo "$pkg"
 }
 
@@ -87,14 +113,17 @@ resolve_package() {
 install_dependencies() {
     log_info "Installing required dependencies..."
     
+    log_debug "Running apt-get update..."
     sudo apt-get update
     
     # Resolve library package names that may differ across Debian/Raspbian versions
+    log_debug "Resolving library package names..."
     LIBCUPS=$(resolve_package "libcups2")
     LIBCUPSIMAGE=$(resolve_package "libcupsimage2")
     log_info "Using packages: $LIBCUPS, $LIBCUPSIMAGE"
     
     # Install CUPS and required tools
+    log_debug "Installing CUPS packages: cups, cups-client, cups-bsd, $LIBCUPS, $LIBCUPSIMAGE, printer-driver-all, psutils, a2ps"
     sudo apt-get install -y \
         cups \
         cups-client \
@@ -120,11 +149,14 @@ setup_cups_service() {
     
     sudo systemctl enable cups
     sudo systemctl start cups
+    log_debug "CUPS service status: $(systemctl is-active cups 2>/dev/null || echo 'unknown')"
     
     # Add user to lpadmin group if not already
-    if ! groups $USER | grep -q lpadmin; then
-        sudo usermod -a -G lpadmin $USER
+    if ! groups "$USER" | grep -q lpadmin; then
+        sudo usermod -a -G lpadmin "$USER"
         log_info "Added $USER to lpadmin group. You may need to log out and back in for this to take effect."
+    else
+        log_debug "User $USER is already in lpadmin group"
     fi
     
     log_info "CUPS service is running."
@@ -144,17 +176,21 @@ download_drivers() {
     
     # Download LPR driver
     log_info "Downloading LPR driver..."
+    log_debug "LPR driver URL: $DRIVER_LPR_URL"
     wget --secure-protocol=auto --https-only -O dcp130clpr.deb "$DRIVER_LPR_URL" || {
         log_error "Failed to download LPR driver. Please check your internet connection."
         exit 1
     }
+    log_debug "LPR driver downloaded: $(ls -lh dcp130clpr.deb)"
     
     # Download CUPS wrapper driver
     log_info "Downloading CUPS wrapper driver..."
+    log_debug "CUPS wrapper URL: $DRIVER_CUPS_URL"
     wget --secure-protocol=auto --https-only -O dcp130ccupswrapper.deb "$DRIVER_CUPS_URL" || {
         log_error "Failed to download CUPS wrapper driver. Please check your internet connection."
         exit 1
     }
+    log_debug "CUPS wrapper downloaded: $(ls -lh dcp130ccupswrapper.deb)"
     
     log_info "Drivers downloaded successfully."
 }
@@ -170,15 +206,23 @@ extract_and_modify_drivers() {
     log_info "Extracting LPR driver..."
     dpkg-deb -x dcp130clpr.deb lpr_extract/
     dpkg-deb -e dcp130clpr.deb lpr_extract/DEBIAN
+    log_debug "LPR control before modification:"
+    log_debug "$(cat lpr_extract/DEBIAN/control)"
     
     # Extract CUPS wrapper driver
     log_info "Extracting CUPS wrapper driver..."
     dpkg-deb -x dcp130ccupswrapper.deb cups_extract/
     dpkg-deb -e dcp130ccupswrapper.deb cups_extract/DEBIAN
+    log_debug "CUPS wrapper control before modification:"
+    log_debug "$(cat cups_extract/DEBIAN/control)"
     
     # Modify control files to remove architecture restrictions
     sed -i 's/Architecture: .*/Architecture: all/' lpr_extract/DEBIAN/control
     sed -i 's/Architecture: .*/Architecture: all/' cups_extract/DEBIAN/control
+    log_debug "LPR control after modification:"
+    log_debug "$(cat lpr_extract/DEBIAN/control)"
+    log_debug "CUPS wrapper control after modification:"
+    log_debug "$(cat cups_extract/DEBIAN/control)"
     
     log_info "Drivers prepared for ARM installation."
 }
@@ -202,17 +246,20 @@ install_drivers() {
     
     # Install LPR driver
     log_info "Installing LPR driver..."
+    log_debug "LPR package: $(ls -lh dcp130clpr_arm.deb)"
     if ! sudo dpkg -i --force-architecture dcp130clpr_arm.deb; then
         log_warn "LPR driver installation reported errors, attempting to fix dependencies..."
     fi
     
     # Install CUPS wrapper driver
     log_info "Installing CUPS wrapper driver..."
+    log_debug "CUPS wrapper package: $(ls -lh dcp130ccupswrapper_arm.deb)"
     if ! sudo dpkg -i --force-architecture dcp130ccupswrapper_arm.deb; then
         log_warn "CUPS wrapper driver installation reported errors, attempting to fix dependencies..."
     fi
     
     # Fix any dependency issues
+    log_debug "Running apt-get install -f to fix dependencies..."
     sudo apt-get install -f -y || true
     
     log_info "Drivers installed successfully."
@@ -222,6 +269,9 @@ install_drivers() {
 detect_printer() {
     log_info "Detecting Brother DCP-130C printer..."
     
+    log_debug "USB devices:"
+    log_debug "$(lsusb 2>/dev/null || echo 'lsusb not available')"
+    
     # Check USB connection
     if lsusb | grep -i "Brother"; then
         log_info "Brother printer detected on USB."
@@ -229,6 +279,9 @@ detect_printer() {
     else
         log_warn "Brother printer not detected on USB. Please ensure the printer is connected and powered on."
     fi
+    
+    log_debug "CUPS backends:"
+    log_debug "$(lpinfo -v 2>/dev/null || echo 'lpinfo not available')"
     
     # Check printer device
     if lpinfo -v | grep -i "Brother"; then
@@ -245,6 +298,7 @@ configure_printer() {
     
     # Get the printer URI
     PRINTER_URI=$(lpinfo -v | grep -i "Brother.*DCP-130C" | awk '{print $2}' | head -n 1)
+    log_debug "Auto-detected printer URI: '${PRINTER_URI:-<empty>}'"
     
     if [[ -z "$PRINTER_URI" ]]; then
         log_warn "Could not auto-detect printer URI. Using default USB URI."
@@ -256,14 +310,26 @@ configure_printer() {
     # Remove existing printer if it exists
     lpstat -p "$PRINTER_NAME" &>/dev/null && {
         log_info "Removing existing printer configuration..."
+        log_debug "Removing printer: $PRINTER_NAME"
         sudo lpadmin -x "$PRINTER_NAME"
     }
     
+    # Check for PPD file
+    local ppd_file="/usr/share/cups/model/Brother/brother_dcp130c_printer_en.ppd"
+    log_debug "Looking for PPD file: $ppd_file"
+    if [[ -f "$ppd_file" ]]; then
+        log_debug "PPD file found: $(ls -lh "$ppd_file")"
+    else
+        log_warn "PPD file not found at $ppd_file"
+        log_debug "Available Brother PPDs: $(find /usr/share/cups/model/ -iname '*brother*' 2>/dev/null || echo 'none')"
+    fi
+    
     # Add the printer
     log_info "Adding printer to CUPS..."
+    log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -P $ppd_file -E -o printer-is-shared=false"
     sudo lpadmin -p "$PRINTER_NAME" \
         -v "$PRINTER_URI" \
-        -P /usr/share/cups/model/Brother/brother_dcp130c_printer_en.ppd \
+        -P "$ppd_file" \
         -E \
         -o printer-is-shared=false
     
@@ -349,6 +415,13 @@ display_info() {
 # Main installation process
 main() {
     log_info "Starting Brother DCP-130C printer driver installation..."
+    if [[ "$DEBUG" == "1" ]]; then
+        log_debug "Debug mode is active"
+        log_debug "Script: $0"
+        log_debug "Date: $(date)"
+        log_debug "Shell: $BASH_VERSION"
+        log_debug "System: $(uname -a)"
+    fi
     echo
     
     check_root
