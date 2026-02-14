@@ -47,23 +47,24 @@ PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
 
 # Driver filenames
-DRIVER_LPR_FILE="dcp130clpr-1.1.2-1.i386.deb"
-DRIVER_CUPS_FILE="dcp130ccupswrapper-1.1.2-1.i386.deb"
+DRIVER_LPR_FILE="dcp130clpr-1.0.1-1.i386.deb"
+DRIVER_CUPS_FILE="dcp130ccupswrapper-1.0.1-1.i386.deb"
 
 # Multiple download sources (tried in order). Brother has moved files across
 # domains over the years, so we try several known locations plus the
 # Internet Archive as a last resort.
+# The dlf number is Brother's internal download file ID.
 DRIVER_LPR_URLS=(
-    "https://download.brother.com/welcome/dlf006646/${DRIVER_LPR_FILE}"
-    "http://download.brother.com/welcome/dlf006646/${DRIVER_LPR_FILE}"
+    "https://download.brother.com/welcome/dlf005579/${DRIVER_LPR_FILE}"
+    "http://download.brother.com/welcome/dlf005579/${DRIVER_LPR_FILE}"
     "http://www.brother.com/pub/bsc/linux/dlf/${DRIVER_LPR_FILE}"
-    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf006646/${DRIVER_LPR_FILE}"
+    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf005579/${DRIVER_LPR_FILE}"
 )
 DRIVER_CUPS_URLS=(
-    "https://download.brother.com/welcome/dlf006648/${DRIVER_CUPS_FILE}"
-    "http://download.brother.com/welcome/dlf006648/${DRIVER_CUPS_FILE}"
+    "https://download.brother.com/welcome/dlf005581/${DRIVER_CUPS_FILE}"
+    "http://download.brother.com/welcome/dlf005581/${DRIVER_CUPS_FILE}"
     "http://www.brother.com/pub/bsc/linux/dlf/${DRIVER_CUPS_FILE}"
-    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf006648/${DRIVER_CUPS_FILE}"
+    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf005581/${DRIVER_CUPS_FILE}"
 )
 
 # Check if running as root
