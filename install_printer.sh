@@ -58,19 +58,49 @@ check_architecture() {
     fi
 }
 
+# Resolve a package name, preferring the original but falling back to the t64 variant.
+# On newer Debian/Raspbian (trixie+), some libraries were renamed with a t64 suffix
+# (e.g. libcups2 -> libcups2t64). This function detects which variant is available.
+resolve_package() {
+    local pkg="$1"
+    local policy
+    # Check if the original package has an installable candidate
+    policy=$(apt-cache policy "$pkg" 2>/dev/null)
+    if echo "$policy" | grep -q "Candidate:" && \
+       ! echo "$policy" | grep -q "Candidate: (none)"; then
+        echo "$pkg"
+        return
+    fi
+    # Try the t64 variant
+    local t64_pkg="${pkg}t64"
+    policy=$(apt-cache policy "$t64_pkg" 2>/dev/null)
+    if echo "$policy" | grep -q "Candidate:" && \
+       ! echo "$policy" | grep -q "Candidate: (none)"; then
+        echo "$t64_pkg"
+        return
+    fi
+    # Fall back to the original name and let apt-get report the error
+    echo "$pkg"
+}
+
 # Install required dependencies
 install_dependencies() {
     log_info "Installing required dependencies..."
     
     sudo apt-get update
     
+    # Resolve library package names that may differ across Debian/Raspbian versions
+    LIBCUPS=$(resolve_package "libcups2")
+    LIBCUPSIMAGE=$(resolve_package "libcupsimage2")
+    log_info "Using packages: $LIBCUPS, $LIBCUPSIMAGE"
+    
     # Install CUPS and required tools
     sudo apt-get install -y \
         cups \
         cups-client \
         cups-bsd \
-        libcups2 \
-        libcupsimage2 \
+        "$LIBCUPS" \
+        "$LIBCUPSIMAGE" \
         printer-driver-all \
         psutils \
         a2ps
