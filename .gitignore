@@ -1,0 +1,19 @@
+# Temporary files
+/tmp/
+*.tmp
+*.log
+
+# Debian packages
+*.deb
+
+# Extract directories
+*_extract/
+
+# Backup files
+*~
+*.bak
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
