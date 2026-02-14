@@ -45,8 +45,26 @@ log_debug() {
 PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
-DRIVER_LPR_URL="https://download.brother.com/welcome/dlf006646/dcp130clpr-1.1.2-1.i386.deb"
-DRIVER_CUPS_URL="https://download.brother.com/welcome/dlf006648/dcp130ccupswrapper-1.1.2-1.i386.deb"
+
+# Driver filenames
+DRIVER_LPR_FILE="dcp130clpr-1.1.2-1.i386.deb"
+DRIVER_CUPS_FILE="dcp130ccupswrapper-1.1.2-1.i386.deb"
+
+# Multiple download sources (tried in order). Brother has moved files across
+# domains over the years, so we try several known locations plus the
+# Internet Archive as a last resort.
+DRIVER_LPR_URLS=(
+    "https://download.brother.com/welcome/dlf006646/${DRIVER_LPR_FILE}"
+    "http://download.brother.com/welcome/dlf006646/${DRIVER_LPR_FILE}"
+    "http://www.brother.com/pub/bsc/linux/dlf/${DRIVER_LPR_FILE}"
+    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf006646/${DRIVER_LPR_FILE}"
+)
+DRIVER_CUPS_URLS=(
+    "https://download.brother.com/welcome/dlf006648/${DRIVER_CUPS_FILE}"
+    "http://download.brother.com/welcome/dlf006648/${DRIVER_CUPS_FILE}"
+    "http://www.brother.com/pub/bsc/linux/dlf/${DRIVER_CUPS_FILE}"
+    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf006648/${DRIVER_CUPS_FILE}"
+)
 
 # Check if running as root
 check_root() {
@@ -209,26 +227,62 @@ create_temp_dir() {
     log_info "Working directory: $TMP_DIR"
 }
 
+# Try downloading a file from multiple URLs until one succeeds.
+# Usage: try_download output_file url1 url2 url3 ...
+# Returns 0 on success, 1 if all URLs fail.
+try_download() {
+    local output_file="$1"
+    shift
+    local urls=("$@")
+    
+    for url in "${urls[@]}"; do
+        log_debug "Trying download: $url"
+        if wget -q --timeout=30 --tries=2 -O "$output_file" "$url" 2>/dev/null; then
+            # Verify we got an actual file (not an HTML error page)
+            if [[ -s "$output_file" ]] && file "$output_file" | grep -qi "debian\|archive\|data"; then
+                log_info "Downloaded successfully from: $url"
+                return 0
+            fi
+            log_debug "Download from $url succeeded but file appears invalid, trying next..."
+            rm -f "$output_file"
+        else
+            log_debug "Download failed from: $url"
+        fi
+    done
+    
+    return 1
+}
+
 # Download printer drivers
 download_drivers() {
     log_info "Downloading Brother DCP-130C printer drivers..."
     
     # Download LPR driver
-    log_info "Downloading LPR driver..."
-    log_debug "LPR driver URL: $DRIVER_LPR_URL"
-    wget --secure-protocol=auto --https-only -O dcp130clpr.deb "$DRIVER_LPR_URL" || {
-        log_error "Failed to download LPR driver. Please check your internet connection."
+    log_info "Downloading LPR driver (${DRIVER_LPR_FILE})..."
+    log_debug "LPR driver URLs to try: ${DRIVER_LPR_URLS[*]}"
+    if ! try_download dcp130clpr.deb "${DRIVER_LPR_URLS[@]}"; then
+        log_error "Failed to download LPR driver from all sources."
+        log_error "URLs tried:"
+        for url in "${DRIVER_LPR_URLS[@]}"; do
+            log_error "  - $url"
+        done
+        log_error "Please download ${DRIVER_LPR_FILE} manually and place it in ${TMP_DIR}/"
         exit 1
-    }
+    fi
     log_debug "LPR driver downloaded: $(ls -lh dcp130clpr.deb)"
     
     # Download CUPS wrapper driver
-    log_info "Downloading CUPS wrapper driver..."
-    log_debug "CUPS wrapper URL: $DRIVER_CUPS_URL"
-    wget --secure-protocol=auto --https-only -O dcp130ccupswrapper.deb "$DRIVER_CUPS_URL" || {
-        log_error "Failed to download CUPS wrapper driver. Please check your internet connection."
+    log_info "Downloading CUPS wrapper driver (${DRIVER_CUPS_FILE})..."
+    log_debug "CUPS wrapper URLs to try: ${DRIVER_CUPS_URLS[*]}"
+    if ! try_download dcp130ccupswrapper.deb "${DRIVER_CUPS_URLS[@]}"; then
+        log_error "Failed to download CUPS wrapper driver from all sources."
+        log_error "URLs tried:"
+        for url in "${DRIVER_CUPS_URLS[@]}"; do
+            log_error "  - $url"
+        done
+        log_error "Please download ${DRIVER_CUPS_FILE} manually and place it in ${TMP_DIR}/"
         exit 1
-    }
+    fi
     log_debug "CUPS wrapper downloaded: $(ls -lh dcp130ccupswrapper.deb)"
     
     log_info "Drivers downloaded successfully."
