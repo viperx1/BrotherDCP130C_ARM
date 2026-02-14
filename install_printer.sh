@@ -73,10 +73,13 @@ install_dependencies() {
         libcupsimage2 \
         printer-driver-all \
         psutils \
-        a2ps \
+        a2ps
+    
+    # Try to install 32-bit libraries (may not be available on all ARM systems)
+    sudo apt-get install -y \
         lib32gcc-s1 \
         lib32stdc++6 \
-        libc6-i386 2>/dev/null || true
+        libc6-i386 2>/dev/null || log_warn "32-bit libraries not available (not required on ARM)"
     
     log_info "Dependencies installed successfully."
 }
@@ -163,11 +166,15 @@ install_drivers() {
     
     # Install LPR driver
     log_info "Installing LPR driver..."
-    sudo dpkg -i --force-all dcp130clpr_arm.deb || true
+    if ! sudo dpkg -i --force-architecture dcp130clpr_arm.deb; then
+        log_warn "LPR driver installation reported errors, attempting to fix dependencies..."
+    fi
     
     # Install CUPS wrapper driver
     log_info "Installing CUPS wrapper driver..."
-    sudo dpkg -i --force-all dcp130ccupswrapper_arm.deb || true
+    if ! sudo dpkg -i --force-architecture dcp130ccupswrapper_arm.deb; then
+        log_warn "CUPS wrapper driver installation reported errors, attempting to fix dependencies..."
+    fi
     
     # Fix any dependency issues
     sudo apt-get install -f -y || true
@@ -247,7 +254,7 @@ test_print() {
     
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         # Create a simple test page
-        cat > /tmp/test_page.txt << 'EOF'
+        cat > /tmp/test_page.txt << EOF
 Brother DCP-130C Test Page
 ==========================
 
