@@ -361,6 +361,15 @@ setup_cups_service() {
                 echo 'Browsing On' | sudo tee -a "$cupsd_conf" > /dev/null
             fi
 
+            # Advertise shared printers via DNS-SD (mDNS) so they are
+            # discoverable by Android, iOS, macOS and other devices that
+            # use mDNS-based printer discovery.
+            if grep -q '^BrowseLocalProtocols' "$cupsd_conf"; then
+                sudo sed -i 's/^BrowseLocalProtocols .*/BrowseLocalProtocols dnssd/' "$cupsd_conf"
+            else
+                echo 'BrowseLocalProtocols dnssd' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
             # Allow remote access to the printer in the <Location /> block
             # Add "Allow @LOCAL" if not already present so LAN clients can print
             if ! grep -q 'Allow @LOCAL' "$cupsd_conf"; then
@@ -1227,6 +1236,7 @@ display_info() {
         ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
         log_info "Printer sharing: ENABLED"
         log_info "Other devices on the network can discover and use this printer."
+        log_info "Android: The printer will appear automatically in the Default Print Service."
         if [[ -n "$ip_addr" ]]; then
             log_info "CUPS web interface: http://${ip_addr}:631"
         fi

@@ -92,7 +92,12 @@ During installation, the script asks whether you want to share the printer on yo
 - Avahi (mDNS/Bonjour) is installed and enabled so other devices can automatically discover the printer
 - The printer is marked as shared in CUPS
 
-Other computers on the same network (Linux, macOS, Windows) can then discover and add the printer automatically. On macOS, it will appear in **System Settings > Printers & Scanners**. On Linux, it will appear through CUPS browsing. On Windows, it can be added via the CUPS IPP URL (e.g. `http://<raspberry-pi-ip>:631/printers/Brother_DCP_130C`).
+Other devices on the same network can then discover and use the printer automatically:
+
+- **Android**: The printer appears in the built-in **Default Print Service** (no app needed). Open any document, tap **Print**, and select the Brother printer.
+- **macOS / iOS**: It will appear in **System Settings > Printers & Scanners** and in the print dialog.
+- **Linux**: It will appear through CUPS browsing.
+- **Windows**: It can be added via the CUPS IPP URL (e.g. `http://<raspberry-pi-ip>:631/printers/Brother_DCP_130C`).
 
 If you chose **no** during installation, the printer is only available locally on the Raspberry Pi.
 
