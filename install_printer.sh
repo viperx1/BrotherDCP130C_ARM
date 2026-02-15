@@ -1080,6 +1080,11 @@ COLORPATCH
 GSPATCH
             fi
 
+            # Also set pdftops-renderer via lpoptions so cups-filters
+            # receives it as a command-line option (PPD alone is not enough).
+            sudo lpoptions -p "$PRINTER_NAME" -o pdftops-renderer=gs
+            log_debug "lpoptions set: pdftops-renderer=gs"
+
             # Debug: verify options were set
             log_debug "Printer options after configure:"
             log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|pdftops' || echo '<no matching options>')"
@@ -1213,6 +1218,14 @@ GSPATCH
     else
         log_warn "Installed PPD not found at $installed_ppd — pdftops-renderer option not set"
     fi
+
+    # Also set pdftops-renderer via lpoptions so cups-filters receives
+    # it as a command-line option (PPD default alone is not enough —
+    # the pdftops filter reads the option from the CUPS filter args,
+    # and lpoptions writes to /etc/cups/lpoptions which CUPS always
+    # passes to filters).
+    sudo lpoptions -p "$PRINTER_NAME" -o pdftops-renderer=gs
+    log_debug "lpoptions set: pdftops-renderer=gs"
 
     # Debug: verify PPD options are visible to CUPS
     log_debug "Printer options after configure:"
