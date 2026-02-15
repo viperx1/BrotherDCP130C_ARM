@@ -153,9 +153,10 @@ cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupsw
 - Restart CUPS: `sudo systemctl restart cups`
 
 ### Android: color settings ignored
-The script patches the Brother PPD and sets CUPS options so that Android's
-"Black & White" / "Color" choice maps to the printer's ColorModel. If you
-installed before this fix, re-run the installer to apply the updated settings.
+The default PDF-to-PostScript renderer (Poppler) cannot convert to grayscale.
+The script adds `pdftops-renderer=gs` to the installed PPD so Ghostscript is
+used instead, which correctly handles monochrome conversion. If you installed
+before this fix, re-run the installer.
 
 ### Android: "printing service is not enabled" error
 This is caused by a hostname mismatch — Android connects using the
@@ -166,6 +167,12 @@ If the error persists after re-running the installer, verify manually:
 grep 'ServerAlias' /etc/cups/cupsd.conf
 # Should show: ServerAlias *
 ```
+
+### Android: stale/dead printers showing up
+Android caches previously discovered printers. If you see old or dead printer
+entries, clear the Android print service cache:
+
+**Settings → Apps → Default Print Service → Storage → Clear Cache**
 
 ## Technical Details
 

@@ -616,6 +616,17 @@ remove_duplicate_printers() {
     local known_variants=("DCP130C" "dcp130c" "DCP-130C" "Brother-DCP-130C")
     local removed=0
 
+    # Helper: fully remove a printer queue AND its leftover PPD/config
+    # files so CUPS does not re-create it on restart.
+    _remove_printer() {
+        local p="$1"
+        sudo lpadmin -x "$p" 2>/dev/null || true
+        # Remove leftover PPD and config that would cause CUPS to
+        # resurrect the queue on next restart.
+        sudo rm -f "/etc/cups/ppd/${p}.ppd" 2>/dev/null || true
+        sudo rm -f "/etc/cups/ppd/${p}.ppd.O" 2>/dev/null || true
+    }
+
     # First check known name variants
     for variant in "${known_variants[@]}"; do
         if [[ "$variant" == "$PRINTER_NAME" ]]; then
@@ -623,7 +634,7 @@ remove_duplicate_printers() {
         fi
         if lpstat -p "$variant" &>/dev/null; then
             log_info "Removing duplicate printer '$variant' (auto-created by cupswrapper; we use '$PRINTER_NAME' instead)"
-            sudo lpadmin -x "$variant" 2>/dev/null || true
+            _remove_printer "$variant"
             removed=$((removed + 1))
         fi
     done
@@ -636,11 +647,27 @@ remove_duplicate_printers() {
             # Match any DCP-130C/dcp130c name variant (case-insensitive)
             if echo "$printer" | grep -qi "dcp[-_.]130c\|dcp130c"; then
                 log_info "Removing duplicate printer '$printer' (matches DCP-130C pattern)"
-                sudo lpadmin -x "$printer" 2>/dev/null || true
+                _remove_printer "$printer"
                 removed=$((removed + 1))
             fi
         done <<< "$all_printers"
     fi
+
+    # Also clean up orphan PPD files for known duplicate names even if
+    # the queue is already gone (prevents CUPS from re-creating them).
+    local ppd
+    for ppd in /etc/cups/ppd/*; do
+        [[ -f "$ppd" ]] || continue
+        local ppd_base
+        ppd_base=$(basename "$ppd" | sed 's/\.ppd\.O$//;s/\.ppd$//')
+        # Skip our canonical printer
+        [[ "$ppd_base" == "$PRINTER_NAME" ]] && continue
+        # Remove any PPD matching DCP-130C variants (case-insensitive)
+        if echo "$ppd_base" | grep -qi "dcp[-_.]130c\|dcp130c"; then
+            log_debug "Removing orphan PPD: $ppd"
+            sudo rm -f "$ppd"
+        fi
+    done
 
     if [[ $removed -gt 0 ]]; then
         log_info "Removed $removed duplicate DCP-130C printer(s)."
@@ -1001,7 +1028,7 @@ configure_printer() {
         local patched_ppd
         patched_ppd=$(mktemp /tmp/brother_dcp130c_patched.XXXXXX.ppd)
         cp "$ppd_file" "$patched_ppd"
-        # Append color mode mapping before the end of the file
+        # Append color mode mapping
         cat >> "$patched_ppd" << 'COLORPATCH'
 
 *% IPP print-color-mode mapping for Android/iOS printing
@@ -1030,14 +1057,28 @@ COLORPATCH
                 -o "$share_opt"
 
             # Set color mode options so Android/IPP clients can switch
-            # between color and monochrome printing.  Use Ghostscript as
-            # the PDF-to-PS renderer because Poppler cannot convert to
-            # grayscale PostScript.
+            # between color and monochrome printing.
             sudo lpadmin -p "$PRINTER_NAME" \
                 -o print-color-mode-default=color \
                 -o print-color-mode-supported=color,monochrome \
-                -o ColorModel=RGB \
-                -o pdftops-renderer=gs
+                -o ColorModel=RGB
+
+            # Force Ghostscript as the PDF-to-PostScript renderer
+            # (same as the PPD-based path below — see comment there).
+            local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
+            if [[ -f "$installed_ppd" ]] && ! grep -q 'pdftops-renderer' "$installed_ppd"; then
+                log_debug "Adding pdftops-renderer=gs to installed PPD: $installed_ppd"
+                sudo bash -c "cat >> '$installed_ppd'" << 'GSPATCH'
+
+*% Use Ghostscript for PDF-to-PS conversion (Poppler can't do grayscale)
+*OpenUI *pdftops-renderer/PDF Renderer: PickOne
+*OrderDependency: 100 AnySetup *pdftops-renderer
+*Defaultpdftops-renderer: gs
+*pdftops-renderer gs/Ghostscript: ""
+*pdftops-renderer pdftops/Poppler: ""
+*CloseUI: *pdftops-renderer
+GSPATCH
+            fi
 
             # Debug: verify options were set
             log_debug "Printer options after configure:"
@@ -1140,16 +1181,40 @@ PPEOF
         -o "$share_opt"
 
     # Set color mode options so Android/IPP clients can switch
-    # between color and monochrome printing.  Use Ghostscript as
-    # the PDF-to-PS renderer because Poppler cannot convert to
-    # grayscale PostScript.
+    # between color and monochrome printing.
     sudo lpadmin -p "$PRINTER_NAME" \
         -o print-color-mode-default=color \
         -o print-color-mode-supported=color,monochrome \
-        -o ColorModel=RGB \
-        -o pdftops-renderer=gs
+        -o ColorModel=RGB
 
-    # Debug: verify options were set
+    # Force Ghostscript as the PDF-to-PostScript renderer.
+    # Poppler (the default) cannot convert to grayscale PostScript, so
+    # monochrome print jobs from Android/iOS come out in color.
+    # "lpadmin -o pdftops-renderer=gs" is silently ignored because it is
+    # not a PPD option, so we write it directly into the installed PPD
+    # that CUPS copies to /etc/cups/ppd/.
+    local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
+    if [[ -f "$installed_ppd" ]]; then
+        if ! grep -q 'pdftops-renderer' "$installed_ppd"; then
+            log_debug "Adding pdftops-renderer=gs to installed PPD: $installed_ppd"
+            sudo bash -c "cat >> '$installed_ppd'" << 'GSPATCH'
+
+*% Use Ghostscript for PDF-to-PS conversion (Poppler can't do grayscale)
+*OpenUI *pdftops-renderer/PDF Renderer: PickOne
+*OrderDependency: 100 AnySetup *pdftops-renderer
+*Defaultpdftops-renderer: gs
+*pdftops-renderer gs/Ghostscript: ""
+*pdftops-renderer pdftops/Poppler: ""
+*CloseUI: *pdftops-renderer
+GSPATCH
+        fi
+        log_debug "Installed PPD color/renderer options:"
+        log_debug "$(grep -iE 'ColorModel|pdftops|color-mode' "$installed_ppd" || echo '<none>')"
+    else
+        log_warn "Installed PPD not found at $installed_ppd — pdftops-renderer option not set"
+    fi
+
+    # Debug: verify PPD options are visible to CUPS
     log_debug "Printer options after configure:"
     log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|pdftops' || echo '<no matching options>')"
     
@@ -1325,6 +1390,8 @@ display_info() {
         log_info "Printer sharing: ENABLED"
         log_info "Other devices on the network can discover and use this printer."
         log_info "Android: The printer will appear automatically in the Default Print Service."
+        log_info "         If you see stale/dead printers on Android, go to"
+        log_info "         Settings > Apps > Default Print Service > Storage > Clear Cache"
         if [[ -n "$ip_addr" ]]; then
             log_info "CUPS web interface: http://${ip_addr}:631"
         fi
@@ -1374,7 +1441,11 @@ main() {
     # last step before displaying results.
     log_debug "CUPS printers before final cleanup: $(lpstat -e 2>/dev/null || echo '<none>')"
     remove_duplicate_printers
-    log_debug "CUPS printers after final cleanup: $(lpstat -e 2>/dev/null || echo '<none>')"
+    # Restart CUPS once more so it forgets the removed queues
+    sudo systemctl restart cups 2>/dev/null || true
+    # Brief pause to let CUPS settle, then verify
+    sleep 2
+    log_debug "CUPS printers after final cleanup + restart: $(lpstat -e 2>/dev/null || echo '<none>')"
 
     display_info
     
