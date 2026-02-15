@@ -55,8 +55,20 @@ patch_lpadmin_calls() {
     local prefix="${2:-}"
     if grep -q 'lpadmin' "$file"; then
         log_debug "Patching $file: commenting out lpadmin calls to prevent duplicate printer"
-        $prefix sed -i 's|^\([[:space:]]*\)\(lpadmin\)|\1# [patched] \2|g' "$file"
-        $prefix sed -i 's|^\([[:space:]]*\)\(/usr/sbin/lpadmin\)|\1# [patched] \2|g' "$file"
+        # Comment out any non-comment line containing lpadmin (covers bare
+        # "lpadmin", "/usr/sbin/lpadmin", backtick/subshell calls, and
+        # variable-assigned invocations like result=`lpadmin ...`).
+        # Lines that already start with # are left alone.
+        $prefix sed -i '/^[[:space:]]*#/!{/lpadmin/s|^\([[:space:]]*\)\(.*\)|\1# [patched] \2|}' "$file"
+        # Log any remaining unpatched lpadmin references for debugging
+        local remaining
+        remaining=$($prefix grep -n 'lpadmin' "$file" | grep -v '^[0-9]*:[[:space:]]*#' || true)
+        if [[ -n "$remaining" ]]; then
+            log_debug "Remaining lpadmin references in $file after patching:"
+            log_debug "$remaining"
+        else
+            log_debug "All lpadmin calls in $file have been patched"
+        fi
     fi
 }
 
@@ -664,6 +676,9 @@ install_drivers() {
     if ! sudo dpkg -i --force-all dcp130ccupswrapper_arm.deb; then
         log_warn "CUPS wrapper driver installation reported errors, attempting to fix dependencies..."
     fi
+
+    # Debug: show what printers dpkg postinst created
+    log_debug "CUPS printers after dpkg -i cupswrapper: $(lpstat -e 2>/dev/null || echo '<none>')"
     
     # Fix any dependency issues
     log_debug "Running apt-get install -f to fix dependencies..."
@@ -679,6 +694,8 @@ install_drivers() {
         fi
         if grep -q 'lpadmin' "$installed_wrapper"; then
             patch_lpadmin_calls "$installed_wrapper" sudo
+        else
+            log_debug "No lpadmin calls found in installed cupswrapper (already patched by package)"
         fi
     fi
 
@@ -692,6 +709,9 @@ install_drivers() {
             log_debug "cupswrapper: $line"
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
+
+    # Debug: show printer state after cupswrapper re-run
+    log_debug "CUPS printers after cupswrapper re-run: $(lpstat -e 2>/dev/null || echo '<none>')"
 
     # Remove any auto-created DCP-130C printers. The cupswrapper postinst
     # (before our patches took effect) or a previous installation may have
@@ -1010,11 +1030,18 @@ COLORPATCH
                 -o "$share_opt"
 
             # Set color mode options so Android/IPP clients can switch
-            # between color and monochrome printing.
+            # between color and monochrome printing.  Use Ghostscript as
+            # the PDF-to-PS renderer because Poppler cannot convert to
+            # grayscale PostScript.
             sudo lpadmin -p "$PRINTER_NAME" \
                 -o print-color-mode-default=color \
                 -o print-color-mode-supported=color,monochrome \
-                -o ColorModel=RGB
+                -o ColorModel=RGB \
+                -o pdftops-renderer=gs
+
+            # Debug: verify options were set
+            log_debug "Printer options after configure:"
+            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|pdftops' || echo '<no matching options>')"
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -1113,11 +1140,18 @@ PPEOF
         -o "$share_opt"
 
     # Set color mode options so Android/IPP clients can switch
-    # between color and monochrome printing.
+    # between color and monochrome printing.  Use Ghostscript as
+    # the PDF-to-PS renderer because Poppler cannot convert to
+    # grayscale PostScript.
     sudo lpadmin -p "$PRINTER_NAME" \
         -o print-color-mode-default=color \
         -o print-color-mode-supported=color,monochrome \
-        -o ColorModel=RGB
+        -o ColorModel=RGB \
+        -o pdftops-renderer=gs
+
+    # Debug: verify options were set
+    log_debug "Printer options after configure:"
+    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|pdftops' || echo '<no matching options>')"
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"
@@ -1334,6 +1368,14 @@ main() {
     configure_printer
     test_print
     cleanup
+
+    # Final cleanup: remove any duplicate printers that may have been
+    # re-created by CUPS restarts during installation.  This must be the
+    # last step before displaying results.
+    log_debug "CUPS printers before final cleanup: $(lpstat -e 2>/dev/null || echo '<none>')"
+    remove_duplicate_printers
+    log_debug "CUPS printers after final cleanup: $(lpstat -e 2>/dev/null || echo '<none>')"
+
     display_info
     
     log_info "Installation script completed successfully!"
