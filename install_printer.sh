@@ -540,33 +540,72 @@ install_drivers() {
         fi
     fi
 
-    # Check if the Brother LPR binary can execute on this architecture.
-    # The driver is an i386 binary - it needs binfmt_misc/qemu-user-static
-    # to run on ARM, or it may use the system's native lpr.
-    local brother_bin="/usr/local/Brother/Printer/dcp130c/lpd/filterdcp130c"
-    if [[ -f "$brother_bin" ]]; then
-        local bin_arch
-        bin_arch=$(file "$brother_bin" 2>/dev/null || echo 'unknown')
-        log_debug "Brother LPR binary: $bin_arch"
-        if echo "$bin_arch" | grep -qi "Intel 80386\|x86-64\|i386"; then
-            log_debug "Brother binary is x86 — checking if ARM can execute it..."
-            if "$brother_bin" --version &>/dev/null || "$brother_bin" &>/dev/null; then
-                log_debug "Brother binary executes successfully (binfmt_misc/qemu-user available)"
+    # Check if the Brother LPR binaries can execute on this architecture.
+    # The driver is compiled for i386 — the main filter scripts (filterdcp130c,
+    # brlpdwrapperdcp130c) are shell wrappers, but they call actual i386 ELF
+    # binaries (e.g. brdcp130cfilter, brprintconfdcp130c) that need
+    # binfmt_misc/qemu-user-static to run on ARM.
+    #
+    # can_execute_binary: test if a single binary can run on this system
+    can_execute_binary() {
+        local f="$1"
+        "$f" --version &>/dev/null || "$f" --help &>/dev/null || "$f" &>/dev/null
+    }
+
+    log_debug "Scanning Brother driver directory for i386 binaries..."
+    local i386_binaries_found=0
+    local i386_binaries_failed=0
+    while IFS= read -r -d '' bin_file; do
+        local bin_type
+        bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
+        if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
+            i386_binaries_found=$((i386_binaries_found + 1))
+            log_debug "i386 binary: $bin_file"
+            if ! can_execute_binary "$bin_file"; then
+                i386_binaries_failed=$((i386_binaries_failed + 1))
+                log_debug "  -> FAILED to execute"
             else
-                log_warn "Brother i386 binary cannot execute on this ARM system!"
-                log_warn "Install qemu-user-static for i386 binary support: sudo apt-get install -y qemu-user-static"
-                # Try to install qemu-user-static automatically
-                if sudo apt-get install -y qemu-user-static 2>/dev/null; then
-                    log_info "Installed qemu-user-static for i386 binary support"
-                else
-                    log_warn "Could not install qemu-user-static. Printing may not work."
-                    log_warn "Try manually: sudo apt-get install qemu-user-static"
-                fi
+                log_debug "  -> executes OK"
             fi
         fi
+    done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
+
+    if [[ $i386_binaries_found -gt 0 ]]; then
+        log_debug "Found $i386_binaries_found i386 ELF binaries, $i386_binaries_failed failed to execute"
+        if [[ $i386_binaries_failed -gt 0 ]]; then
+            log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 binaries cannot execute on this ARM system!"
+            log_warn "This will prevent the printer from working."
+            log_info "Installing qemu-user-static for i386 binary support..."
+            sudo apt-get install -y qemu-user-static 2>&1 | tail -5
+            local apt_status=${PIPESTATUS[0]}
+            if [[ $apt_status -eq 0 ]]; then
+                log_info "Installed qemu-user-static. Re-checking binaries..."
+                local recheck_failed=0
+                while IFS= read -r -d '' bin_file; do
+                    local bin_type
+                    bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
+                    if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
+                        if ! can_execute_binary "$bin_file"; then
+                            recheck_failed=$((recheck_failed + 1))
+                            log_debug "Still fails after qemu-user-static: $bin_file"
+                        fi
+                    fi
+                done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
+                if [[ $recheck_failed -gt 0 ]]; then
+                    log_warn "$recheck_failed binaries still can't execute. Printing may not work."
+                    log_warn "You may need i386 libraries: sudo dpkg --add-architecture i386 && sudo apt-get update && sudo apt-get install -y libc6:i386"
+                else
+                    log_info "All Brother binaries now execute successfully."
+                fi
+            else
+                log_warn "Could not install qemu-user-static. Printing may not work."
+                log_warn "Try manually: sudo apt-get install qemu-user-static"
+            fi
+        else
+            log_info "All Brother i386 binaries execute successfully on this ARM system."
+        fi
     else
-        log_debug "Brother LPR binary not found at expected path: $brother_bin"
-        log_debug "Brother LPR files: $(find /usr/local/Brother/Printer/dcp130c/lpd/ -type f 2>/dev/null | head -10 || echo 'none')"
+        log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
     fi
 
     # Restart CUPS to pick up new filters
@@ -793,6 +832,24 @@ EOF
         if [[ -f /var/log/cups/error_log ]]; then
             log_lines_before=$(wc -l < /var/log/cups/error_log 2>/dev/null || echo 0)
         fi
+
+        # Temporarily enable CUPS debug logging to capture filter pipeline details
+        local cups_log_level_changed=0
+        local current_log_level="warn"
+        if [[ "$DEBUG" == "1" ]]; then
+            current_log_level=$(grep -i "^LogLevel" /etc/cups/cupsd.conf 2>/dev/null | awk '{print $2}' || echo "warn")
+            if [[ "$current_log_level" != "debug" && "$current_log_level" != "debug2" ]]; then
+                log_debug "Temporarily enabling CUPS debug logging (was: $current_log_level)..."
+                sudo sed -i "s/^LogLevel .*/LogLevel debug/" /etc/cups/cupsd.conf 2>/dev/null || true
+                sudo systemctl restart cups 2>/dev/null || true
+                sleep 2
+                cups_log_level_changed=1
+                # Update log position after restart
+                if [[ -f /var/log/cups/error_log ]]; then
+                    log_lines_before=$(wc -l < /var/log/cups/error_log 2>/dev/null || echo 0)
+                fi
+            fi
+        fi
         
         # Print the test page
         log_info "Sending test page to printer..."
@@ -824,14 +881,31 @@ EOF
                 log_debug "CUPS log entries for this print job:"
                 log_debug "$new_log_entries"
                 # Check for specific error types
-                if echo "$new_log_entries" | grep -qi "not available\|no such file\|filter failed\|Broken pipe"; then
+                if echo "$new_log_entries" | grep -qi "not available\|no such file\|filter failed\|Broken pipe\|exec format error"; then
                     log_warn "CUPS filter errors detected — the filter pipeline may not be working."
                     log_warn "This usually means the Brother i386 binary can't run on ARM."
                     log_warn "Try: sudo apt-get install qemu-user-static"
                 fi
             else
                 log_debug "No new CUPS log entries for this print job"
+                log_warn "CUPS did not log any activity for this print job."
+                log_warn "This may indicate the job was silently dropped or the USB backend is not responding."
             fi
+        fi
+
+        # Check the job-specific log in /var/log/cups/ if available
+        local latest_job_log
+        latest_job_log=$(find /var/log/cups/ -maxdepth 1 -name 'd[0-9]*-[0-9]*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
+        if [[ -n "$latest_job_log" ]]; then
+            log_debug "Latest CUPS job log: $latest_job_log"
+            log_debug "$(tail -20 "$latest_job_log" 2>/dev/null || echo 'could not read job log')"
+        fi
+
+        # Restore CUPS log level if we changed it
+        if [[ $cups_log_level_changed -eq 1 ]]; then
+            log_debug "Restoring CUPS log level to $current_log_level..."
+            sudo sed -i "s/^LogLevel .*/LogLevel $current_log_level/" /etc/cups/cupsd.conf 2>/dev/null || true
+            sudo systemctl restart cups 2>/dev/null || true
         fi
         
         log_info "Test page sent to printer. Please check the printer output."
