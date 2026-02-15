@@ -164,16 +164,80 @@ fix_broken_packages() {
         if dpkg -s "$pkg" &>/dev/null; then
             local status
             status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
-            if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured\|config-files"; then
+            log_debug "fix_broken_packages: $pkg status='$status'"
+            if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured"; then
                 log_warn "Fixing broken package state: $pkg ($status)"
-                sudo dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
-                sudo dpkg --purge --force-remove-reinstreq "$pkg" 2>/dev/null || true
+
+                # pkg_base is the package name without architecture qualifier
+                # (e.g. "dcp130clpr" from "dcp130clpr:i386"). Both forms are
+                # needed: dpkg commands use the full name, while dpkg info files
+                # on disk may use either form depending on the system.
+                local pkg_base="${pkg%%:*}"
+
+                # First, neutralize any broken maintainer scripts that may
+                # prevent dpkg from completing the removal (e.g. scripts that
+                # call /etc/init.d/lpd which doesn't exist on modern systems).
+                for script in prerm postrm; do
+                    for sp in "/var/lib/dpkg/info/${pkg_base}.${script}" \
+                              "/var/lib/dpkg/info/${pkg}.${script}"; do
+                        if [[ -f "$sp" ]]; then
+                            log_debug "Neutralizing broken maintainer script: $sp"
+                            sudo cp "$sp" "${sp}.bak" 2>/dev/null || true
+                            echo '#!/bin/sh' | sudo tee "$sp" > /dev/null
+                            echo 'exit 0' | sudo tee -a "$sp" > /dev/null
+                            sudo chmod 755 "$sp"
+                        fi
+                    done
+                done
+
+                # Now try aggressive removal with all forces enabled
+                log_debug "Attempting dpkg --purge --force-all $pkg"
+                sudo dpkg --purge --force-all "$pkg" 2>/dev/null || true
+
+                # Verify removal succeeded
+                if dpkg -s "$pkg" &>/dev/null; then
+                    local new_status
+                    new_status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
+                    log_debug "Package $pkg still present after purge: $new_status"
+
+                    # Last resort: directly clean the dpkg database
+                    log_warn "Standard removal failed for $pkg, cleaning dpkg database directly..."
+                    sudo rm -f "/var/lib/dpkg/info/${pkg_base}".* 2>/dev/null || true
+                    sudo rm -f "/var/lib/dpkg/info/${pkg}".* 2>/dev/null || true
+                    # Remove the package entry from dpkg status file using
+                    # exact match on the package name (without arch qualifier)
+                    if [[ -f /var/lib/dpkg/status ]]; then
+                        sudo cp /var/lib/dpkg/status /var/lib/dpkg/status.bak
+                        sudo awk -v pkg="$pkg_base" '
+                            BEGIN { skip=0 }
+                            /^Package:/ { skip=($2 == pkg) }
+                            /^$/ { if (skip) { skip=0; next } }
+                            !skip { print }
+                        ' /var/lib/dpkg/status.bak | sudo tee /var/lib/dpkg/status > /dev/null
+                        log_debug "Removed $pkg_base entry from dpkg status database"
+                    fi
+                else
+                    log_debug "Package $pkg successfully removed"
+                fi
+
                 packages_fixed=1
             fi
         fi
     done
+
     if [[ $packages_fixed -eq 1 ]]; then
-        log_info "Cleaned up broken package state. apt-get should work now."
+        # Verify apt-get works now
+        log_debug "Verifying apt-get works after cleanup..."
+        local check_output
+        check_output=$(sudo apt-get check 2>&1 || true)
+        if echo "$check_output" | grep -qi "reinst-required\|needs to be reinstalled"; then
+            log_error "apt-get is still blocked by broken packages after cleanup."
+            log_error "apt-get check output:"
+            log_error "$check_output"
+            log_error "Try manually running: sudo dpkg --configure -a"
+            exit 1
+        fi
+        log_info "Cleaned up broken package state. apt-get is working."
     fi
 }
 
