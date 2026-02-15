@@ -46,6 +46,19 @@ PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
 
+# Patch lpadmin calls in a script file by commenting them out.
+# This prevents Brother's cupswrapper scripts from auto-creating printers.
+# Usage: patch_lpadmin_calls <file> [sudo]
+patch_lpadmin_calls() {
+    local file="$1"
+    local prefix="${2:-}"
+    if grep -q 'lpadmin' "$file"; then
+        log_debug "Patching $file: commenting out lpadmin calls to prevent duplicate printer"
+        $prefix sed -i 's|^\([[:space:]]*\)\(lpadmin\)|\1# [patched] \2|g' "$file"
+        $prefix sed -i 's|^\([[:space:]]*\)\(/usr/sbin/lpadmin\)|\1# [patched] \2|g' "$file"
+    fi
+}
+
 # Driver filenames
 DRIVER_LPR_FILE="dcp130clpr-1.0.1-1.i386.deb"
 DRIVER_CUPS_FILE="dcp130ccupswrapper-1.0.1-1.i386.deb"
@@ -408,12 +421,18 @@ extract_and_modify_drivers() {
     # Fix maintainer scripts that reference /etc/init.d/lpd which doesn't
     # exist on modern systems and causes "Permission denied" errors.
     # Replace calls to /etc/init.d/lpd with a harmless no-op.
+    # Also comment out lpadmin calls in the cupswrapper postinst/prerm to
+    # prevent the package from auto-creating/removing a "DCP130C" printer
+    # during dpkg install — we handle printer setup in configure_printer().
     for script_dir in lpr_extract/DEBIAN cups_extract/DEBIAN; do
         for script in preinst postinst prerm postrm; do
             if [[ -f "$script_dir/$script" ]]; then
                 if grep -q '/etc/init.d/lpd' "$script_dir/$script"; then
                     log_debug "Patching $script_dir/$script: removing /etc/init.d/lpd references"
                     sed -i 's|/etc/init.d/lpd|/bin/true|g' "$script_dir/$script"
+                fi
+                if [[ "$script_dir" == "cups_extract/DEBIAN" ]]; then
+                    patch_lpadmin_calls "$script_dir/$script"
                 fi
                 # Ensure script is executable
                 chmod 755 "$script_dir/$script"
@@ -426,12 +445,19 @@ extract_and_modify_drivers() {
     # This script is called from the CUPS wrapper postinst and itself
     # references /etc/init.d/lpd. Without patching it, the filter
     # pipeline setup may fail silently.
+    # Additionally, the cupswrapper script calls lpadmin to auto-create a
+    # printer named "DCP130C". We patch those calls out so only our own
+    # configure_printer() creates the printer with the correct name and URI,
+    # preventing duplicate printers from appearing in CUPS.
     local wrapper_script
     wrapper_script=$(find cups_extract/ -name 'cupswrapper*dcp130c*' -type f 2>/dev/null | head -n 1)
     if [[ -n "$wrapper_script" ]]; then
         if grep -qF '/etc/init.d/lpd' "$wrapper_script"; then
-            log_debug "Patching cupswrapper script: $wrapper_script"
+            log_debug "Patching cupswrapper script: $wrapper_script (removing /etc/init.d/lpd references)"
             sed -i 's|/etc/init.d/lpd|/bin/true|g' "$wrapper_script"
+        fi
+        if grep -q 'lpadmin' "$wrapper_script"; then
+            patch_lpadmin_calls "$wrapper_script"
         fi
         chmod 755 "$wrapper_script"
     else
@@ -457,6 +483,59 @@ repackage_drivers() {
     dpkg-deb -b cups_extract dcp130ccupswrapper_arm.deb
     
     log_info "Drivers repackaged successfully."
+}
+
+# Remove any duplicate Brother DCP-130C printers from CUPS.
+# The cupswrapper postinst and the cupswrapper script itself call lpadmin
+# to create a printer (typically named "DCP130C") every time the package
+# is installed. This conflicts with our canonical printer name
+# ($PRINTER_NAME = "Brother_DCP_130C"). This function detects ALL
+# DCP-130C printers and removes any that are not $PRINTER_NAME, so only
+# one properly-configured printer remains.
+remove_duplicate_printers() {
+    log_debug "Checking for duplicate DCP-130C printers in CUPS..."
+
+    # List all CUPS printer names
+    local all_printers
+    all_printers=$(lpstat -e 2>/dev/null || true)
+    log_debug "All CUPS printers: ${all_printers:-<none>}"
+
+    # Known auto-created names from Brother's cupswrapper scripts,
+    # plus common variations from manual/repeated installs.
+    local known_variants=("DCP130C" "dcp130c" "DCP-130C" "Brother-DCP-130C")
+    local removed=0
+
+    # First check known name variants
+    for variant in "${known_variants[@]}"; do
+        if [[ "$variant" == "$PRINTER_NAME" ]]; then
+            continue  # don't remove our own printer
+        fi
+        if lpstat -p "$variant" &>/dev/null; then
+            log_info "Removing duplicate printer '$variant' (auto-created by cupswrapper; we use '$PRINTER_NAME' instead)"
+            sudo lpadmin -x "$variant" 2>/dev/null || true
+            removed=$((removed + 1))
+        fi
+    done
+
+    # Also scan for any other DCP-130C / dcp130c printers we might have missed
+    if [[ -n "$all_printers" ]]; then
+        while IFS= read -r printer; do
+            # Skip our canonical printer name
+            [[ "$printer" == "$PRINTER_NAME" ]] && continue
+            # Match any DCP-130C/dcp130c name variant (case-insensitive)
+            if echo "$printer" | grep -qi "dcp[-_.]130c\|dcp130c"; then
+                log_info "Removing duplicate printer '$printer' (matches DCP-130C pattern)"
+                sudo lpadmin -x "$printer" 2>/dev/null || true
+                removed=$((removed + 1))
+            fi
+        done <<< "$all_printers"
+    fi
+
+    if [[ $removed -gt 0 ]]; then
+        log_info "Removed $removed duplicate DCP-130C printer(s)."
+    else
+        log_debug "No duplicate DCP-130C printers found."
+    fi
 }
 
 # Install drivers
@@ -492,14 +571,22 @@ install_drivers() {
     sudo apt-get install -f -y || true
 
     # Patch the installed cupswrapper script if it still has /etc/init.d/lpd references
+    # or lpadmin calls that would create a duplicate printer.
     local installed_wrapper="/usr/local/Brother/Printer/dcp130c/cupswrapper/cupswrapperdcp130c"
-    if [[ -f "$installed_wrapper" ]] && grep -qF '/etc/init.d/lpd' "$installed_wrapper"; then
-        log_debug "Patching installed cupswrapper script: $installed_wrapper"
-        sudo sed -i 's|/etc/init.d/lpd|/bin/true|g' "$installed_wrapper"
+    if [[ -f "$installed_wrapper" ]]; then
+        if grep -qF '/etc/init.d/lpd' "$installed_wrapper"; then
+            log_debug "Patching installed cupswrapper script: $installed_wrapper (removing /etc/init.d/lpd)"
+            sudo sed -i 's|/etc/init.d/lpd|/bin/true|g' "$installed_wrapper"
+        fi
+        if grep -q 'lpadmin' "$installed_wrapper"; then
+            patch_lpadmin_calls "$installed_wrapper" sudo
+        fi
     fi
 
     # Re-run the cupswrapper script to ensure filter pipeline is set up correctly.
     # The postinst may have failed partially due to /etc/init.d/lpd errors.
+    # The lpadmin calls are already patched out, so this will only set up
+    # the filter/PPD pipeline without creating any printer queues.
     if [[ -f "$installed_wrapper" ]]; then
         log_info "Re-running cupswrapper setup to ensure filter pipeline is configured..."
         sudo "$installed_wrapper" 2>&1 | while IFS= read -r line; do
@@ -507,14 +594,12 @@ install_drivers() {
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
 
-    # The cupswrapper script auto-creates a printer named "DCP130C" (without
-    # the "Brother_" prefix) using lpadmin internally. We remove it because
-    # configure_printer() will create our own "Brother_DCP_130C" with the
-    # correct URI and settings. The duplicate would otherwise appear in CUPS.
-    if lpstat -p DCP130C &>/dev/null; then
-        log_info "Removing cupswrapper's auto-created 'DCP130C' printer (we create '$PRINTER_NAME' instead)"
-        sudo lpadmin -x DCP130C 2>/dev/null || true
-    fi
+    # Remove any auto-created DCP-130C printers. The cupswrapper postinst
+    # (before our patches took effect) or a previous installation may have
+    # created printers with various names. We check for all known variants
+    # and remove any that are not our canonical $PRINTER_NAME, which is set
+    # up later by configure_printer() with the correct URI and settings.
+    remove_duplicate_printers
 
     # Verify the filter binary/script exists
     log_debug "Checking Brother filter pipeline..."
@@ -740,6 +825,11 @@ detect_printer() {
 # Configure printer in CUPS
 configure_printer() {
     log_info "Configuring printer in CUPS..."
+
+    # Remove any duplicate DCP-130C printers that may have been created
+    # by a previous install or by the cupswrapper postinst before our
+    # lpadmin patches took effect.
+    remove_duplicate_printers
     
     # Get the printer URI
     PRINTER_URI=$(lpinfo -v | grep -i "Brother.*DCP-130C" | awk '{print $2}' | head -n 1)
@@ -1056,6 +1146,7 @@ display_info() {
     log_info "To manage printer: http://localhost:631"
     echo
     log_info "If you were added to the lpadmin group, you may need to log out and back in."
+    log_debug "All CUPS printers after installation: $(lpstat -e 2>/dev/null || echo '<none>')"
 }
 
 # Main installation process
