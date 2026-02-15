@@ -155,6 +155,28 @@ resolve_package() {
     echo "$pkg"
 }
 
+# Fix broken dpkg state from previous failed installs.
+# A broken package (e.g. dcp130clpr:i386 "needs to be reinstalled") blocks
+# ALL apt-get operations, so this must run before install_dependencies().
+fix_broken_packages() {
+    local packages_fixed=0
+    for pkg in dcp130clpr dcp130ccupswrapper "dcp130clpr:i386" "dcp130ccupswrapper:i386"; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            local status
+            status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
+            if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured\|config-files"; then
+                log_warn "Fixing broken package state: $pkg ($status)"
+                sudo dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+                sudo dpkg --purge --force-remove-reinstreq "$pkg" 2>/dev/null || true
+                packages_fixed=1
+            fi
+        fi
+    done
+    if [[ $packages_fixed -eq 1 ]]; then
+        log_info "Cleaned up broken package state. apt-get should work now."
+    fi
+}
+
 # Install required dependencies
 install_dependencies() {
     log_info "Installing required dependencies..."
@@ -656,6 +678,7 @@ main() {
     
     check_root
     check_architecture
+    fix_broken_packages
     install_dependencies
     setup_cups_service
     create_temp_dir
