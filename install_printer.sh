@@ -354,6 +354,16 @@ setup_cups_service() {
                 echo 'Port 631' | sudo tee -a "$cupsd_conf" > /dev/null
             fi
 
+            # Accept requests using any hostname. Android's print service
+            # connects via the mDNS-discovered hostname which may not match
+            # CUPS' ServerName, causing a "printing service is not enabled"
+            # error on the client even though the job prints.
+            if ! grep -q '^ServerAlias' "$cupsd_conf"; then
+                log_debug "Adding ServerAlias * to cupsd.conf..."
+                sudo sed -i '/^Port 631/a ServerAlias *' "$cupsd_conf" 2>/dev/null \
+                    || echo 'ServerAlias *' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
             # Enable sharing in cupsd.conf
             if grep -q '^Browsing' "$cupsd_conf"; then
                 sudo sed -i 's/^Browsing .*/Browsing On/' "$cupsd_conf"
@@ -960,6 +970,28 @@ configure_printer() {
             break
         fi
     done
+
+    # Patch the discovered PPD to advertise print-color-mode support.
+    # The original Brother PPD does not include the IPP color mode
+    # attributes that Android/iOS need to map their "Black & White"
+    # option to the PPD's ColorModel. Without this, color choices
+    # from mobile clients are silently ignored.
+    if [[ -n "$ppd_file" ]] && ! grep -q 'print-color-mode' "$ppd_file"; then
+        log_debug "Patching PPD to add print-color-mode IPP attributes..."
+        local patched_ppd
+        patched_ppd=$(mktemp /tmp/brother_dcp130c_patched.XXXXXX.ppd)
+        cp "$ppd_file" "$patched_ppd"
+        # Append color mode mapping before the end of the file
+        cat >> "$patched_ppd" << 'COLORPATCH'
+
+*% IPP print-color-mode mapping for Android/iOS printing
+*cupsIPPSupplies: True
+*APPrinterPreset Color/Color: "*ColorModel RGB"
+*APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
+COLORPATCH
+        ppd_file="$patched_ppd"
+        log_debug "Patched PPD with color mode mapping: $patched_ppd"
+    fi
     
     # Check if we also have a PPD via lpinfo -m (CUPS driver list)
     if [[ -z "$ppd_file" ]]; then
@@ -976,6 +1008,13 @@ configure_printer() {
                 -m "$cups_driver" \
                 -E \
                 -o "$share_opt"
+
+            # Set color mode options so Android/IPP clients can switch
+            # between color and monochrome printing.
+            sudo lpadmin -p "$PRINTER_NAME" \
+                -o print-color-mode-default=color \
+                -o print-color-mode-supported=color,monochrome \
+                -o ColorModel=RGB
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -1051,6 +1090,14 @@ configure_printer() {
 *ColorModel RGB/Color: "<</cupsColorOrder 0/cupsColorSpace 1/cupsCompression 1/cupsBitsPerColor 8>>setpagedevice"
 *ColorModel Gray/Grayscale: "<</cupsColorOrder 0/cupsColorSpace 0/cupsCompression 1/cupsBitsPerColor 8>>setpagedevice"
 *CloseUI: *ColorModel
+
+*cupsIPPSupplies: True
+*cupsLanguages: "en"
+
+*% Map IPP print-color-mode to ColorModel so Android/iOS color
+*% choices (monochrome / color) are applied correctly.
+*APPrinterPreset Color/Color: "*ColorModel RGB"
+*APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
 PPEOF
         log_debug "Generated basic PPD at $ppd_file"
     fi
@@ -1064,6 +1111,13 @@ PPEOF
         -P "$ppd_file" \
         -E \
         -o "$share_opt"
+
+    # Set color mode options so Android/IPP clients can switch
+    # between color and monochrome printing.
+    sudo lpadmin -p "$PRINTER_NAME" \
+        -o print-color-mode-default=color \
+        -o print-color-mode-supported=color,monochrome \
+        -o ColorModel=RGB
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"

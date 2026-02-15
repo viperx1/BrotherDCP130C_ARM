@@ -152,6 +152,21 @@ cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupsw
 - Cancel stuck jobs: `cancel -a Brother_DCP_130C`
 - Restart CUPS: `sudo systemctl restart cups`
 
+### Android: color settings ignored
+The script patches the Brother PPD and sets CUPS options so that Android's
+"Black & White" / "Color" choice maps to the printer's ColorModel. If you
+installed before this fix, re-run the installer to apply the updated settings.
+
+### Android: "printing service is not enabled" error
+This is caused by a hostname mismatch — Android connects using the
+mDNS-discovered name but CUPS only accepts its own `ServerName` by default.
+The script adds `ServerAlias *` to `cupsd.conf` to accept any hostname.
+If the error persists after re-running the installer, verify manually:
+```bash
+grep 'ServerAlias' /etc/cups/cupsd.conf
+# Should show: ServerAlias *
+```
+
 ## Technical Details
 
 ### Driver Sources
