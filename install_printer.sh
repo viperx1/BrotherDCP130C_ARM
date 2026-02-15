@@ -935,73 +935,17 @@ install_drivers() {
         log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
     fi
 
-    # Wrap the Brother filter with a grayscale conversion step.
-    #
-    # The CUPS filter chain calls brlpdwrapperdcp130c to convert
-    # PostScript to the Brother printer format. However, the PDF→PS
-    # step (Poppler's pdftops) cannot convert to grayscale, so when
-    # Android/iOS requests monochrome printing the output stays color.
-    #
-    # Fix: rename the real filter to .real and install a thin wrapper
-    # that uses Ghostscript to convert the PostScript input to grayscale
-    # BEFORE passing it to the real Brother filter.
+    # Restore original Brother filter if it was previously wrapped.
+    # Previous versions wrapped brlpdwrapperdcp130c with a Ghostscript
+    # grayscale converter, but this caused "No pages found!" errors
+    # because Ghostscript's ps2write output is incompatible with the
+    # Brother binary filter. The Brother driver has its own native
+    # BRMonoColor option for grayscale — no wrapper is needed.
     local brother_filter="/usr/lib/cups/filter/brlpdwrapperdcp130c"
-    if [[ -f "$brother_filter" ]] && [[ ! -f "${brother_filter}.real" ]]; then
-        log_debug "Wrapping Brother filter for grayscale support..."
-        sudo mv "$brother_filter" "${brother_filter}.real"
-    fi
     if [[ -f "${brother_filter}.real" ]]; then
-        sudo tee "$brother_filter" > /dev/null << 'GSWRAPPER'
-#!/bin/bash
-# Grayscale wrapper for Brother DCP-130C CUPS filter.
-# Converts PostScript to grayscale via Ghostscript when ColorModel=Gray
-# is set, then passes the result to the real Brother filter.
-#
-# CUPS filter args: filter job user title copies options [file]
-
-REAL_FILTER="/usr/lib/cups/filter/brlpdwrapperdcp130c.real"
-OPTIONS="$5"
-INPUTFILE="$6"
-
-# Save stdin to a temp file if no file argument
-if [ -z "$INPUTFILE" ]; then
-    INPUTFILE=$(mktemp -t cups_brother_input.XXXXXX)
-    chmod 600 "$INPUTFILE"
-    cat > "$INPUTFILE"
-    CLEANUP_INPUT=1
-else
-    CLEANUP_INPUT=0
-fi
-
-cleanup() {
-    [ "$CLEANUP_INPUT" = "1" ] && rm -f "$INPUTFILE"
-    rm -f "$GRAY_TMP"
-}
-trap cleanup EXIT
-
-# Check if grayscale/monochrome was requested
-if echo "$OPTIONS" | grep -qiE 'ColorModel=Gray|print-color-mode=monochrome'; then
-    GRAY_TMP=$(mktemp -t cups_brother_gray.XXXXXX.ps)
-    chmod 600 "$GRAY_TMP"
-    if gs -q -dNOPAUSE -dBATCH -dSAFER \
-          -sDEVICE=ps2write \
-          -sColorConversionStrategy=Gray \
-          -dProcessColorModel=/DeviceGray \
-          -sOutputFile="$GRAY_TMP" \
-          "$INPUTFILE" 2>/dev/null && [ -s "$GRAY_TMP" ]; then
-        # Pass grayscale PS to the real Brother filter (replace $6 with converted file)
-        exec "$REAL_FILTER" "$1" "$2" "$3" "$4" "$5" "$GRAY_TMP"
-    fi
-    echo "WARNING: Ghostscript grayscale conversion failed, passing through original" >&2
-fi
-
-# No conversion needed or failed — pass original to the real filter
-exec "$REAL_FILTER" "$@"
-GSWRAPPER
-        sudo chmod 755 "$brother_filter"
-        log_debug "Brother filter wrapped for grayscale: $brother_filter"
-    else
-        log_warn "Brother filter not found at $brother_filter — grayscale wrapper not installed"
+        log_debug "Restoring original Brother filter (removing grayscale wrapper)..."
+        sudo mv -f "${brother_filter}.real" "$brother_filter"
+        log_debug "Original Brother filter restored: $brother_filter"
     fi
 
     # Restart CUPS to pick up new filters
@@ -1089,10 +1033,11 @@ configure_printer() {
     done
 
     # Patch the discovered PPD to advertise print-color-mode support.
-    # The original Brother PPD does not include the IPP color mode
-    # attributes that Android/iOS need to map their "Black & White"
-    # option to the PPD's ColorModel. Without this, color choices
-    # from mobile clients are silently ignored.
+    # The original Brother PPD has a BRMonoColor option for grayscale
+    # but doesn't include the IPP color-mode attributes that Android/iOS
+    # need to map their "Black & White" option. We add APPrinterPreset
+    # entries that map IPP print-color-mode to the Brother driver's
+    # native BRMonoColor option.
     if [[ -n "$ppd_file" ]] && ! grep -q 'APPrinterPreset' "$ppd_file"; then
         log_debug "Patching PPD to add print-color-mode IPP attributes..."
         local patched_ppd
@@ -1100,10 +1045,12 @@ configure_printer() {
         cp "$ppd_file" "$patched_ppd"
         cat >> "$patched_ppd" << 'COLORPATCH'
 
-*% IPP print-color-mode mapping for Android/iOS printing
+*% IPP print-color-mode mapping for Android/iOS printing.
+*% Maps to Brother's native BRMonoColor option which the driver
+*% understands natively — no Ghostscript conversion needed.
 *cupsIPPSupplies: True
-*APPrinterPreset Color/Color: "*ColorModel RGB"
-*APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
+*APPrinterPreset Color/Color: "*BRMonoColor BrColor"
+*APPrinterPreset Grayscale/Grayscale: "*BRMonoColor BrMono"
 COLORPATCH
         ppd_file="$patched_ppd"
         log_debug "Patched PPD with color mode mapping: $patched_ppd"
@@ -1134,7 +1081,7 @@ COLORPATCH
 
             # Debug: verify options were set
             log_debug "Printer options after configure:"
-            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode' || echo '<no matching options>')"
+            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|BRMonoColor' || echo '<no matching options>')"
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -1239,11 +1186,11 @@ PPEOF
         -o print-color-mode-supported=color,monochrome \
         -o ColorModel=RGB
 
-    # Verify the installed PPD and Brother filter wrapper
+    # Verify the installed PPD and Brother filter
     local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
     if [[ -f "$installed_ppd" ]]; then
         log_debug "Installed PPD filter/color options:"
-        log_debug "$(grep -iE 'ColorModel|cupsFilter|color-mode' "$installed_ppd" || echo '<none>')"
+        log_debug "$(grep -iE 'ColorModel|cupsFilter|color-mode|BRMonoColor|APPrinterPreset' "$installed_ppd" || echo '<none>')"
         # Ensure no stale cupsFilter2 entries from previous installs
         if grep -q 'cupsFilter2.*brother_grayscale_prefilter' "$installed_ppd"; then
             log_debug "Removing stale cupsFilter2 entry from installed PPD"
@@ -1253,7 +1200,7 @@ PPEOF
 
     # Debug: verify PPD options are visible to CUPS
     log_debug "Printer options after configure:"
-    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode' || echo '<no matching options>')"
+    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|BRMonoColor' || echo '<no matching options>')"
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"
