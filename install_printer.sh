@@ -320,6 +320,7 @@ install_dependencies() {
         "$LIBCUPS"
         "$LIBCUPSIMAGE"
         printer-driver-all
+        ghostscript
         psutils
         a2ps
     )
@@ -934,6 +935,75 @@ install_drivers() {
         log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
     fi
 
+    # Install a grayscale pre-filter that uses Ghostscript.
+    # The CUPS filter chain goes:  PDF → pdftops (Poppler) → Brother filter.
+    # Poppler cannot convert PDF to grayscale PostScript, so when
+    # Android/iOS requests monochrome printing, the output stays in color.
+    # This pre-filter intercepts the PDF and converts it to grayscale
+    # using Ghostscript BEFORE it enters the filter chain.
+    local gs_filter="/usr/lib/cups/filter/brother_grayscale_prefilter"
+    log_debug "Installing grayscale pre-filter: $gs_filter"
+    sudo tee "$gs_filter" > /dev/null << 'GSFILTER'
+#!/bin/bash
+# Brother DCP-130C grayscale pre-filter for CUPS.
+# Converts PDF to grayscale using Ghostscript when ColorModel=Gray
+# is set (e.g. by Android/iOS "Black & White" print option).
+#
+# CUPS filter interface: filter job user title copies options [file]
+
+OPTIONS="$5"
+INPUTFILE="$6"
+
+# If no file argument, save stdin to a temp file
+if [ -z "$INPUTFILE" ]; then
+    INPUTFILE=$(mktemp -t cups_gs_input.XXXXXX.pdf)
+    chmod 600 "$INPUTFILE"
+    cat > "$INPUTFILE"
+    CLEANUP_INPUT=1
+else
+    CLEANUP_INPUT=0
+fi
+
+cleanup() {
+    [ "$CLEANUP_INPUT" = "1" ] && rm -f "$INPUTFILE"
+    rm -f "$TMPOUT" "$TMPOUT.err"
+}
+trap cleanup EXIT
+
+# Check if grayscale/monochrome was requested
+if echo "$OPTIONS" | grep -qiE 'ColorModel=Gray|print-color-mode=monochrome'; then
+    # Convert to grayscale using Ghostscript
+    TMPOUT=$(mktemp -t cups_gs_gray.XXXXXX.pdf)
+    chmod 600 "$TMPOUT"
+
+    if gs -q -dNOPAUSE -dBATCH -dSAFER \
+          -sDEVICE=pdfwrite \
+          -sColorConversionStrategy=Gray \
+          -dProcessColorModel=/DeviceGray \
+          -sOutputFile="$TMPOUT" \
+          "$INPUTFILE" 2>"$TMPOUT.err"; then
+        if [ -s "$TMPOUT" ]; then
+            cat "$TMPOUT"
+            rm -f "$TMPOUT.err"
+            exit 0
+        fi
+    fi
+    # Log error for debugging (visible in CUPS error_log)
+    if [ -s "$TMPOUT.err" ]; then
+        echo "WARNING: Ghostscript errors:" >&2
+        cat "$TMPOUT.err" >&2
+    fi
+    rm -f "$TMPOUT.err"
+    # Ghostscript failed — fall through to pass-through
+    echo "WARNING: Ghostscript grayscale conversion failed, passing through original" >&2
+fi
+
+# No conversion needed or conversion failed — pass through original
+cat "$INPUTFILE"
+GSFILTER
+    sudo chmod 755 "$gs_filter"
+    log_debug "Grayscale pre-filter installed"
+
     # Restart CUPS to pick up new filters
     log_debug "Restarting CUPS to pick up new filters..."
     sudo systemctl restart cups 2>/dev/null || true
@@ -1018,23 +1088,29 @@ configure_printer() {
         fi
     done
 
-    # Patch the discovered PPD to advertise print-color-mode support.
+    # Patch the discovered PPD to advertise print-color-mode support
+    # and add a grayscale pre-filter to the CUPS filter chain.
     # The original Brother PPD does not include the IPP color mode
     # attributes that Android/iOS need to map their "Black & White"
     # option to the PPD's ColorModel. Without this, color choices
     # from mobile clients are silently ignored.
-    if [[ -n "$ppd_file" ]] && ! grep -q 'print-color-mode' "$ppd_file"; then
-        log_debug "Patching PPD to add print-color-mode IPP attributes..."
+    if [[ -n "$ppd_file" ]] && ! grep -q 'brother_grayscale_prefilter' "$ppd_file"; then
+        log_debug "Patching PPD to add print-color-mode IPP attributes and grayscale pre-filter..."
         local patched_ppd
         patched_ppd=$(mktemp /tmp/brother_dcp130c_patched.XXXXXX.ppd)
         cp "$ppd_file" "$patched_ppd"
-        # Append color mode mapping
+        # Append color mode mapping and grayscale pre-filter
         cat >> "$patched_ppd" << 'COLORPATCH'
 
 *% IPP print-color-mode mapping for Android/iOS printing
 *cupsIPPSupplies: True
 *APPrinterPreset Color/Color: "*ColorModel RGB"
 *APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
+
+*% Grayscale pre-filter: converts PDF to grayscale using Ghostscript
+*% when ColorModel=Gray is set, BEFORE the Brother filter processes it.
+*% This bypasses Poppler's inability to do grayscale conversion.
+*cupsFilter2: "application/pdf application/pdf 0 brother_grayscale_prefilter"
 COLORPATCH
         ppd_file="$patched_ppd"
         log_debug "Patched PPD with color mode mapping: $patched_ppd"
@@ -1063,31 +1139,21 @@ COLORPATCH
                 -o print-color-mode-supported=color,monochrome \
                 -o ColorModel=RGB
 
-            # Force Ghostscript as the PDF-to-PostScript renderer
+            # Add grayscale pre-filter to installed PPD
             # (same as the PPD-based path below — see comment there).
             local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
-            if [[ -f "$installed_ppd" ]] && ! grep -q 'pdftops-renderer' "$installed_ppd"; then
-                log_debug "Adding pdftops-renderer=gs to installed PPD: $installed_ppd"
+            if [[ -f "$installed_ppd" ]] && ! grep -q 'brother_grayscale_prefilter' "$installed_ppd"; then
+                log_debug "Adding grayscale pre-filter to installed PPD: $installed_ppd"
                 sudo bash -c "cat >> '$installed_ppd'" << 'GSPATCH'
 
-*% Use Ghostscript for PDF-to-PS conversion (Poppler can't do grayscale)
-*OpenUI *pdftops-renderer/PDF Renderer: PickOne
-*OrderDependency: 100 AnySetup *pdftops-renderer
-*Defaultpdftops-renderer: gs
-*pdftops-renderer gs/Ghostscript: ""
-*pdftops-renderer pdftops/Poppler: ""
-*CloseUI: *pdftops-renderer
+*% Grayscale pre-filter: converts PDF to grayscale using Ghostscript
+*cupsFilter2: "application/pdf application/pdf 0 brother_grayscale_prefilter"
 GSPATCH
             fi
 
-            # Also set pdftops-renderer via lpoptions so cups-filters
-            # receives it as a command-line option (PPD alone is not enough).
-            sudo lpoptions -p "$PRINTER_NAME" -o pdftops-renderer=gs
-            log_debug "lpoptions set: pdftops-renderer=gs"
-
             # Debug: verify options were set
             log_debug "Printer options after configure:"
-            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|pdftops' || echo '<no matching options>')"
+            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode' || echo '<no matching options>')"
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -1171,6 +1237,9 @@ GSPATCH
 *% choices (monochrome / color) are applied correctly.
 *APPrinterPreset Color/Color: "*ColorModel RGB"
 *APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
+
+*% Grayscale pre-filter: converts PDF to grayscale using Ghostscript
+*cupsFilter2: "application/pdf application/pdf 0 brother_grayscale_prefilter"
 PPEOF
         log_debug "Generated basic PPD at $ppd_file"
     fi
@@ -1192,44 +1261,32 @@ PPEOF
         -o print-color-mode-supported=color,monochrome \
         -o ColorModel=RGB
 
-    # Force Ghostscript as the PDF-to-PostScript renderer.
-    # Poppler (the default) cannot convert to grayscale PostScript, so
-    # monochrome print jobs from Android/iOS come out in color.
-    # "lpadmin -o pdftops-renderer=gs" is silently ignored because it is
-    # not a PPD option, so we write it directly into the installed PPD
-    # that CUPS copies to /etc/cups/ppd/.
+    # Ensure the installed PPD has the grayscale pre-filter entry.
+    # The pre-filter (brother_grayscale_prefilter) uses Ghostscript to
+    # convert PDF to grayscale when ColorModel=Gray is set, BEFORE the
+    # data enters the Brother filter chain. This is necessary because
+    # cups-filters' pdftops (Poppler) cannot do grayscale conversion,
+    # and the pdftops-renderer PPD option doesn't work in cups-filters 2.x.
     local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
     if [[ -f "$installed_ppd" ]]; then
-        if ! grep -q 'pdftops-renderer' "$installed_ppd"; then
-            log_debug "Adding pdftops-renderer=gs to installed PPD: $installed_ppd"
+        if ! grep -q 'brother_grayscale_prefilter' "$installed_ppd"; then
+            log_debug "Adding grayscale pre-filter to installed PPD: $installed_ppd"
             sudo bash -c "cat >> '$installed_ppd'" << 'GSPATCH'
 
-*% Use Ghostscript for PDF-to-PS conversion (Poppler can't do grayscale)
-*OpenUI *pdftops-renderer/PDF Renderer: PickOne
-*OrderDependency: 100 AnySetup *pdftops-renderer
-*Defaultpdftops-renderer: gs
-*pdftops-renderer gs/Ghostscript: ""
-*pdftops-renderer pdftops/Poppler: ""
-*CloseUI: *pdftops-renderer
+*% Grayscale pre-filter: converts PDF to grayscale using Ghostscript
+*% when ColorModel=Gray is set, BEFORE the Brother filter processes it.
+*cupsFilter2: "application/pdf application/pdf 0 brother_grayscale_prefilter"
 GSPATCH
         fi
-        log_debug "Installed PPD color/renderer options:"
-        log_debug "$(grep -iE 'ColorModel|pdftops|color-mode' "$installed_ppd" || echo '<none>')"
+        log_debug "Installed PPD filter/color options:"
+        log_debug "$(grep -iE 'ColorModel|cupsFilter|color-mode|grayscale' "$installed_ppd" || echo '<none>')"
     else
-        log_warn "Installed PPD not found at $installed_ppd — pdftops-renderer option not set"
+        log_warn "Installed PPD not found at $installed_ppd — grayscale pre-filter not added"
     fi
-
-    # Also set pdftops-renderer via lpoptions so cups-filters receives
-    # it as a command-line option (PPD default alone is not enough —
-    # the pdftops filter reads the option from the CUPS filter args,
-    # and lpoptions writes to /etc/cups/lpoptions which CUPS always
-    # passes to filters).
-    sudo lpoptions -p "$PRINTER_NAME" -o pdftops-renderer=gs
-    log_debug "lpoptions set: pdftops-renderer=gs"
 
     # Debug: verify PPD options are visible to CUPS
     log_debug "Printer options after configure:"
-    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|pdftops' || echo '<no matching options>')"
+    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode' || echo '<no matching options>')"
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"

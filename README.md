@@ -153,10 +153,13 @@ cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupsw
 - Restart CUPS: `sudo systemctl restart cups`
 
 ### Android: color settings ignored
-The default PDF-to-PostScript renderer (Poppler) cannot convert to grayscale.
-The script adds `pdftops-renderer=gs` to the installed PPD so Ghostscript is
-used instead, which correctly handles monochrome conversion. If you installed
-before this fix, re-run the installer.
+The CUPS filter chain uses Poppler for PDF-to-PostScript conversion, which
+cannot convert to grayscale. The `pdftops-renderer` PPD option doesn't work
+with cups-filters 2.x. Instead, the script installs a **Ghostscript-based
+grayscale pre-filter** (`brother_grayscale_prefilter`) that converts the PDF
+to grayscale *before* it enters the CUPS filter chain. This is registered in
+the PPD via `*cupsFilter2`. If you installed before this fix, re-run the
+installer.
 
 ### Android: "printing service is not enabled" error
 This is caused by a hostname mismatch — Android connects using the
