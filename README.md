@@ -153,11 +153,13 @@ cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupsw
 - Restart CUPS: `sudo systemctl restart cups`
 
 ### Android: color settings ignored
-The Brother PPD has a native `BRMonoColor` option for grayscale printing. The
-script patches the PPD with `*APPrinterPreset` entries that map Android/iOS's
-IPP `print-color-mode=monochrome` to `BRMonoColor=BrMono`, so the Brother
-driver handles grayscale conversion natively. If you installed before this fix,
-re-run the installer.
+CUPS maps IPP `print-color-mode=monochrome` to the PPD's standard `ColorModel`
+option. But the Brother driver reads its own proprietary `BRMonoColor` option
+and ignores `ColorModel`. The script patches the installed Brother filter script
+(`brlpdwrapperdcp130c`) to detect `ColorModel=Gray` or `print-color-mode=monochrome`
+in the CUPS job options and translate them to `BRMonoColor=BrMono`, so the
+Brother driver receives the grayscale instruction in its native format.
+If you installed before this fix, re-run the installer.
 
 ### Android: "printing service is not enabled" error
 This is caused by a hostname mismatch — Android connects using the

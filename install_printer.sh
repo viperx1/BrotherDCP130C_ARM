@@ -948,6 +948,34 @@ install_drivers() {
         log_debug "Original Brother filter restored: $brother_filter"
     fi
 
+    # Patch the Brother filter script to translate CUPS color mode options
+    # to the Brother-specific BRMonoColor option.
+    #
+    # When Android/iOS sends print-color-mode=monochrome, CUPS maps it to
+    # ColorModel=Gray (standard PPD option). But the Brother driver reads
+    # BRMonoColor (a Brother-specific PPD option) and ignores ColorModel.
+    # This patch injects BRMonoColor=BrMono into the options when the CUPS
+    # options contain ColorModel=Gray or print-color-mode=monochrome.
+    if [[ -f "$brother_filter" ]]; then
+        if ! grep -q 'BRMonoColor' "$brother_filter"; then
+            log_debug "Patching Brother filter to translate ColorModel to BRMonoColor..."
+            # Insert color mode translation right after the shebang line
+            sudo sed -i '1 a\
+# --- Grayscale patch: translate CUPS ColorModel to Brother BRMonoColor ---\
+# CUPS maps IPP print-color-mode=monochrome to ColorModel=Gray,\
+# but the Brother driver reads BRMonoColor instead of ColorModel.\
+case "$5" in\
+  *ColorModel=Gray*|*print-color-mode=monochrome*)\
+    set -- "$1" "$2" "$3" "$4" "$(echo "$5" | sed '\''s/BRMonoColor=BrColor/BRMonoColor=BrMono/g'\'') BRMonoColor=BrMono" "$6"\
+    ;;\
+esac\
+# --- End grayscale patch ---' "$brother_filter"
+            log_debug "Brother filter patched for grayscale: $brother_filter"
+        else
+            log_debug "Brother filter already has BRMonoColor handling"
+        fi
+    fi
+
     # Restart CUPS to pick up new filters
     log_debug "Restarting CUPS to pick up new filters..."
     sudo systemctl restart cups 2>/dev/null || true
