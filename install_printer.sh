@@ -158,6 +158,8 @@ resolve_package() {
 # Fix broken dpkg state from previous failed installs.
 # A broken package (e.g. dcp130clpr:i386 "needs to be reinstalled") blocks
 # ALL apt-get operations, so this must run before install_dependencies().
+# We also detect "unpacked" state (package extracted but not configured),
+# which can leave broken dependency chains.
 fix_broken_packages() {
     local packages_fixed=0
     for pkg in dcp130clpr dcp130ccupswrapper "dcp130clpr:i386" "dcp130ccupswrapper:i386"; do
@@ -165,7 +167,8 @@ fix_broken_packages() {
             local status
             status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
             log_debug "fix_broken_packages: $pkg status='$status'"
-            if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured"; then
+            if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured" || \
+               echo "$status" | grep -qw "unpacked"; then
                 log_warn "Fixing broken package state: $pkg ($status)"
 
                 # pkg_base is the package name without architecture qualifier
@@ -177,7 +180,7 @@ fix_broken_packages() {
                 # First, neutralize any broken maintainer scripts that may
                 # prevent dpkg from completing the removal (e.g. scripts that
                 # call /etc/init.d/lpd which doesn't exist on modern systems).
-                for script in prerm postrm; do
+                for script in preinst postinst prerm postrm; do
                     for sp in "/var/lib/dpkg/info/${pkg_base}.${script}" \
                               "/var/lib/dpkg/info/${pkg}.${script}"; do
                         if [[ -f "$sp" ]]; then
@@ -226,6 +229,11 @@ fix_broken_packages() {
     done
 
     if [[ $packages_fixed -eq 1 ]]; then
+        # Run apt-get install -f to resolve any remaining dependency issues
+        # left over after purging broken packages
+        log_debug "Running apt-get install -f to fix remaining dependency issues..."
+        sudo apt-get install -f -y 2>/dev/null || true
+
         # Verify apt-get works now
         log_debug "Verifying apt-get works after cleanup..."
         local check_output
