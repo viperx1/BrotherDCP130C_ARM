@@ -96,6 +96,27 @@ direct usb://Brother/DCP-130C?serial=BROB7F595603
 
 ## Troubleshooting
 
+### Debug mode
+
+Run the script with `--debug` for verbose diagnostic output:
+```bash
+sudo ./install_printer.sh --debug
+```
+
+### Driver download fails
+
+Brother may remove or move driver files over time. The script tries multiple
+download sources automatically. If all sources fail, you can download the
+drivers manually and place them in `/tmp/brother_dcp130c_install/`:
+
+```bash
+mkdir -p /tmp/brother_dcp130c_install
+# Download dcp130clpr-1.0.1-1.i386.deb and dcp130ccupswrapper-1.0.1-1.i386.deb
+# from Brother's support website or another source, then:
+cp dcp130clpr-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130clpr.deb
+cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupswrapper.deb
+```
+
 ### Printer not detected
 - Ensure the printer is powered on and connected via USB
 - Try a different USB cable or port
@@ -115,8 +136,8 @@ direct usb://Brother/DCP-130C?serial=BROB7F595603
 
 ### Driver Sources
 
-- **LPR Driver**: dcp130clpr-1.1.2-1.i386.deb
-- **CUPS Wrapper**: dcp130ccupswrapper-1.1.2-1.i386.deb
+- **LPR Driver**: dcp130clpr-1.0.1-1.i386.deb
+- **CUPS Wrapper**: dcp130ccupswrapper-1.0.1-1.i386.deb
 
 The script modifies these i386 packages to work on ARM architecture by:
 1. Extracting the .deb packages
