@@ -513,11 +513,12 @@ install_drivers() {
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
 
-    # The cupswrapper script creates its own printer named "DCP130C" (without
-    # the "Brother_" prefix). Remove it to avoid confusion — we'll create our
-    # own properly-configured printer in configure_printer().
+    # The cupswrapper script auto-creates a printer named "DCP130C" (without
+    # the "Brother_" prefix) using lpadmin internally. We remove it because
+    # configure_printer() will create our own "Brother_DCP_130C" with the
+    # correct URI and settings. The duplicate would otherwise appear in CUPS.
     if lpstat -p DCP130C &>/dev/null; then
-        log_debug "Removing cupswrapper's auto-created 'DCP130C' printer (we use '$PRINTER_NAME' instead)"
+        log_info "Removing cupswrapper's auto-created 'DCP130C' printer (we create '$PRINTER_NAME' instead)"
         sudo lpadmin -x DCP130C 2>/dev/null || true
     fi
 
@@ -575,31 +576,35 @@ install_drivers() {
         if [[ $i386_binaries_failed -gt 0 ]]; then
             log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 binaries cannot execute on this ARM system!"
             log_warn "This will prevent the printer from working."
-            log_info "Installing qemu-user-static for i386 binary support..."
-            sudo apt-get install -y qemu-user-static 2>&1 | tail -5
-            local apt_status=${PIPESTATUS[0]}
-            if [[ $apt_status -eq 0 ]]; then
-                log_info "Installed qemu-user-static. Re-checking binaries..."
-                local recheck_failed=0
-                while IFS= read -r -d '' bin_file; do
-                    local bin_type
-                    bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
-                    if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
-                        if ! can_execute_binary "$bin_file"; then
-                            recheck_failed=$((recheck_failed + 1))
-                            log_debug "Still fails after qemu-user-static: $bin_file"
-                        fi
+            log_info "Setting up i386 binary support (qemu-user-static + libc6:i386)..."
+
+            # Step 1: Install qemu-user-static for binfmt_misc i386 emulation
+            sudo apt-get install -y qemu-user-static 2>&1 | tail -3
+
+            # Step 2: Add i386 architecture and install libc6:i386 — the i386
+            # ELF binaries need both the emulator AND the i386 C library
+            sudo dpkg --add-architecture i386 2>/dev/null || true
+            sudo apt-get update -qq 2>/dev/null || true
+            sudo apt-get install -y libc6:i386 2>&1 | tail -3 || log_warn "Could not install libc6:i386"
+
+            # Re-check binaries after installing i386 support
+            log_info "Re-checking binaries after i386 support installation..."
+            local recheck_failed=0
+            while IFS= read -r -d '' bin_file; do
+                local bin_type
+                bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
+                if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
+                    if ! can_execute_binary "$bin_file"; then
+                        recheck_failed=$((recheck_failed + 1))
+                        log_debug "Still fails: $bin_file"
                     fi
-                done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
-                if [[ $recheck_failed -gt 0 ]]; then
-                    log_warn "$recheck_failed binaries still can't execute. Printing may not work."
-                    log_warn "You may need i386 libraries: sudo dpkg --add-architecture i386 && sudo apt-get update && sudo apt-get install -y libc6:i386"
-                else
-                    log_info "All Brother binaries now execute successfully."
                 fi
+            done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
+            if [[ $recheck_failed -gt 0 ]]; then
+                log_warn "$recheck_failed binaries still can't execute. Printing may not work."
+                log_warn "Try manually: sudo apt-get install -y qemu-user-static libc6:i386 libstdc++6:i386"
             else
-                log_warn "Could not install qemu-user-static. Printing may not work."
-                log_warn "Try manually: sudo apt-get install qemu-user-static"
+                log_info "All Brother binaries now execute successfully."
             fi
         else
             log_info "All Brother i386 binaries execute successfully on this ARM system."
@@ -862,12 +867,10 @@ EOF
         
         # Show job status and diagnostics
         log_info "Test page sent. Checking job status..."
-        log_debug "Print queue:"
-        log_debug "$(lpq -P "$PRINTER_NAME" 2>/dev/null || echo 'lpq not available')"
         
         local printer_status
         printer_status=$(lpstat -p "$PRINTER_NAME" 2>/dev/null || echo 'unknown')
-        log_debug "Printer status: $printer_status"
+        log_info "Printer status: $printer_status"
         
         # Show all recent jobs for this printer
         log_debug "Recent print jobs:"
@@ -878,27 +881,35 @@ EOF
             local new_log_entries
             new_log_entries=$(tail -n +"$((log_lines_before + 1))" /var/log/cups/error_log 2>/dev/null || true)
             if [[ -n "$new_log_entries" ]]; then
-                log_debug "CUPS log entries for this print job:"
-                log_debug "$new_log_entries"
-                # Check for specific error types
-                if echo "$new_log_entries" | grep -qi "not available\|no such file\|filter failed\|Broken pipe\|exec format error"; then
+                # Filter to show only important lines (errors, warnings, job/filter activity)
+                # Skip verbose IPP client chatter (Client N, HTTP, Content-Length, etc.)
+                local important_entries
+                important_entries=$(echo "$new_log_entries" | grep -iE "^\w \[.*\] \[Job [0-9]|^E \[|filter|backend|Started |PID [0-9]+ .* exited" || true)
+                if [[ -n "$important_entries" ]]; then
+                    log_debug "CUPS job/filter log entries:"
+                    log_debug "$important_entries"
+                fi
+                # Check for actual filter/backend errors (NOT normal client disconnects)
+                if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error)"; then
                     log_warn "CUPS filter errors detected — the filter pipeline may not be working."
                     log_warn "This usually means the Brother i386 binary can't run on ARM."
-                    log_warn "Try: sudo apt-get install qemu-user-static"
+                    log_warn "Try: sudo dpkg --add-architecture i386 && sudo apt-get update && sudo apt-get install -y qemu-user-static libc6:i386"
                 fi
             else
                 log_debug "No new CUPS log entries for this print job"
-                log_warn "CUPS did not log any activity for this print job."
-                log_warn "This may indicate the job was silently dropped or the USB backend is not responding."
             fi
         fi
 
-        # Check the job-specific log in /var/log/cups/ if available
-        local latest_job_log
-        latest_job_log=$(find /var/log/cups/ -maxdepth 1 -name 'd[0-9]*-[0-9]*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
-        if [[ -n "$latest_job_log" ]]; then
-            log_debug "Latest CUPS job log: $latest_job_log"
-            log_debug "$(tail -20 "$latest_job_log" 2>/dev/null || echo 'could not read job log')"
+        # Wait for the print job to leave the queue before restarting CUPS
+        # (restarting while the job is active would kill it)
+        local wait_count=0
+        while lpq -P "$PRINTER_NAME" 2>/dev/null | grep -q "active\|pending" && [[ $wait_count -lt 30 ]]; do
+            log_debug "Print job still in queue, waiting..."
+            sleep 2
+            wait_count=$((wait_count + 1))
+        done
+        if [[ $wait_count -ge 30 ]]; then
+            log_warn "Print job still in queue after 60 seconds. It may be stuck."
         fi
 
         # Restore CUPS log level if we changed it
