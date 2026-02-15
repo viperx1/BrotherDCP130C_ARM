@@ -583,8 +583,10 @@ install_drivers() {
             # On Raspberry Pi OS (armhf), libc6:i386 is not available via apt
             # because i386 repos don't exist. We download it directly from
             # Debian mirrors and extract the needed files.
-            if [[ ! -f /lib/ld-linux.so.2 ]]; then
-                log_info "i386 dynamic linker missing (/lib/ld-linux.so.2). Downloading from Debian mirrors..."
+            if [[ ! -f /lib/ld-linux.so.2 ]] || [[ ! -f /lib/i386-linux-gnu/libc.so.6 ]]; then
+                log_info "i386 libraries missing. Downloading from Debian mirrors..."
+                log_debug "ld-linux.so.2 exists: $(test -f /lib/ld-linux.so.2 && echo yes || echo no)"
+                log_debug "libc.so.6 exists: $(test -f /lib/i386-linux-gnu/libc.so.6 && echo yes || echo no)"
                 local i386_tmp
                 i386_tmp=$(mktemp -d)
                 local libc6_deb="${i386_tmp}/libc6_i386.deb"
@@ -614,6 +616,18 @@ install_drivers() {
                             sudo mkdir -p /lib/i386-linux-gnu
                             sudo cp -a "${i386_tmp}/extract/lib/i386-linux-gnu/"* /lib/i386-linux-gnu/ 2>/dev/null || true
                             log_debug "Copied i386 libs to /lib/i386-linux-gnu/"
+                            # Verify libc.so.6 was extracted
+                            if [[ -f /lib/i386-linux-gnu/libc.so.6 ]]; then
+                                log_info "Installed i386 libc: /lib/i386-linux-gnu/libc.so.6"
+                            else
+                                log_warn "libc.so.6 not found after extraction"
+                            fi
+                        fi
+                        # Register i386 library path with the dynamic linker
+                        if ! grep -qsF 'i386-linux-gnu' /etc/ld.so.conf.d/i386-linux-gnu.conf 2>/dev/null; then
+                            echo "/lib/i386-linux-gnu" | sudo tee /etc/ld.so.conf.d/i386-linux-gnu.conf > /dev/null
+                            sudo ldconfig 2>/dev/null || true
+                            log_debug "Registered /lib/i386-linux-gnu in ld.so.conf.d"
                         fi
                     else
                         log_warn "Could not download libc6 i386 from Debian mirrors."
@@ -623,7 +637,16 @@ install_drivers() {
                 fi
                 rm -rf "$i386_tmp"
             else
-                log_debug "i386 dynamic linker already present: /lib/ld-linux.so.2"
+                log_debug "i386 libraries already present: /lib/ld-linux.so.2 and /lib/i386-linux-gnu/libc.so.6"
+            fi
+
+            # Fix Raspberry Pi /etc/ld.so.preload that causes errors under qemu-user-static.
+            # The ARM-specific libarmmem library preload makes i386 binaries emit errors.
+            # We comment out the libarmmem line so it doesn't interfere with i386 execution.
+            if [[ -f /etc/ld.so.preload ]] && grep -q 'libarmmem' /etc/ld.so.preload 2>/dev/null; then
+                log_info "Fixing /etc/ld.so.preload for i386 compatibility..."
+                sudo sed -i 's|^[[:space:]]*/usr/lib/arm-linux-gnueabihf/libarmmem|# Commented for i386 compat: /usr/lib/arm-linux-gnueabihf/libarmmem|' /etc/ld.so.preload
+                log_debug "Commented out libarmmem preload to prevent i386 binary errors"
             fi
 
             # Re-check binaries after installing i386 support
@@ -635,7 +658,10 @@ install_drivers() {
                 if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
                     if ! can_execute_binary "$bin_file"; then
                         recheck_failed=$((recheck_failed + 1))
+                        local run_err
+                        run_err=$("$bin_file" 2>&1 || true)
                         log_debug "Still fails: $bin_file"
+                        log_debug "  Error: ${run_err:-<no output>}"
                     fi
                 fi
             done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
@@ -933,13 +959,16 @@ EOF
                     log_debug "$important_entries"
                 fi
                 # Check for actual filter/backend errors (NOT normal client disconnects)
-                if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error|ld-linux|Could not open)" \
+                if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error|ld-linux|Could not open|cannot open shared object|libarmmem)" \
                     || echo "$new_log_entries" | grep -qP "\[Job [0-9]+\].*Sent 0 bytes"; then
                     log_warn "CUPS filter errors detected — the filter pipeline is not working correctly."
-                    if echo "$new_log_entries" | grep -qiE "ld-linux|Could not open"; then
-                        log_warn "Root cause: i386 dynamic linker (/lib/ld-linux.so.2) is missing."
-                        log_warn "The Brother driver binary cannot execute without it."
+                    if echo "$new_log_entries" | grep -qiE "ld-linux|Could not open|cannot open shared object"; then
+                        log_warn "Root cause: i386 shared libraries are missing or not found."
+                        log_warn "The Brother driver binary cannot execute without them."
                         log_warn "Re-run this script to attempt automatic fix, or see README for manual steps."
+                    elif echo "$new_log_entries" | grep -qiE "libarmmem"; then
+                        log_warn "Root cause: ARM-specific preload library interfering with i386 emulation."
+                        log_warn "Re-run this script — it will fix /etc/ld.so.preload automatically."
                     else
                         log_warn "This usually means the Brother i386 binary can't run on ARM."
                     fi
