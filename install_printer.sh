@@ -45,6 +45,7 @@ log_debug() {
 PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
+PRINTER_SHARED=false
 
 # Patch lpadmin calls in a script file by commenting them out.
 # This prevents Brother's cupswrapper scripts from auto-creating printers.
@@ -105,6 +106,23 @@ check_architecture() {
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             exit 1
         fi
+    fi
+}
+
+# Ask user whether to enable printer sharing on the local network.
+# When enabled, the printer will be shared via CUPS and discoverable
+# on the LAN through Avahi/Bonjour (mDNS).
+ask_printer_sharing() {
+    echo
+    log_info "Printer sharing allows other devices on your local network to discover and use this printer."
+    read -p "Do you want to enable printer sharing on the local network? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRINTER_SHARED=true
+        log_info "Printer sharing will be enabled."
+    else
+        PRINTER_SHARED=false
+        log_info "Printer sharing will not be enabled. The printer will only be available locally."
     fi
 }
 
@@ -316,6 +334,72 @@ setup_cups_service() {
         log_info "Added $USER to lpadmin group. You may need to log out and back in for this to take effect."
     else
         log_debug "User $USER is already in lpadmin group"
+    fi
+
+    if [[ "$PRINTER_SHARED" == true ]]; then
+        log_info "Configuring CUPS for network printer sharing..."
+
+        # Allow CUPS to listen on all network interfaces (not just localhost)
+        local cupsd_conf="/etc/cups/cupsd.conf"
+        if [[ -f "$cupsd_conf" ]]; then
+            # Back up the original configuration
+            sudo cp "$cupsd_conf" "${cupsd_conf}.bak"
+
+            # Replace "Listen localhost:631" with "Port 631" so CUPS listens on all interfaces
+            if grep -q '^Listen localhost:631' "$cupsd_conf"; then
+                log_debug "Changing CUPS to listen on all interfaces (Port 631)..."
+                sudo sed -i 's/^Listen localhost:631/Port 631/' "$cupsd_conf"
+            elif ! grep -q '^Port 631' "$cupsd_conf"; then
+                log_debug "Adding Port 631 directive to cupsd.conf..."
+                echo 'Port 631' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
+            # Enable sharing in cupsd.conf
+            if grep -q '^Browsing' "$cupsd_conf"; then
+                sudo sed -i 's/^Browsing .*/Browsing On/' "$cupsd_conf"
+            else
+                echo 'Browsing On' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
+            if grep -q '^DefaultAuthType' "$cupsd_conf"; then
+                log_debug "DefaultAuthType already set"
+            fi
+
+            # Allow remote access to the printer in the <Location /> block
+            # Add "Allow @LOCAL" if not already present so LAN clients can print
+            if ! grep -q 'Allow @LOCAL' "$cupsd_conf"; then
+                log_debug "Adding 'Allow @LOCAL' to CUPS access control..."
+                sudo sed -i '/<Location \/>/,/<\/Location>/ {
+                    /Order allow,deny/a\  Allow @LOCAL
+                }' "$cupsd_conf"
+            fi
+
+            # Allow remote access to /printers as well
+            if grep -q '<Location /printers>' "$cupsd_conf"; then
+                if ! sudo sed -n '/<Location \/printers>/,/<\/Location>/p' "$cupsd_conf" | grep -q 'Allow @LOCAL'; then
+                    sudo sed -i '/<Location \/printers>/,/<\/Location>/ {
+                        /Order allow,deny/a\  Allow @LOCAL
+                    }' "$cupsd_conf"
+                fi
+            fi
+
+            log_debug "Updated cupsd.conf for network sharing"
+        fi
+
+        # Install and enable Avahi for mDNS/Bonjour printer discovery on LAN
+        if ! dpkg -s avahi-daemon &>/dev/null; then
+            log_info "Installing Avahi daemon for network printer discovery..."
+            sudo apt-get install -y avahi-daemon 2>&1 | tail -3
+        else
+            log_debug "Avahi daemon is already installed"
+        fi
+        sudo systemctl enable avahi-daemon 2>/dev/null || true
+        sudo systemctl start avahi-daemon 2>/dev/null || true
+        log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
+
+        # Restart CUPS to apply configuration changes
+        log_info "Restarting CUPS to apply sharing configuration..."
+        sudo systemctl restart cups
     fi
     
     log_info "CUPS service is running."
@@ -880,12 +964,13 @@ configure_printer() {
         if [[ -n "$cups_driver" ]]; then
             log_info "Found CUPS driver: $cups_driver"
             log_info "Adding printer to CUPS using driver..."
-            log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -m $cups_driver -E -o printer-is-shared=false"
+            local share_opt="printer-is-shared=$PRINTER_SHARED"
+            log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -m $cups_driver -E -o $share_opt"
             sudo lpadmin -p "$PRINTER_NAME" \
                 -v "$PRINTER_URI" \
                 -m "$cups_driver" \
                 -E \
-                -o printer-is-shared=false
+                -o "$share_opt"
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -966,13 +1051,14 @@ PPEOF
     fi
     
     # Add the printer
+    local share_opt="printer-is-shared=$PRINTER_SHARED"
     log_info "Adding printer to CUPS..."
-    log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -P $ppd_file -E -o printer-is-shared=false"
+    log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -P $ppd_file -E -o $share_opt"
     sudo lpadmin -p "$PRINTER_NAME" \
         -v "$PRINTER_URI" \
         -P "$ppd_file" \
         -E \
-        -o printer-is-shared=false
+        -o "$share_opt"
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"
@@ -1140,6 +1226,18 @@ display_info() {
     log_info "Printer Status:"
     lpstat -p "$PRINTER_NAME" || true
     echo
+    if [[ "$PRINTER_SHARED" == true ]]; then
+        local ip_addr
+        ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+        log_info "Printer sharing: ENABLED"
+        log_info "Other devices on the network can discover and use this printer."
+        if [[ -n "$ip_addr" ]]; then
+            log_info "CUPS web interface: http://${ip_addr}:631"
+        fi
+    else
+        log_info "Printer sharing: DISABLED (local only)"
+    fi
+    echo
     log_info "To print a file, use: lpr -P $PRINTER_NAME <filename>"
     log_info "To check printer status: lpstat -p $PRINTER_NAME"
     log_info "To view print queue: lpq -P $PRINTER_NAME"
@@ -1163,6 +1261,7 @@ main() {
     
     check_root
     check_architecture
+    ask_printer_sharing
     fix_broken_packages
     install_dependencies
     setup_cups_service

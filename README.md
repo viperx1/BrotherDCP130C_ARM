@@ -21,8 +21,9 @@ The installation script (`install_printer.sh`) performs the following:
 2. **Downloads Drivers**: Fetches official Brother DCP-130C drivers from Brother's website
 3. **ARM Compatibility**: Modifies i386 drivers to work on ARM architecture
 4. **Automatic Configuration**: Configures the printer in CUPS automatically
-5. **Test Print**: Offers optional test page printing to verify installation
-6. **Error Handling**: Includes robust error checking and logging
+5. **Printer Sharing**: Optional LAN sharing with Avahi/Bonjour discovery so other devices on the network can find and use the printer
+6. **Test Print**: Offers optional test page printing to verify installation
+7. **Error Handling**: Includes robust error checking and logging
 
 ## Installation
 
@@ -53,10 +54,12 @@ sudo ./install_printer.sh
 
 The script will:
 - Check system architecture
-- Install CUPS and dependencies
+- Ask whether to enable printer sharing on the local network
+- Install CUPS and dependencies (plus Avahi if sharing is enabled)
 - Download and prepare drivers for ARM
 - Install the printer drivers
 - Configure the printer in CUPS
+- If sharing was enabled, configure CUPS for network access and Avahi/Bonjour discovery
 - Optionally print a test page
 
 ## Usage
@@ -80,6 +83,18 @@ After installation, you can:
 
 - **Manage printer via web interface**:
   Open http://localhost:631 in your browser
+
+### Printer Sharing
+
+During installation, the script asks whether you want to share the printer on your local network. If you choose **yes**:
+
+- CUPS is configured to listen on all network interfaces (port 631)
+- Avahi (mDNS/Bonjour) is installed and enabled so other devices can automatically discover the printer
+- The printer is marked as shared in CUPS
+
+Other computers on the same network (Linux, macOS, Windows) can then discover and add the printer automatically. On macOS, it will appear in **System Settings > Printers & Scanners**. On Linux, it will appear through CUPS browsing. On Windows, it can be added via the CUPS IPP URL (e.g. `http://<raspberry-pi-ip>:631/printers/Brother_DCP_130C`).
+
+If you chose **no** during installation, the printer is only available locally on the Raspberry Pi.
 
 ## Verification
 
