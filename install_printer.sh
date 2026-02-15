@@ -601,8 +601,12 @@ install_drivers() {
                 if [[ -n "$libc6_filename" ]]; then
                     log_debug "Downloading: ${libc6_url}${libc6_filename}"
                     if wget -q --timeout=30 -O "$libc6_deb" "${libc6_url}${libc6_filename}" 2>/dev/null; then
-                        log_debug "Extracting i386 dynamic linker..."
+                        log_debug "Extracting i386 libraries..."
                         dpkg-deb -x "$libc6_deb" "${i386_tmp}/extract/" 2>/dev/null
+                        # Debug: show what was extracted
+                        if [[ "$DEBUG" == "1" ]]; then
+                            log_debug "Extracted directories: $(find "${i386_tmp}/extract/" -maxdepth 4 -type d 2>/dev/null | head -20)"
+                        fi
                         # Copy ld-linux.so.2 to /lib/ where the kernel's binfmt_misc expects it
                         local ld_linux
                         ld_linux=$(find "${i386_tmp}/extract/" \( -name 'ld-linux.so.2' -o -name 'ld-linux*.so*' \) 2>/dev/null | head -1)
@@ -611,24 +615,43 @@ install_drivers() {
                             sudo chmod 755 /lib/ld-linux.so.2
                             log_info "Installed i386 dynamic linker: /lib/ld-linux.so.2"
                         fi
-                        # Copy i386 libs to /lib/i386-linux-gnu/ for the binaries to find
-                        if [[ -d "${i386_tmp}/extract/lib/i386-linux-gnu" ]]; then
+                        # Find and copy i386 libs — glibc 2.43+ may use usr/lib/i386-linux-gnu/ instead of lib/i386-linux-gnu/
+                        local i386_lib_dir
+                        i386_lib_dir=$(find "${i386_tmp}/extract/" -type d -name 'i386-linux-gnu' 2>/dev/null | head -1)
+                        if [[ -n "$i386_lib_dir" ]]; then
+                            log_debug "Found i386 lib directory: $i386_lib_dir"
                             sudo mkdir -p /lib/i386-linux-gnu
-                            sudo cp -a "${i386_tmp}/extract/lib/i386-linux-gnu/"* /lib/i386-linux-gnu/ 2>/dev/null || true
+                            sudo cp -a "${i386_lib_dir}/"* /lib/i386-linux-gnu/ 2>/dev/null || true
                             log_debug "Copied i386 libs to /lib/i386-linux-gnu/"
-                            # Verify libc.so.6 was extracted
-                            if [[ -f /lib/i386-linux-gnu/libc.so.6 ]]; then
-                                log_info "Installed i386 libc: /lib/i386-linux-gnu/libc.so.6"
+                        else
+                            log_debug "No i386-linux-gnu directory found, searching for libc.so.6 directly..."
+                            local libc_so
+                            libc_so=$(find "${i386_tmp}/extract/" \( -name 'libc.so.6' -o -name 'libc-*.so' \) 2>/dev/null | head -1)
+                            if [[ -n "$libc_so" ]]; then
+                                local libc_dir
+                                libc_dir=$(dirname "$libc_so")
+                                log_debug "Found libc.so.6 at: $libc_so (dir: $libc_dir)"
+                                sudo mkdir -p /lib/i386-linux-gnu
+                                sudo cp -a "${libc_dir}/"*.so* /lib/i386-linux-gnu/ 2>/dev/null || true
+                                log_debug "Copied i386 libs from $libc_dir to /lib/i386-linux-gnu/"
                             else
-                                log_warn "libc.so.6 not found after extraction"
+                                log_warn "Could not find libc.so.6 anywhere in extracted package"
+                                log_debug "Extracted contents: $(find "${i386_tmp}/extract/" -type f -name '*.so*' 2>/dev/null | head -20)"
                             fi
                         fi
-                        # Register i386 library path with the dynamic linker
-                        if ! grep -qsF 'i386-linux-gnu' /etc/ld.so.conf.d/i386-linux-gnu.conf 2>/dev/null; then
-                            echo "/lib/i386-linux-gnu" | sudo tee /etc/ld.so.conf.d/i386-linux-gnu.conf > /dev/null
-                            sudo ldconfig 2>/dev/null || true
-                            log_debug "Registered /lib/i386-linux-gnu in ld.so.conf.d"
+                        # Verify libc.so.6 was installed
+                        if [[ -f /lib/i386-linux-gnu/libc.so.6 ]]; then
+                            log_info "Installed i386 libc: /lib/i386-linux-gnu/libc.so.6"
+                        else
+                            log_warn "libc.so.6 not found at /lib/i386-linux-gnu/libc.so.6 after extraction"
                         fi
+                        # Register i386 library paths with the dynamic linker
+                        if ! grep -qsF 'i386-linux-gnu' /etc/ld.so.conf.d/i386-linux-gnu.conf 2>/dev/null; then
+                            printf "/lib/i386-linux-gnu\n/usr/lib/i386-linux-gnu\n" | sudo tee /etc/ld.so.conf.d/i386-linux-gnu.conf > /dev/null
+                            log_debug "Registered i386 library paths in ld.so.conf.d"
+                        fi
+                        sudo ldconfig 2>/dev/null || true
+                        log_debug "Ran ldconfig to update library cache"
                     else
                         log_warn "Could not download libc6 i386 from Debian mirrors."
                     fi
