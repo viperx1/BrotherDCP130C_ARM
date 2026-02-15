@@ -154,12 +154,11 @@ cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupsw
 
 ### Android: color settings ignored
 The CUPS filter chain uses Poppler for PDF-to-PostScript conversion, which
-cannot convert to grayscale. The `pdftops-renderer` PPD option doesn't work
-with cups-filters 2.x. Instead, the script installs a **Ghostscript-based
-grayscale pre-filter** (`brother_grayscale_prefilter`) that converts the PDF
-to grayscale *before* it enters the CUPS filter chain. This is registered in
-the PPD via `*cupsFilter2`. If you installed before this fix, re-run the
-installer.
+cannot convert to grayscale. The script wraps the Brother CUPS filter
+(`brlpdwrapperdcp130c`) with a **Ghostscript-based grayscale converter** that
+detects `ColorModel=Gray` or `print-color-mode=monochrome` in the job options
+and converts PostScript to grayscale before passing it to the real Brother
+filter. If you installed before this fix, re-run the installer.
 
 ### Android: "printing service is not enabled" error
 This is caused by a hostname mismatch — Android connects using the
