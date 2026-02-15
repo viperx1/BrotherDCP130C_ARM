@@ -513,11 +513,20 @@ install_drivers() {
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
 
+    # The cupswrapper script creates its own printer named "DCP130C" (without
+    # the "Brother_" prefix). Remove it to avoid confusion — we'll create our
+    # own properly-configured printer in configure_printer().
+    if lpstat -p DCP130C &>/dev/null; then
+        log_debug "Removing cupswrapper's auto-created 'DCP130C' printer (we use '$PRINTER_NAME' instead)"
+        sudo lpadmin -x DCP130C 2>/dev/null || true
+    fi
+
     # Verify the filter binary/script exists
     log_debug "Checking Brother filter pipeline..."
     local filter_path="/usr/lib/cups/filter/brlpdwrapperdcp130c"
     if [[ -f "$filter_path" ]] || [[ -L "$filter_path" ]]; then
         log_debug "Filter found: $(ls -lh "$filter_path")"
+        log_debug "Filter type: $(file "$filter_path" 2>/dev/null || echo 'unknown')"
     else
         # Check alternative locations
         local alt_filter
@@ -529,6 +538,35 @@ install_drivers() {
             log_debug "Available Brother filters: $(find /usr/lib/cups/filter/ /usr/libexec/cups/filter/ -iname '*brother*' -o -iname '*brlpd*' 2>/dev/null || echo 'none')"
             log_debug "Brother printer files: $(find /usr/local/Brother/ -type f 2>/dev/null | head -20 || echo 'none')"
         fi
+    fi
+
+    # Check if the Brother LPR binary can execute on this architecture.
+    # The driver is an i386 binary - it needs binfmt_misc/qemu-user-static
+    # to run on ARM, or it may use the system's native lpr.
+    local brother_bin="/usr/local/Brother/Printer/dcp130c/lpd/filterdcp130c"
+    if [[ -f "$brother_bin" ]]; then
+        local bin_arch
+        bin_arch=$(file "$brother_bin" 2>/dev/null || echo 'unknown')
+        log_debug "Brother LPR binary: $bin_arch"
+        if echo "$bin_arch" | grep -qi "Intel 80386\|x86-64\|i386"; then
+            log_debug "Brother binary is x86 — checking if ARM can execute it..."
+            if "$brother_bin" --version &>/dev/null || "$brother_bin" &>/dev/null; then
+                log_debug "Brother binary executes successfully (binfmt_misc/qemu-user available)"
+            else
+                log_warn "Brother i386 binary cannot execute on this ARM system!"
+                log_warn "Install qemu-user-static for i386 binary support: sudo apt-get install -y qemu-user-static"
+                # Try to install qemu-user-static automatically
+                if sudo apt-get install -y qemu-user-static 2>/dev/null; then
+                    log_info "Installed qemu-user-static for i386 binary support"
+                else
+                    log_warn "Could not install qemu-user-static. Printing may not work."
+                    log_warn "Try manually: sudo apt-get install qemu-user-static"
+                fi
+            fi
+        fi
+    else
+        log_debug "Brother LPR binary not found at expected path: $brother_bin"
+        log_debug "Brother LPR files: $(find /usr/local/Brother/Printer/dcp130c/lpd/ -type f 2>/dev/null | head -10 || echo 'none')"
     fi
 
     # Restart CUPS to pick up new filters
@@ -750,26 +788,49 @@ User: $USER
 Congratulations! Your printer installation was successful.
 EOF
         
+        # Record CUPS error log position before printing
+        local log_lines_before=0
+        if [[ -f /var/log/cups/error_log ]]; then
+            log_lines_before=$(wc -l < /var/log/cups/error_log 2>/dev/null || echo 0)
+        fi
+        
         # Print the test page
         log_info "Sending test page to printer..."
-        lpr -P "$PRINTER_NAME" /tmp/test_page.txt
+        local job_output
+        job_output=$(lpr -P "$PRINTER_NAME" /tmp/test_page.txt 2>&1) || true
+        log_debug "lpr output: '${job_output:-<empty>}'"
         
-        # Wait a moment for the job to be processed
-        sleep 3
+        # Wait for the job to be processed
+        sleep 5
         
         # Show job status and diagnostics
         log_info "Test page sent. Checking job status..."
         log_debug "Print queue:"
         log_debug "$(lpq -P "$PRINTER_NAME" 2>/dev/null || echo 'lpq not available')"
-        log_debug "Printer status: $(lpstat -p "$PRINTER_NAME" 2>/dev/null || echo 'unknown')"
         
-        # Check CUPS error log for filter failures
+        local printer_status
+        printer_status=$(lpstat -p "$PRINTER_NAME" 2>/dev/null || echo 'unknown')
+        log_debug "Printer status: $printer_status"
+        
+        # Show all recent jobs for this printer
+        log_debug "Recent print jobs:"
+        log_debug "$(lpstat -W completed -o "$PRINTER_NAME" 2>/dev/null || lpstat -o "$PRINTER_NAME" 2>/dev/null || echo 'no jobs found')"
+        
+        # Check CUPS error log for new entries since we sent the job
         if [[ -f /var/log/cups/error_log ]]; then
-            local recent_errors
-            recent_errors=$(tail -20 /var/log/cups/error_log 2>/dev/null | grep -i "error\|fail\|filter\|dcp130c" || true)
-            if [[ -n "$recent_errors" ]]; then
-                log_debug "Recent CUPS errors:"
-                log_debug "$recent_errors"
+            local new_log_entries
+            new_log_entries=$(tail -n +"$((log_lines_before + 1))" /var/log/cups/error_log 2>/dev/null || true)
+            if [[ -n "$new_log_entries" ]]; then
+                log_debug "CUPS log entries for this print job:"
+                log_debug "$new_log_entries"
+                # Check for specific error types
+                if echo "$new_log_entries" | grep -qi "not available\|no such file\|filter failed\|Broken pipe"; then
+                    log_warn "CUPS filter errors detected — the filter pipeline may not be working."
+                    log_warn "This usually means the Brother i386 binary can't run on ARM."
+                    log_warn "Try: sudo apt-get install qemu-user-static"
+                fi
+            else
+                log_debug "No new CUPS log entries for this print job"
             fi
         fi
         
