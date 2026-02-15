@@ -426,6 +426,23 @@ extract_and_modify_drivers() {
             fi
         done
     done
+
+    # Also patch the cupswrapper script that gets installed to
+    # /usr/local/Brother/Printer/dcp130c/cupswrapper/cupswrapperdcp130c
+    # This script is called from the CUPS wrapper postinst and itself
+    # references /etc/init.d/lpd. Without patching it, the filter
+    # pipeline setup may fail silently.
+    local wrapper_script
+    wrapper_script=$(find cups_extract/ -name 'cupswrapper*dcp130c*' -type f 2>/dev/null | head -n 1)
+    if [[ -n "$wrapper_script" ]]; then
+        if grep -qF '/etc/init.d/lpd' "$wrapper_script"; then
+            log_debug "Patching cupswrapper script: $wrapper_script"
+            sed -i 's|/etc/init.d/lpd|/bin/true|g' "$wrapper_script"
+        fi
+        chmod 755 "$wrapper_script"
+    else
+        log_debug "No cupswrapper script found in cups_extract to patch"
+    fi
     
     log_debug "LPR control after modification:"
     log_debug "$(cat lpr_extract/DEBIAN/control)"
@@ -479,7 +496,45 @@ install_drivers() {
     # Fix any dependency issues
     log_debug "Running apt-get install -f to fix dependencies..."
     sudo apt-get install -f -y || true
-    
+
+    # Patch the installed cupswrapper script if it still has /etc/init.d/lpd references
+    local installed_wrapper="/usr/local/Brother/Printer/dcp130c/cupswrapper/cupswrapperdcp130c"
+    if [[ -f "$installed_wrapper" ]] && grep -qF '/etc/init.d/lpd' "$installed_wrapper"; then
+        log_debug "Patching installed cupswrapper script: $installed_wrapper"
+        sudo sed -i 's|/etc/init.d/lpd|/bin/true|g' "$installed_wrapper"
+    fi
+
+    # Re-run the cupswrapper script to ensure filter pipeline is set up correctly.
+    # The postinst may have failed partially due to /etc/init.d/lpd errors.
+    if [[ -f "$installed_wrapper" ]]; then
+        log_info "Re-running cupswrapper setup to ensure filter pipeline is configured..."
+        sudo "$installed_wrapper" 2>&1 | while IFS= read -r line; do
+            log_debug "cupswrapper: $line"
+        done || log_warn "cupswrapper script returned non-zero exit code"
+    fi
+
+    # Verify the filter binary/script exists
+    log_debug "Checking Brother filter pipeline..."
+    local filter_path="/usr/lib/cups/filter/brlpdwrapperdcp130c"
+    if [[ -f "$filter_path" ]] || [[ -L "$filter_path" ]]; then
+        log_debug "Filter found: $(ls -lh "$filter_path")"
+    else
+        # Check alternative locations
+        local alt_filter
+        alt_filter=$(find /usr/lib/cups/filter/ /usr/libexec/cups/filter/ -iname '*dcp130c*' 2>/dev/null | head -n 1)
+        if [[ -n "$alt_filter" ]]; then
+            log_debug "Filter found at alternate location: $(ls -lh "$alt_filter")"
+        else
+            log_warn "Brother filter not found in CUPS filter directory!"
+            log_debug "Available Brother filters: $(find /usr/lib/cups/filter/ /usr/libexec/cups/filter/ -iname '*brother*' -o -iname '*brlpd*' 2>/dev/null || echo 'none')"
+            log_debug "Brother printer files: $(find /usr/local/Brother/ -type f 2>/dev/null | head -20 || echo 'none')"
+        fi
+    fi
+
+    # Restart CUPS to pick up new filters
+    log_debug "Restarting CUPS to pick up new filters..."
+    sudo systemctl restart cups 2>/dev/null || true
+
     log_info "Drivers installed successfully."
 }
 
@@ -699,7 +754,27 @@ EOF
         log_info "Sending test page to printer..."
         lpr -P "$PRINTER_NAME" /tmp/test_page.txt
         
+        # Wait a moment for the job to be processed
+        sleep 3
+        
+        # Show job status and diagnostics
+        log_info "Test page sent. Checking job status..."
+        log_debug "Print queue:"
+        log_debug "$(lpq -P "$PRINTER_NAME" 2>/dev/null || echo 'lpq not available')"
+        log_debug "Printer status: $(lpstat -p "$PRINTER_NAME" 2>/dev/null || echo 'unknown')"
+        
+        # Check CUPS error log for filter failures
+        if [[ -f /var/log/cups/error_log ]]; then
+            local recent_errors
+            recent_errors=$(tail -20 /var/log/cups/error_log 2>/dev/null | grep -i "error\|fail\|filter\|dcp130c" || true)
+            if [[ -n "$recent_errors" ]]; then
+                log_debug "Recent CUPS errors:"
+                log_debug "$recent_errors"
+            fi
+        fi
+        
         log_info "Test page sent to printer. Please check the printer output."
+        log_info "If nothing printed, check CUPS logs: sudo tail -50 /var/log/cups/error_log"
     else
         log_info "Skipping test print."
     fi
