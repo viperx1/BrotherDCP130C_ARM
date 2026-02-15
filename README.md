@@ -21,8 +21,9 @@ The installation script (`install_printer.sh`) performs the following:
 2. **Downloads Drivers**: Fetches official Brother DCP-130C drivers from Brother's website
 3. **ARM Compatibility**: Modifies i386 drivers to work on ARM architecture
 4. **Automatic Configuration**: Configures the printer in CUPS automatically
-5. **Test Print**: Offers optional test page printing to verify installation
-6. **Error Handling**: Includes robust error checking and logging
+5. **Printer Sharing**: Optional LAN sharing with Avahi/Bonjour discovery so other devices on the network can find and use the printer
+6. **Test Print**: Offers optional test page printing to verify installation
+7. **Error Handling**: Includes robust error checking and logging
 
 ## Installation
 
@@ -53,10 +54,12 @@ sudo ./install_printer.sh
 
 The script will:
 - Check system architecture
-- Install CUPS and dependencies
+- Ask whether to enable printer sharing on the local network
+- Install CUPS and dependencies (plus Avahi if sharing is enabled)
 - Download and prepare drivers for ARM
 - Install the printer drivers
 - Configure the printer in CUPS
+- If sharing was enabled, configure CUPS for network access and Avahi/Bonjour discovery
 - Optionally print a test page
 
 ## Usage
@@ -80,6 +83,23 @@ After installation, you can:
 
 - **Manage printer via web interface**:
   Open http://localhost:631 in your browser
+
+### Printer Sharing
+
+During installation, the script asks whether you want to share the printer on your local network. If you choose **yes**:
+
+- CUPS is configured to listen on all network interfaces (port 631)
+- Avahi (mDNS/Bonjour) is installed and enabled so other devices can automatically discover the printer
+- The printer is marked as shared in CUPS
+
+Other devices on the same network can then discover and use the printer automatically:
+
+- **Android**: The printer appears in the built-in **Default Print Service** (no app needed). Open any document, tap **Print**, and select the Brother printer.
+- **macOS / iOS**: It will appear in **System Settings > Printers & Scanners** and in the print dialog.
+- **Linux**: It will appear through CUPS browsing.
+- **Windows**: It can be added via the CUPS IPP URL (e.g. `http://<raspberry-pi-ip>:631/printers/Brother_DCP_130C`).
+
+If you chose **no** during installation, the printer is only available locally on the Raspberry Pi.
 
 ## Verification
 
@@ -131,6 +151,31 @@ cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupsw
 - Check printer status: `lpstat -p Brother_DCP_130C`
 - Cancel stuck jobs: `cancel -a Brother_DCP_130C`
 - Restart CUPS: `sudo systemctl restart cups`
+
+### Android: color settings ignored
+CUPS maps IPP `print-color-mode=monochrome` to the PPD's standard `ColorModel`
+option. But the Brother driver reads its own proprietary `BRMonoColor` option
+and ignores `ColorModel`. The script patches the installed Brother filter script
+(`brlpdwrapperdcp130c`) to detect `ColorModel=Gray` or `print-color-mode=monochrome`
+in the CUPS job options and translate them to `BRMonoColor=BrMono`, so the
+Brother driver receives the grayscale instruction in its native format.
+If you installed before this fix, re-run the installer.
+
+### Android: "printing service is not enabled" error
+This is caused by a hostname mismatch — Android connects using the
+mDNS-discovered name but CUPS only accepts its own `ServerName` by default.
+The script adds `ServerAlias *` to `cupsd.conf` to accept any hostname.
+If the error persists after re-running the installer, verify manually:
+```bash
+grep 'ServerAlias' /etc/cups/cupsd.conf
+# Should show: ServerAlias *
+```
+
+### Android: stale/dead printers showing up
+Android caches previously discovered printers. If you see old or dead printer
+entries, clear the Android print service cache:
+
+**Settings → Apps → Default Print Service → Storage → Clear Cache**
 
 ## Technical Details
 

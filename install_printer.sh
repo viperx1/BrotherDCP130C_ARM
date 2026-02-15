@@ -45,6 +45,7 @@ log_debug() {
 PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
+PRINTER_SHARED=false
 
 # Patch lpadmin calls in a script file by commenting them out.
 # This prevents Brother's cupswrapper scripts from auto-creating printers.
@@ -54,8 +55,20 @@ patch_lpadmin_calls() {
     local prefix="${2:-}"
     if grep -q 'lpadmin' "$file"; then
         log_debug "Patching $file: commenting out lpadmin calls to prevent duplicate printer"
-        $prefix sed -i 's|^\([[:space:]]*\)\(lpadmin\)|\1# [patched] \2|g' "$file"
-        $prefix sed -i 's|^\([[:space:]]*\)\(/usr/sbin/lpadmin\)|\1# [patched] \2|g' "$file"
+        # Comment out any non-comment line containing lpadmin (covers bare
+        # "lpadmin", "/usr/sbin/lpadmin", backtick/subshell calls, and
+        # variable-assigned invocations like result=`lpadmin ...`).
+        # Lines that already start with # are left alone.
+        $prefix sed -i '/^[[:space:]]*#/!{/lpadmin/s|^\([[:space:]]*\)\(.*\)|\1# [patched] \2|}' "$file"
+        # Log any remaining unpatched lpadmin references for debugging
+        local remaining
+        remaining=$($prefix grep -n 'lpadmin' "$file" | grep -v '^[0-9]*:[[:space:]]*#' || true)
+        if [[ -n "$remaining" ]]; then
+            log_debug "Remaining lpadmin references in $file after patching:"
+            log_debug "$remaining"
+        else
+            log_debug "All lpadmin calls in $file have been patched"
+        fi
     fi
 }
 
@@ -105,6 +118,23 @@ check_architecture() {
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             exit 1
         fi
+    fi
+}
+
+# Ask user whether to enable printer sharing on the local network.
+# When enabled, the printer will be shared via CUPS and discoverable
+# on the LAN through Avahi/Bonjour (mDNS).
+ask_printer_sharing() {
+    echo
+    log_info "Printer sharing allows other devices on your local network to discover and use this printer."
+    read -p "Do you want to enable printer sharing on the local network? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRINTER_SHARED=true
+        log_info "Printer sharing will be enabled."
+    else
+        PRINTER_SHARED=false
+        log_info "Printer sharing will not be enabled. The printer will only be available locally."
     fi
 }
 
@@ -290,6 +320,7 @@ install_dependencies() {
         "$LIBCUPS"
         "$LIBCUPSIMAGE"
         printer-driver-all
+        ghostscript
         psutils
         a2ps
     )
@@ -316,6 +347,87 @@ setup_cups_service() {
         log_info "Added $USER to lpadmin group. You may need to log out and back in for this to take effect."
     else
         log_debug "User $USER is already in lpadmin group"
+    fi
+
+    if [[ "$PRINTER_SHARED" == true ]]; then
+        log_info "Configuring CUPS for network printer sharing..."
+
+        # Allow CUPS to listen on all network interfaces (not just localhost)
+        local cupsd_conf="/etc/cups/cupsd.conf"
+        if [[ -f "$cupsd_conf" ]]; then
+            # Back up the original configuration
+            sudo cp "$cupsd_conf" "${cupsd_conf}.bak"
+
+            # Replace "Listen localhost:631" with "Port 631" so CUPS listens on all interfaces
+            if grep -q '^Listen localhost:631' "$cupsd_conf"; then
+                log_debug "Changing CUPS to listen on all interfaces (Port 631)..."
+                sudo sed -i 's/^Listen localhost:631/Port 631/' "$cupsd_conf"
+            elif ! grep -q '^Port 631' "$cupsd_conf"; then
+                log_debug "Adding Port 631 directive to cupsd.conf..."
+                echo 'Port 631' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
+            # Accept requests using any hostname. Android's print service
+            # connects via the mDNS-discovered hostname which may not match
+            # CUPS' ServerName, causing a "printing service is not enabled"
+            # error on the client even though the job prints.
+            if ! grep -q '^ServerAlias' "$cupsd_conf"; then
+                log_debug "Adding ServerAlias * to cupsd.conf..."
+                sudo sed -i '/^Port 631/a ServerAlias *' "$cupsd_conf" 2>/dev/null \
+                    || echo 'ServerAlias *' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
+            # Enable sharing in cupsd.conf
+            if grep -q '^Browsing' "$cupsd_conf"; then
+                sudo sed -i 's/^Browsing .*/Browsing On/' "$cupsd_conf"
+            else
+                echo 'Browsing On' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
+            # Advertise shared printers via DNS-SD (mDNS) so they are
+            # discoverable by Android, iOS, macOS and other devices that
+            # use mDNS-based printer discovery.
+            if grep -q '^BrowseLocalProtocols' "$cupsd_conf"; then
+                sudo sed -i 's/^BrowseLocalProtocols .*/BrowseLocalProtocols dnssd/' "$cupsd_conf"
+            else
+                echo 'BrowseLocalProtocols dnssd' | sudo tee -a "$cupsd_conf" > /dev/null
+            fi
+
+            # Allow remote access to the printer in the <Location /> block
+            # Add "Allow @LOCAL" if not already present so LAN clients can print
+            if ! grep -q 'Allow @LOCAL' "$cupsd_conf"; then
+                log_debug "Adding 'Allow @LOCAL' to CUPS access control..."
+                sudo sed -i '/<Location \/>/,/<\/Location>/ {
+                    /Order allow,deny/a\  Allow @LOCAL
+                }' "$cupsd_conf"
+            fi
+
+            # Allow remote access to /printers as well
+            if grep -q '<Location /printers>' "$cupsd_conf"; then
+                if ! sudo sed -n '/<Location \/printers>/,/<\/Location>/p' "$cupsd_conf" | grep -q 'Allow @LOCAL'; then
+                    sudo sed -i '/<Location \/printers>/,/<\/Location>/ {
+                        /Order allow,deny/a\  Allow @LOCAL
+                    }' "$cupsd_conf"
+                fi
+            fi
+
+            log_debug "Updated cupsd.conf for network sharing"
+        fi
+
+        # Install and enable Avahi for mDNS/Bonjour printer discovery on LAN
+        if ! dpkg -s avahi-daemon &>/dev/null; then
+            log_info "Installing Avahi daemon for network printer discovery..."
+            sudo apt-get install -y avahi-daemon 2>&1 | tail -3
+        else
+            log_debug "Avahi daemon is already installed"
+        fi
+        sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
+        sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
+        log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
+
+        # Restart CUPS to apply configuration changes
+        log_info "Restarting CUPS to apply sharing configuration..."
+        sudo systemctl restart cups
     fi
     
     log_info "CUPS service is running."
@@ -505,6 +617,17 @@ remove_duplicate_printers() {
     local known_variants=("DCP130C" "dcp130c" "DCP-130C" "Brother-DCP-130C")
     local removed=0
 
+    # Helper: fully remove a printer queue AND its leftover PPD/config
+    # files so CUPS does not re-create it on restart.
+    _remove_printer() {
+        local p="$1"
+        sudo lpadmin -x "$p" 2>/dev/null || true
+        # Remove leftover PPD and config that would cause CUPS to
+        # resurrect the queue on next restart.
+        sudo rm -f "/etc/cups/ppd/${p}.ppd" 2>/dev/null || true
+        sudo rm -f "/etc/cups/ppd/${p}.ppd.O" 2>/dev/null || true
+    }
+
     # First check known name variants
     for variant in "${known_variants[@]}"; do
         if [[ "$variant" == "$PRINTER_NAME" ]]; then
@@ -512,7 +635,7 @@ remove_duplicate_printers() {
         fi
         if lpstat -p "$variant" &>/dev/null; then
             log_info "Removing duplicate printer '$variant' (auto-created by cupswrapper; we use '$PRINTER_NAME' instead)"
-            sudo lpadmin -x "$variant" 2>/dev/null || true
+            _remove_printer "$variant"
             removed=$((removed + 1))
         fi
     done
@@ -525,11 +648,27 @@ remove_duplicate_printers() {
             # Match any DCP-130C/dcp130c name variant (case-insensitive)
             if echo "$printer" | grep -qi "dcp[-_.]130c\|dcp130c"; then
                 log_info "Removing duplicate printer '$printer' (matches DCP-130C pattern)"
-                sudo lpadmin -x "$printer" 2>/dev/null || true
+                _remove_printer "$printer"
                 removed=$((removed + 1))
             fi
         done <<< "$all_printers"
     fi
+
+    # Also clean up orphan PPD files for known duplicate names even if
+    # the queue is already gone (prevents CUPS from re-creating them).
+    local ppd
+    for ppd in /etc/cups/ppd/*; do
+        [[ -f "$ppd" ]] || continue
+        local ppd_base
+        ppd_base=$(basename "$ppd" | sed 's/\.ppd\.O$//;s/\.ppd$//')
+        # Skip our canonical printer
+        [[ "$ppd_base" == "$PRINTER_NAME" ]] && continue
+        # Remove any PPD matching DCP-130C variants (case-insensitive)
+        if echo "$ppd_base" | grep -qi "dcp[-_.]130c\|dcp130c"; then
+            log_debug "Removing orphan PPD: $ppd"
+            sudo rm -f "$ppd"
+        fi
+    done
 
     if [[ $removed -gt 0 ]]; then
         log_info "Removed $removed duplicate DCP-130C printer(s)."
@@ -565,6 +704,9 @@ install_drivers() {
     if ! sudo dpkg -i --force-all dcp130ccupswrapper_arm.deb; then
         log_warn "CUPS wrapper driver installation reported errors, attempting to fix dependencies..."
     fi
+
+    # Debug: show what printers dpkg postinst created
+    log_debug "CUPS printers after dpkg -i cupswrapper: $(lpstat -e 2>/dev/null || echo '<none>')"
     
     # Fix any dependency issues
     log_debug "Running apt-get install -f to fix dependencies..."
@@ -580,6 +722,8 @@ install_drivers() {
         fi
         if grep -q 'lpadmin' "$installed_wrapper"; then
             patch_lpadmin_calls "$installed_wrapper" sudo
+        else
+            log_debug "No lpadmin calls found in installed cupswrapper (already patched by package)"
         fi
     fi
 
@@ -593,6 +737,9 @@ install_drivers() {
             log_debug "cupswrapper: $line"
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
+
+    # Debug: show printer state after cupswrapper re-run
+    log_debug "CUPS printers after cupswrapper re-run: $(lpstat -e 2>/dev/null || echo '<none>')"
 
     # Remove any auto-created DCP-130C printers. The cupswrapper postinst
     # (before our patches took effect) or a previous installation may have
@@ -788,6 +935,47 @@ install_drivers() {
         log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
     fi
 
+    # Restore original Brother filter if it was previously wrapped.
+    # Previous versions wrapped brlpdwrapperdcp130c with a Ghostscript
+    # grayscale converter, but this caused "No pages found!" errors
+    # because Ghostscript's ps2write output is incompatible with the
+    # Brother binary filter. The Brother driver has its own native
+    # BRMonoColor option for grayscale — no wrapper is needed.
+    local brother_filter="/usr/lib/cups/filter/brlpdwrapperdcp130c"
+    if [[ -f "${brother_filter}.real" ]]; then
+        log_debug "Restoring original Brother filter (removing grayscale wrapper)..."
+        sudo mv -f "${brother_filter}.real" "$brother_filter"
+        log_debug "Original Brother filter restored: $brother_filter"
+    fi
+
+    # Patch the Brother filter script to translate CUPS color mode options
+    # to the Brother-specific BRMonoColor option.
+    #
+    # When Android/iOS sends print-color-mode=monochrome, CUPS maps it to
+    # ColorModel=Gray (standard PPD option). But the Brother driver reads
+    # BRMonoColor (a Brother-specific PPD option) and ignores ColorModel.
+    # This patch injects BRMonoColor=BrMono into the options when the CUPS
+    # options contain ColorModel=Gray or print-color-mode=monochrome.
+    if [[ -f "$brother_filter" ]]; then
+        if ! grep -q 'BRMonoColor' "$brother_filter"; then
+            log_debug "Patching Brother filter to translate ColorModel to BRMonoColor..."
+            # Insert color mode translation right after the shebang line
+            sudo sed -i '1 a\
+# --- Grayscale patch: translate CUPS ColorModel to Brother BRMonoColor ---\
+# CUPS maps IPP print-color-mode=monochrome to ColorModel=Gray,\
+# but the Brother driver reads BRMonoColor instead of ColorModel.\
+case "$5" in\
+  *ColorModel=Gray*|*print-color-mode=monochrome*)\
+    set -- "$1" "$2" "$3" "$4" "$(echo "$5" | sed '\''s/BRMonoColor=BrColor/BRMonoColor=BrMono/g'\'') BRMonoColor=BrMono" "$6"\
+    ;;\
+esac\
+# --- End grayscale patch ---' "$brother_filter"
+            log_debug "Brother filter patched for grayscale: $brother_filter"
+        else
+            log_debug "Brother filter already has BRMonoColor handling"
+        fi
+    fi
+
     # Restart CUPS to pick up new filters
     log_debug "Restarting CUPS to pick up new filters..."
     sudo systemctl restart cups 2>/dev/null || true
@@ -871,6 +1059,30 @@ configure_printer() {
             break
         fi
     done
+
+    # Patch the discovered PPD to advertise print-color-mode support.
+    # The original Brother PPD has a BRMonoColor option for grayscale
+    # but doesn't include the IPP color-mode attributes that Android/iOS
+    # need to map their "Black & White" option. We add APPrinterPreset
+    # entries that map IPP print-color-mode to the Brother driver's
+    # native BRMonoColor option.
+    if [[ -n "$ppd_file" ]] && ! grep -q 'APPrinterPreset' "$ppd_file"; then
+        log_debug "Patching PPD to add print-color-mode IPP attributes..."
+        local patched_ppd
+        patched_ppd=$(mktemp /tmp/brother_dcp130c_patched.XXXXXX.ppd)
+        cp "$ppd_file" "$patched_ppd"
+        cat >> "$patched_ppd" << 'COLORPATCH'
+
+*% IPP print-color-mode mapping for Android/iOS printing.
+*% Maps to Brother's native BRMonoColor option which the driver
+*% understands natively — no Ghostscript conversion needed.
+*cupsIPPSupplies: True
+*APPrinterPreset Color/Color: "*BRMonoColor BrColor"
+*APPrinterPreset Grayscale/Grayscale: "*BRMonoColor BrMono"
+COLORPATCH
+        ppd_file="$patched_ppd"
+        log_debug "Patched PPD with color mode mapping: $patched_ppd"
+    fi
     
     # Check if we also have a PPD via lpinfo -m (CUPS driver list)
     if [[ -z "$ppd_file" ]]; then
@@ -880,12 +1092,24 @@ configure_printer() {
         if [[ -n "$cups_driver" ]]; then
             log_info "Found CUPS driver: $cups_driver"
             log_info "Adding printer to CUPS using driver..."
-            log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -m $cups_driver -E -o printer-is-shared=false"
+            local share_opt="printer-is-shared=$PRINTER_SHARED"
+            log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -m $cups_driver -E -o $share_opt"
             sudo lpadmin -p "$PRINTER_NAME" \
                 -v "$PRINTER_URI" \
                 -m "$cups_driver" \
                 -E \
-                -o printer-is-shared=false
+                -o "$share_opt"
+
+            # Set color mode options so Android/IPP clients can switch
+            # between color and monochrome printing.
+            sudo lpadmin -p "$PRINTER_NAME" \
+                -o print-color-mode-default=color \
+                -o print-color-mode-supported=color,monochrome \
+                -o ColorModel=RGB
+
+            # Debug: verify options were set
+            log_debug "Printer options after configure:"
+            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|BRMonoColor' || echo '<no matching options>')"
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -961,18 +1185,50 @@ configure_printer() {
 *ColorModel RGB/Color: "<</cupsColorOrder 0/cupsColorSpace 1/cupsCompression 1/cupsBitsPerColor 8>>setpagedevice"
 *ColorModel Gray/Grayscale: "<</cupsColorOrder 0/cupsColorSpace 0/cupsCompression 1/cupsBitsPerColor 8>>setpagedevice"
 *CloseUI: *ColorModel
+
+*cupsIPPSupplies: True
+*cupsLanguages: "en"
+
+*% Map IPP print-color-mode to ColorModel so Android/iOS color
+*% choices (monochrome / color) are applied correctly.
+*APPrinterPreset Color/Color: "*ColorModel RGB"
+*APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
 PPEOF
         log_debug "Generated basic PPD at $ppd_file"
     fi
     
     # Add the printer
+    local share_opt="printer-is-shared=$PRINTER_SHARED"
     log_info "Adding printer to CUPS..."
-    log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -P $ppd_file -E -o printer-is-shared=false"
+    log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -P $ppd_file -E -o $share_opt"
     sudo lpadmin -p "$PRINTER_NAME" \
         -v "$PRINTER_URI" \
         -P "$ppd_file" \
         -E \
-        -o printer-is-shared=false
+        -o "$share_opt"
+
+    # Set color mode options so Android/IPP clients can switch
+    # between color and monochrome printing.
+    sudo lpadmin -p "$PRINTER_NAME" \
+        -o print-color-mode-default=color \
+        -o print-color-mode-supported=color,monochrome \
+        -o ColorModel=RGB
+
+    # Verify the installed PPD and Brother filter
+    local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
+    if [[ -f "$installed_ppd" ]]; then
+        log_debug "Installed PPD filter/color options:"
+        log_debug "$(grep -iE 'ColorModel|cupsFilter|color-mode|BRMonoColor|APPrinterPreset' "$installed_ppd" || echo '<none>')"
+        # Ensure no stale cupsFilter2 entries from previous installs
+        if grep -q 'cupsFilter2.*brother_grayscale_prefilter' "$installed_ppd"; then
+            log_debug "Removing stale cupsFilter2 entry from installed PPD"
+            sudo sed -i '/cupsFilter2.*brother_grayscale_prefilter/d' "$installed_ppd"
+        fi
+    fi
+
+    # Debug: verify PPD options are visible to CUPS
+    log_debug "Printer options after configure:"
+    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|BRMonoColor' || echo '<no matching options>')"
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"
@@ -1140,6 +1396,21 @@ display_info() {
     log_info "Printer Status:"
     lpstat -p "$PRINTER_NAME" || true
     echo
+    if [[ "$PRINTER_SHARED" == true ]]; then
+        local ip_addr
+        ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+        log_info "Printer sharing: ENABLED"
+        log_info "Other devices on the network can discover and use this printer."
+        log_info "Android: The printer will appear automatically in the Default Print Service."
+        log_info "         If you see stale/dead printers on Android, go to"
+        log_info "         Settings > Apps > Default Print Service > Storage > Clear Cache"
+        if [[ -n "$ip_addr" ]]; then
+            log_info "CUPS web interface: http://${ip_addr}:631"
+        fi
+    else
+        log_info "Printer sharing: DISABLED (local only)"
+    fi
+    echo
     log_info "To print a file, use: lpr -P $PRINTER_NAME <filename>"
     log_info "To check printer status: lpstat -p $PRINTER_NAME"
     log_info "To view print queue: lpq -P $PRINTER_NAME"
@@ -1163,6 +1434,7 @@ main() {
     
     check_root
     check_architecture
+    ask_printer_sharing
     fix_broken_packages
     install_dependencies
     setup_cups_service
@@ -1175,6 +1447,18 @@ main() {
     configure_printer
     test_print
     cleanup
+
+    # Final cleanup: remove any duplicate printers that may have been
+    # re-created by CUPS restarts during installation.  This must be the
+    # last step before displaying results.
+    log_debug "CUPS printers before final cleanup: $(lpstat -e 2>/dev/null || echo '<none>')"
+    remove_duplicate_printers
+    # Restart CUPS once more so it forgets the removed queues
+    sudo systemctl restart cups 2>/dev/null || true
+    # Brief pause to let CUPS settle, then verify
+    sleep 2
+    log_debug "CUPS printers after final cleanup + restart: $(lpstat -e 2>/dev/null || echo '<none>')"
+
     display_info
     
     log_info "Installation script completed successfully!"
