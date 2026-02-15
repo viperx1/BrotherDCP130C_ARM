@@ -286,12 +286,6 @@ install_dependencies() {
     # Install CUPS and required tools
     sudo apt-get install -y "${packages[@]}"
     
-    # Try to install 32-bit libraries (may not be available on all ARM systems)
-    sudo apt-get install -y \
-        lib32gcc-s1 \
-        lib32stdc++6 \
-        libc6-i386 2>/dev/null || log_warn "32-bit libraries not available (not required on ARM)"
-    
     log_info "Dependencies installed successfully."
 }
 
@@ -574,21 +568,66 @@ install_drivers() {
     if [[ $i386_binaries_found -gt 0 ]]; then
         log_debug "Found $i386_binaries_found i386 ELF binaries, $i386_binaries_failed failed to execute"
         if [[ $i386_binaries_failed -gt 0 ]]; then
-            log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 binaries cannot execute on this ARM system!"
-            log_warn "This will prevent the printer from working."
-            log_info "Setting up i386 binary support (qemu-user-static + libc6:i386)..."
+            log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 binaries cannot execute on this ARM system."
+            log_info "Setting up i386 binary support..."
 
-            # Step 1: Install qemu-user-static for binfmt_misc i386 emulation
-            sudo apt-get install -y qemu-user-static 2>&1 | tail -3
+            # Step 1: Ensure qemu-user-static is installed for binfmt_misc i386 emulation
+            if ! dpkg -s qemu-user-static &>/dev/null; then
+                log_info "Installing qemu-user-static..."
+                sudo apt-get install -y qemu-user-static 2>&1 | tail -3
+            else
+                log_debug "qemu-user-static is already installed"
+            fi
 
-            # Step 2: Add i386 architecture and install libc6:i386 — the i386
-            # ELF binaries need both the emulator AND the i386 C library
-            sudo dpkg --add-architecture i386 2>/dev/null || true
-            sudo apt-get update -qq 2>/dev/null || true
-            sudo apt-get install -y libc6:i386 2>&1 | tail -3 || log_warn "Could not install libc6:i386"
+            # Step 2: Provide the i386 dynamic linker (/lib/ld-linux.so.2)
+            # On Raspberry Pi OS (armhf), libc6:i386 is not available via apt
+            # because i386 repos don't exist. We download it directly from
+            # Debian mirrors and extract the needed files.
+            if [[ ! -f /lib/ld-linux.so.2 ]]; then
+                log_info "i386 dynamic linker missing (/lib/ld-linux.so.2). Downloading from Debian mirrors..."
+                local i386_tmp
+                i386_tmp=$(mktemp -d)
+                local libc6_deb="${i386_tmp}/libc6_i386.deb"
+                local libc6_url="https://deb.debian.org/debian/pool/main/g/glibc/"
+
+                # Find the latest libc6 i386 deb from Debian pool
+                local libc6_filename
+                libc6_filename=$(wget -q -O - "$libc6_url" 2>/dev/null \
+                    | grep -oP 'libc6_[0-9][0-9.~+-]*_i386\.deb' \
+                    | sort -V | tail -1)
+
+                if [[ -n "$libc6_filename" ]]; then
+                    log_debug "Downloading: ${libc6_url}${libc6_filename}"
+                    if wget -q --timeout=30 -O "$libc6_deb" "${libc6_url}${libc6_filename}" 2>/dev/null; then
+                        log_debug "Extracting i386 dynamic linker..."
+                        dpkg-deb -x "$libc6_deb" "${i386_tmp}/extract/" 2>/dev/null
+                        # Copy ld-linux.so.2 to /lib/ where the kernel's binfmt_misc expects it
+                        local ld_linux
+                        ld_linux=$(find "${i386_tmp}/extract/" \( -name 'ld-linux.so.2' -o -name 'ld-linux*.so*' \) 2>/dev/null | head -1)
+                        if [[ -n "$ld_linux" ]]; then
+                            sudo cp "$ld_linux" /lib/ld-linux.so.2
+                            sudo chmod 755 /lib/ld-linux.so.2
+                            log_info "Installed i386 dynamic linker: /lib/ld-linux.so.2"
+                        fi
+                        # Copy i386 libs to /lib/i386-linux-gnu/ for the binaries to find
+                        if [[ -d "${i386_tmp}/extract/lib/i386-linux-gnu" ]]; then
+                            sudo mkdir -p /lib/i386-linux-gnu
+                            sudo cp -a "${i386_tmp}/extract/lib/i386-linux-gnu/"* /lib/i386-linux-gnu/ 2>/dev/null || true
+                            log_debug "Copied i386 libs to /lib/i386-linux-gnu/"
+                        fi
+                    else
+                        log_warn "Could not download libc6 i386 from Debian mirrors."
+                    fi
+                else
+                    log_warn "Could not find libc6 i386 package in Debian pool."
+                fi
+                rm -rf "$i386_tmp"
+            else
+                log_debug "i386 dynamic linker already present: /lib/ld-linux.so.2"
+            fi
 
             # Re-check binaries after installing i386 support
-            log_info "Re-checking binaries after i386 support installation..."
+            log_info "Re-checking binaries..."
             local recheck_failed=0
             while IFS= read -r -d '' bin_file; do
                 local bin_type
@@ -602,7 +641,9 @@ install_drivers() {
             done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
             if [[ $recheck_failed -gt 0 ]]; then
                 log_warn "$recheck_failed binaries still can't execute. Printing may not work."
-                log_warn "Try manually: sudo apt-get install -y qemu-user-static libc6:i386 libstdc++6:i386"
+                log_warn "The Brother i386 binaries need additional i386 libraries."
+                log_warn "Check: file /usr/local/Brother/Printer/dcp130c/lpd/brdcp130cfilter"
+                log_warn "Then run the binary directly to see what libraries are missing."
             else
                 log_info "All Brother binaries now execute successfully."
             fi
@@ -884,16 +925,24 @@ EOF
                 # Filter to show only important lines (errors, warnings, job/filter activity)
                 # Skip verbose IPP client chatter (Client N, HTTP, Content-Length, etc.)
                 local important_entries
-                important_entries=$(echo "$new_log_entries" | grep -iE "^\w \[.*\] \[Job [0-9]|^E \[|filter|backend|Started |PID [0-9]+ .* exited" || true)
+                important_entries=$(echo "$new_log_entries" \
+                    | grep -iE "^\w \[.*\] \[Job [0-9]|^E \[|filter|backend|Started |PID [0-9]+ .* exited|ld-linux|Could not open|Sent [0-9]+ bytes" \
+                    | grep -viE "envp\[|argv\[" || true)
                 if [[ -n "$important_entries" ]]; then
                     log_debug "CUPS job/filter log entries:"
                     log_debug "$important_entries"
                 fi
                 # Check for actual filter/backend errors (NOT normal client disconnects)
-                if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error)"; then
-                    log_warn "CUPS filter errors detected — the filter pipeline may not be working."
-                    log_warn "This usually means the Brother i386 binary can't run on ARM."
-                    log_warn "Try: sudo dpkg --add-architecture i386 && sudo apt-get update && sudo apt-get install -y qemu-user-static libc6:i386"
+                if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error|ld-linux|Could not open)" \
+                    || echo "$new_log_entries" | grep -qP "\[Job [0-9]+\].*Sent 0 bytes"; then
+                    log_warn "CUPS filter errors detected — the filter pipeline is not working correctly."
+                    if echo "$new_log_entries" | grep -qiE "ld-linux|Could not open"; then
+                        log_warn "Root cause: i386 dynamic linker (/lib/ld-linux.so.2) is missing."
+                        log_warn "The Brother driver binary cannot execute without it."
+                        log_warn "Re-run this script to attempt automatic fix, or see README for manual steps."
+                    else
+                        log_warn "This usually means the Brother i386 binary can't run on ARM."
+                    fi
                 fi
             else
                 log_debug "No new CUPS log entries for this print job"
