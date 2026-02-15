@@ -361,10 +361,6 @@ setup_cups_service() {
                 echo 'Browsing On' | sudo tee -a "$cupsd_conf" > /dev/null
             fi
 
-            if grep -q '^DefaultAuthType' "$cupsd_conf"; then
-                log_debug "DefaultAuthType already set"
-            fi
-
             # Allow remote access to the printer in the <Location /> block
             # Add "Allow @LOCAL" if not already present so LAN clients can print
             if ! grep -q 'Allow @LOCAL' "$cupsd_conf"; then
@@ -393,8 +389,8 @@ setup_cups_service() {
         else
             log_debug "Avahi daemon is already installed"
         fi
-        sudo systemctl enable avahi-daemon 2>/dev/null || true
-        sudo systemctl start avahi-daemon 2>/dev/null || true
+        sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
+        sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
         log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
 
         # Restart CUPS to apply configuration changes
