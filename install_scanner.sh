@@ -142,7 +142,17 @@ resolve_package() {
         return
     fi
     # Fall back to the original name and let apt-get report the error
-    log_debug "resolve_package: no candidate found, falling back to '$pkg'"
+    log_debug "resolve_package: no candidate found for '$pkg' or '$t64_pkg'"
+    # Search for similarly-named packages as a diagnostic hint
+    local similar
+    similar=$(apt-cache search "^${pkg}" 2>/dev/null | head -5)
+    if [[ -n "$similar" ]]; then
+        log_debug "resolve_package: similar packages in apt:"
+        while IFS= read -r line; do
+            log_debug "  $line"
+        done <<< "$similar"
+    fi
+    log_debug "resolve_package: falling back to '$pkg' (apt-get will report the actual error)"
     echo "$pkg"
 }
 
@@ -235,10 +245,11 @@ install_dependencies() {
     sudo apt-get update
     
     # Resolve library package names that may differ across Debian/Raspbian versions
+    # On trixie+, the SANE library package is called libsane1 (not libsane)
     log_info "Detecting correct package names for this system..."
-    LIBSANE=$(resolve_package "libsane")
+    LIBSANE=$(resolve_package "libsane1")
     LIBUSB=$(resolve_package "libusb-0.1-4")
-    log_info "Resolved: libsane -> $LIBSANE, libusb-0.1-4 -> $LIBUSB"
+    log_info "Resolved: libsane1 -> $LIBSANE, libusb-0.1-4 -> $LIBUSB"
     
     # Build list of packages to install
     local packages=(
