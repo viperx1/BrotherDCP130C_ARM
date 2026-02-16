@@ -384,37 +384,38 @@ install_drivers() {
     # libraries are i386 ELF binaries that need binfmt_misc/qemu-user-static
     # to run on ARM.
     #
-    # can_execute_binary: test if a single binary can run on this system
+    # can_execute_binary: test if a single binary can run on this system.
+    # Uses a timeout to prevent hangs from binaries that block (e.g.
+    # waiting for input or a device).
     can_execute_binary() {
         local f="$1"
-        "$f" --version &>/dev/null || "$f" --help &>/dev/null || "$f" &>/dev/null
+        timeout 5 "$f" --version &>/dev/null || timeout 5 "$f" --help &>/dev/null || timeout 5 "$f" 2>/dev/null
     }
 
-    log_debug "Scanning Brother scanner driver directory for i386 binaries..."
+    log_debug "Scanning for Brother scanner i386 binaries..."
     local i386_binaries_found=0
     local i386_binaries_failed=0
-    local scan_dirs=("/usr/local/Brother/sane/" "/usr/lib/sane/" "/usr/lib/")
-    for scan_dir in "${scan_dirs[@]}"; do
-        while IFS= read -r -d '' bin_file; do
-            local bin_type
-            bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
-            if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
-                # Only count Brother scanner-related binaries
-                case "$bin_file" in
-                    *brsane*|*brcolm*|*brscandec*|*Brother/sane*)
-                        i386_binaries_found=$((i386_binaries_found + 1))
-                        log_debug "i386 binary: $bin_file"
-                        if ! can_execute_binary "$bin_file"; then
-                            i386_binaries_failed=$((i386_binaries_failed + 1))
-                            log_debug "  -> FAILED to execute"
-                        else
-                            log_debug "  -> executes OK"
-                        fi
-                        ;;
-                esac
+    # Only search Brother-specific directories and files — avoid scanning
+    # broad system directories like /usr/lib/ which contain thousands of
+    # unrelated files and would cause the script to hang for minutes.
+    while IFS= read -r -d '' bin_file; do
+        local bin_type
+        bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
+        if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
+            i386_binaries_found=$((i386_binaries_found + 1))
+            log_debug "i386 binary: $bin_file"
+            if ! can_execute_binary "$bin_file"; then
+                i386_binaries_failed=$((i386_binaries_failed + 1))
+                log_debug "  -> FAILED to execute"
+            else
+                log_debug "  -> executes OK"
             fi
-        done < <(find "$scan_dir" -type f -print0 2>/dev/null)
-    done
+        fi
+    done < <(find /usr/local/Brother/sane/ -type f -print0 2>/dev/null
+             find /usr/lib/sane/ /usr/lib/ -maxdepth 1 -type f \
+                 \( -name '*brsane*' -o -name '*brcolm*' -o -name '*brscandec*' -o -name '*brother*' \) \
+                 -print0 2>/dev/null)
+    log_debug "Binary scan complete: found $i386_binaries_found i386 binaries, $i386_binaries_failed failed"
 
     if [[ $i386_binaries_found -gt 0 ]]; then
         log_debug "Found $i386_binaries_found i386 ELF binaries, $i386_binaries_failed failed to execute"
@@ -522,25 +523,22 @@ install_drivers() {
             # Re-check binaries after installing i386 support
             log_info "Re-checking binaries..."
             local recheck_failed=0
-            for scan_dir in "${scan_dirs[@]}"; do
-                while IFS= read -r -d '' bin_file; do
-                    local bin_type
-                    bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
-                    if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
-                        case "$bin_file" in
-                            *brsane*|*brcolm*|*brscandec*|*Brother/sane*)
-                                if ! can_execute_binary "$bin_file"; then
-                                    recheck_failed=$((recheck_failed + 1))
-                                    local run_err
-                                    run_err=$("$bin_file" 2>&1 || true)
-                                    log_debug "Still fails: $bin_file"
-                                    log_debug "  Error: ${run_err:-<no output>}"
-                                fi
-                                ;;
-                        esac
+            while IFS= read -r -d '' bin_file; do
+                local bin_type
+                bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
+                if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
+                    if ! can_execute_binary "$bin_file"; then
+                        recheck_failed=$((recheck_failed + 1))
+                        local run_err
+                        run_err=$(timeout 5 "$bin_file" 2>&1 || true)
+                        log_debug "Still fails: $bin_file"
+                        log_debug "  Error: ${run_err:-<no output>}"
                     fi
-                done < <(find "$scan_dir" -type f -print0 2>/dev/null)
-            done
+                fi
+            done < <(find /usr/local/Brother/sane/ -type f -print0 2>/dev/null
+                     find /usr/lib/sane/ /usr/lib/ -maxdepth 1 -type f \
+                         \( -name '*brsane*' -o -name '*brcolm*' -o -name '*brscandec*' -o -name '*brother*' \) \
+                         -print0 2>/dev/null)
             if [[ $recheck_failed -gt 0 ]]; then
                 log_warn "$recheck_failed binaries still can't execute. Scanning may not work."
                 log_warn "The Brother i386 binaries need additional i386 libraries."
