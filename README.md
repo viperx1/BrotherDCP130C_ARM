@@ -81,7 +81,9 @@ The scanner script will:
 - Check system architecture
 - Install SANE and dependencies
 - Download and prepare the brscan2 driver for ARM
-- Install the scanner driver
+- Install the scanner driver and create SANE backend symlinks
+- Set up an i386 SANE environment with `qemu-i386-static` (needed because ARM SANE cannot `dlopen()` i386 shared libraries)
+- Create a `brother-scanimage` wrapper for scanning
 - Configure the scanner with brsaneconfig2
 - Optionally perform a test scan
 
@@ -113,20 +115,26 @@ After installation, you can:
 
 After installation, you can:
 
-- **Scan a document**:
+- **Scan a document** (use `brother-scanimage` on ARM):
   ```bash
-  scanimage --format=png --resolution=300 > scan.png
+  brother-scanimage --format=png --resolution=300 > scan.png
   ```
 
 - **List available scanners**:
   ```bash
-  scanimage -L
+  brother-scanimage -L
   ```
 
 - **Check scanner configuration**:
   ```bash
   brsaneconfig2 -q
   ```
+
+> **Note:** On ARM (Raspberry Pi), the native `scanimage` cannot load the i386 Brother
+> SANE backend (`dlopen()` architecture mismatch). The install script creates a
+> `brother-scanimage` wrapper that runs an i386 `scanimage` through `qemu-i386-static`,
+> which can natively load the Brother backend. Use `brother-scanimage` instead of
+> `scanimage` for all scanning operations.
 
 ### Printer Sharing
 
@@ -165,7 +173,7 @@ direct usb://Brother/DCP-130C?serial=BROB7F595603
 To verify the scanner is detected:
 
 ```bash
-scanimage -L
+brother-scanimage -L
 ```
 
 Expected output:

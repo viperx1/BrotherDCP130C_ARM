@@ -617,6 +617,187 @@ install_drivers() {
     log_info "Scanner driver installed successfully."
 }
 
+# Set up an i386 SANE environment for running scanimage on ARM.
+# The ARM SANE process cannot dlopen() i386 shared libraries (architecture
+# mismatch). The solution is to run an i386 scanimage binary via
+# qemu-i386-static, which CAN natively load the i386 Brother SANE backend.
+setup_i386_scanner() {
+    local i386_root="/opt/brother/i386"
+    local wrapper="/usr/local/bin/brother-scanimage"
+
+    # Skip if wrapper already exists and works
+    if [[ -x "$wrapper" ]]; then
+        log_debug "brother-scanimage wrapper already exists: $wrapper"
+        return 0
+    fi
+
+    log_info "Setting up i386 scanner environment for ARM..."
+    log_info "ARM SANE cannot load i386 backend libraries via dlopen()."
+    log_info "Installing i386 scanimage to run through qemu-i386-static..."
+
+    # Ensure qemu-i386-static is available
+    local qemu_bin
+    qemu_bin=$(command -v qemu-i386-static 2>/dev/null || true)
+    if [[ -z "$qemu_bin" ]]; then
+        qemu_bin=$(find /usr/libexec/qemu-binfmt/ /usr/bin/ /usr/local/bin/ -name 'qemu-i386*' -type f -executable 2>/dev/null | head -1)
+    fi
+    if [[ -z "$qemu_bin" ]]; then
+        log_warn "qemu-i386-static not found. Cannot set up i386 scanner environment."
+        log_warn "Install qemu-user-static and re-run this script."
+        return 1
+    fi
+    log_debug "qemu binary: $qemu_bin"
+
+    # Create i386 root
+    sudo mkdir -p "$i386_root"
+
+    # Download i386 sane-utils from Debian pool
+    local i386_tmp
+    i386_tmp=$(mktemp -d)
+    local pool_url="https://deb.debian.org/debian/pool/main"
+
+    # Download i386 sane-utils (contains scanimage)
+    log_info "Downloading i386 sane-utils..."
+    local sane_utils_filename
+    sane_utils_filename=$(wget -q -O - "${pool_url}/s/sane-backends/" 2>/dev/null \
+        | grep -oP 'sane-utils_[0-9][0-9.~+-]*_i386\.deb' \
+        | sort -V | tail -1)
+    if [[ -z "$sane_utils_filename" ]]; then
+        log_warn "Could not find i386 sane-utils in Debian pool."
+        rm -rf "$i386_tmp"
+        return 1
+    fi
+    log_debug "Found: $sane_utils_filename"
+    if ! wget -q --timeout=30 -O "${i386_tmp}/sane-utils.deb" "${pool_url}/s/sane-backends/${sane_utils_filename}" 2>/dev/null; then
+        log_warn "Could not download i386 sane-utils."
+        rm -rf "$i386_tmp"
+        return 1
+    fi
+
+    # Download i386 libsane1 (SANE backend framework)
+    log_info "Downloading i386 libsane1..."
+    local libsane_filename
+    libsane_filename=$(wget -q -O - "${pool_url}/s/sane-backends/" 2>/dev/null \
+        | grep -oP 'libsane1_[0-9][0-9.~+-]*_i386\.deb' \
+        | sort -V | tail -1)
+    if [[ -z "$libsane_filename" ]]; then
+        log_warn "Could not find i386 libsane1 in Debian pool."
+        rm -rf "$i386_tmp"
+        return 1
+    fi
+    log_debug "Found: $libsane_filename"
+    if ! wget -q --timeout=30 -O "${i386_tmp}/libsane1.deb" "${pool_url}/s/sane-backends/${libsane_filename}" 2>/dev/null; then
+        log_warn "Could not download i386 libsane1."
+        rm -rf "$i386_tmp"
+        return 1
+    fi
+
+    # Download i386 libusb-0.1-4 (needed by Brother backend)
+    log_info "Downloading i386 libusb-0.1-4..."
+    local libusb_filename
+    libusb_filename=$(wget -q -O - "${pool_url}/libu/libusb/" 2>/dev/null \
+        | grep -oP 'libusb-0\.1-4_[0-9][0-9.~+-]*_i386\.deb' \
+        | sort -V | tail -1)
+    if [[ -n "$libusb_filename" ]]; then
+        log_debug "Found: $libusb_filename"
+        wget -q --timeout=30 -O "${i386_tmp}/libusb.deb" "${pool_url}/libu/libusb/${libusb_filename}" 2>/dev/null || true
+    fi
+
+    # Extract all packages into the i386 root
+    log_info "Extracting i386 SANE environment..."
+    for deb in "${i386_tmp}"/*.deb; do
+        if [[ -f "$deb" ]]; then
+            log_debug "Extracting: $(basename "$deb")"
+            sudo dpkg-deb -x "$deb" "$i386_root/" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$i386_tmp"
+
+    # Copy the Brother scanner backend .so files into the i386 SANE environment
+    local i386_sane_dir="$i386_root/usr/lib/sane"
+    sudo mkdir -p "$i386_sane_dir"
+    for brother_so in /usr/lib/sane/libsane-brother2*; do
+        if [[ -f "$brother_so" ]] || [[ -L "$brother_so" ]]; then
+            sudo cp -a "$brother_so" "$i386_sane_dir/" 2>/dev/null || true
+            log_debug "Copied to i386 env: $(basename "$brother_so")"
+        fi
+    done
+    # Copy Brother support libraries
+    for brother_lib in /usr/lib/libbrscandec2* /usr/lib/libbrcolm2*; do
+        if [[ -f "$brother_lib" ]] || [[ -L "$brother_lib" ]]; then
+            sudo cp -a "$brother_lib" "$i386_root/usr/lib/" 2>/dev/null || true
+            log_debug "Copied to i386 env: $(basename "$brother_lib")"
+        fi
+    done
+
+    # Copy Brother configuration files
+    if [[ -d /usr/local/Brother/sane ]]; then
+        sudo mkdir -p "$i386_root/usr/local/Brother"
+        sudo cp -a /usr/local/Brother/sane "$i386_root/usr/local/Brother/" 2>/dev/null || true
+        log_debug "Copied Brother sane config to i386 env"
+    fi
+
+    # Ensure SANE config is available in the i386 environment
+    sudo mkdir -p "$i386_root/etc/sane.d"
+    if [[ -f /etc/sane.d/dll.conf ]]; then
+        sudo cp /etc/sane.d/dll.conf "$i386_root/etc/sane.d/" 2>/dev/null || true
+    fi
+    # Copy all SANE .conf files
+    sudo cp /etc/sane.d/*.conf "$i386_root/etc/sane.d/" 2>/dev/null || true
+
+    # Make sure i386 libc is available in the i386 root
+    if [[ -d /lib/i386-linux-gnu ]]; then
+        sudo mkdir -p "$i386_root/lib/i386-linux-gnu"
+        sudo cp -a /lib/i386-linux-gnu/* "$i386_root/lib/i386-linux-gnu/" 2>/dev/null || true
+    fi
+    if [[ -f /lib/ld-linux.so.2 ]]; then
+        sudo cp -a /lib/ld-linux.so.2 "$i386_root/lib/" 2>/dev/null || true
+    fi
+
+    # Find the i386 scanimage binary
+    local i386_scanimage
+    i386_scanimage=$(find "$i386_root" -name 'scanimage' -type f 2>/dev/null | head -1)
+    if [[ -z "$i386_scanimage" ]]; then
+        log_warn "i386 scanimage not found after extraction."
+        return 1
+    fi
+    log_debug "i386 scanimage: $i386_scanimage"
+
+    # Create the wrapper script
+    log_info "Creating brother-scanimage wrapper..."
+    sudo tee "$wrapper" > /dev/null << WRAPPER_EOF
+#!/bin/bash
+# Brother scanner wrapper — runs i386 scanimage via qemu-i386-static.
+# ARM SANE cannot dlopen() i386 backend libraries, so we use an i386
+# scanimage binary that can natively load the Brother SANE backend.
+#
+# Usage: brother-scanimage [scanimage arguments...]
+# Example: brother-scanimage --format=png --resolution=300 > scan.png
+#          brother-scanimage -L
+
+export SANE_CONFIG_DIR="$i386_root/etc/sane.d"
+export LD_LIBRARY_PATH="$i386_root/usr/lib:$i386_root/usr/lib/sane:$i386_root/lib/i386-linux-gnu:/usr/lib:/lib/i386-linux-gnu"
+
+exec "$qemu_bin" -L "$i386_root" "$i386_scanimage" "\$@"
+WRAPPER_EOF
+    sudo chmod 755 "$wrapper"
+    log_info "Created: $wrapper"
+
+    # Verify the wrapper can list backends
+    log_info "Verifying i386 scanner environment..."
+    local verify_output
+    verify_output=$("$wrapper" -L 2>&1 || true)
+    if echo "$verify_output" | grep -qi "brother\|DCP-130C"; then
+        log_info "i386 scanner environment works! Scanner detected."
+    else
+        log_debug "brother-scanimage -L output: ${verify_output:-<empty>}"
+        log_warn "i386 scanner not yet detected via wrapper. This may resolve after USB reconnect."
+    fi
+
+    log_info "i386 scanner environment setup complete."
+    log_info "Use 'brother-scanimage' instead of 'scanimage' for scanning."
+}
+
 # Detect scanner USB connection
 detect_scanner() {
     log_info "Detecting Brother DCP-130C scanner..."
@@ -687,9 +868,18 @@ configure_scanner() {
 # Test scan
 test_scan() {
     log_info "Testing scanner..."
-    
-    # Check if scanimage is available
-    if ! command -v scanimage &>/dev/null; then
+
+    # Determine the best scanimage command to use.
+    # On ARM, the native scanimage cannot load i386 Brother SANE backends
+    # (dlopen architecture mismatch), so we prefer brother-scanimage.
+    local scan_cmd=""
+    if [[ -x /usr/local/bin/brother-scanimage ]]; then
+        scan_cmd="/usr/local/bin/brother-scanimage"
+        log_debug "Using i386 wrapper: $scan_cmd"
+    elif command -v scanimage &>/dev/null; then
+        scan_cmd="scanimage"
+        log_debug "Using native scanimage"
+    else
         log_warn "scanimage not found. Install sane-utils to test scanning."
         return
     fi
@@ -697,71 +887,47 @@ test_scan() {
     # List available scanners
     log_info "Checking for available scanners..."
     local scanners
-    scanners=$(scanimage -L 2>&1 || true)
+    scanners=$($scan_cmd -L 2>&1 || true)
 
     if echo "$scanners" | grep -qi "brother\|DCP-130C"; then
         log_info "Scanner detected: $scanners"
     else
         log_warn "Scanner not detected by SANE."
-        log_info "scanimage -L output: ${scanners:-<empty>}"
+        log_info "$scan_cmd -L output: ${scanners:-<empty>}"
 
-        # Diagnose: check if SANE can find the brother2 backend at all
-        log_info "Running SANE diagnostics..."
+        # If using native scanimage, explain the dlopen issue
+        if [[ "$scan_cmd" == "scanimage" ]]; then
+            log_info "Note: ARM scanimage cannot load i386 Brother backend (dlopen arch mismatch)."
+            log_info "The brother-scanimage wrapper should handle this — checking..."
 
-        # Check the SANE backend shared library loads
-        local brother_so
-        brother_so=$(find /usr/lib/sane/ -name 'libsane-brother2*' -type f 2>/dev/null | head -1)
-        if [[ -n "$brother_so" ]]; then
-            log_debug "Brother SANE backend: $brother_so"
-            log_debug "File type: $(file "$brother_so" 2>/dev/null)"
-            # Check what i386 libraries the backend needs
-            local ldd_output
-            ldd_output=$(ldd "$brother_so" 2>&1 || true)
-            local missing_libs
-            missing_libs=$(echo "$ldd_output" | grep "not found" || true)
-            if [[ -n "$missing_libs" ]]; then
-                log_warn "Brother SANE backend is missing i386 libraries:"
+            # Run SANE debug to confirm the dlopen failure
+            log_debug "SANE backend debug (DLL loading):"
+            local sane_debug_output
+            sane_debug_output=$(SANE_DEBUG_DLL=3 scanimage -L 2>&1 || true)
+            local relevant_lines
+            relevant_lines=$(echo "$sane_debug_output" | grep -i 'brother\|dlopen\|error\|fail\|cannot\|not found' | head -10 || true)
+            if [[ -n "$relevant_lines" ]]; then
                 while IFS= read -r line; do
-                    log_warn "  $line"
-                done <<< "$missing_libs"
-                log_info "These libraries need to be provided for the scanner to work."
-            else
-                log_debug "ldd output: $ldd_output"
+                    log_debug "  $line"
+                done <<< "$relevant_lines"
             fi
-        else
-            log_warn "Brother SANE backend library not found in /usr/lib/sane/"
         fi
 
-        # Check USB-level scanner detection
+        # USB-level check
         if command -v sane-find-scanner &>/dev/null; then
             log_debug "sane-find-scanner output:"
             log_debug "$(sane-find-scanner 2>&1 | grep -i 'brother\|04f9\|USB\|found' || echo '<no relevant output>')"
-        fi
-
-        # Run scanimage with SANE debug to see backend loading errors
-        log_debug "SANE backend debug (DLL loading):"
-        local sane_debug_output
-        sane_debug_output=$(SANE_DEBUG_DLL=3 scanimage -L 2>&1 || true)
-        # Show only relevant lines (brother2 loading, errors)
-        local relevant_lines
-        relevant_lines=$(echo "$sane_debug_output" | grep -i 'brother\|error\|fail\|cannot\|not found\|loaded' | head -15 || true)
-        if [[ -n "$relevant_lines" ]]; then
-            while IFS= read -r line; do
-                log_debug "  $line"
-            done <<< "$relevant_lines"
-        else
-            log_debug "  No brother-related messages in SANE debug output"
         fi
     fi
 
     # Ask user if they want to perform a test scan
     read -p "Do you want to perform a test scan? (y/n): " -n 1 -r
     echo
-    
+
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         local test_output="/tmp/brother_test_scan.pnm"
         log_info "Performing test scan (this may take a moment)..."
-        if scanimage --format=pnm --resolution=150 > "$test_output" 2>&1; then
+        if $scan_cmd --format=pnm --resolution=150 > "$test_output" 2>&1; then
             if [[ -s "$test_output" ]]; then
                 log_info "Test scan saved to: $test_output"
                 log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
@@ -770,7 +936,7 @@ test_scan() {
             fi
         else
             log_warn "Test scan failed. The scanner may not be detected yet."
-            log_info "Try disconnecting and reconnecting the USB cable, then run: scanimage -L"
+            log_info "Try disconnecting and reconnecting the USB cable, then run: $scan_cmd -L"
         fi
     else
         log_info "Skipping test scan."
@@ -798,16 +964,27 @@ display_info() {
     echo
     log_info "Scanner Name: $SCANNER_NAME"
     echo
-    log_info "To scan a document:"
-    log_info "  scanimage --format=png --resolution=300 > scan.png"
-    log_info "To list available scanners:"
-    log_info "  scanimage -L"
+    if [[ -x /usr/local/bin/brother-scanimage ]]; then
+        log_info "To scan a document (use brother-scanimage on ARM):"
+        log_info "  brother-scanimage --format=png --resolution=300 > scan.png"
+        log_info "To list available scanners:"
+        log_info "  brother-scanimage -L"
+    else
+        log_info "To scan a document:"
+        log_info "  scanimage --format=png --resolution=300 > scan.png"
+        log_info "To list available scanners:"
+        log_info "  scanimage -L"
+    fi
     log_info "To check SANE configuration:"
     log_info "  brsaneconfig2 -q"
     echo
     log_info "If the scanner is not detected, try:"
     log_info "  1. Disconnect and reconnect the USB cable"
-    log_info "  2. Run: sudo scanimage -L"
+    if [[ -x /usr/local/bin/brother-scanimage ]]; then
+        log_info "  2. Run: sudo brother-scanimage -L"
+    else
+        log_info "  2. Run: sudo scanimage -L"
+    fi
     log_info "  3. Check SANE backend: grep brother2 /etc/sane.d/dll.conf"
     echo
     log_info "If you were added to the scanner group, you may need to log out and back in."
@@ -834,6 +1011,7 @@ main() {
     extract_and_modify_drivers
     repackage_drivers
     install_drivers
+    setup_i386_scanner
     detect_scanner
     configure_scanner
     test_scan
