@@ -625,10 +625,18 @@ setup_i386_scanner() {
     local i386_root="/opt/brother/i386"
     local wrapper="/usr/local/bin/brother-scanimage"
 
-    # Skip if wrapper already exists and works
+    # Skip only if wrapper already exists AND can run successfully.
+    # Just checking file existence is not enough — the wrapper may have been
+    # created before all i386 dependencies were downloaded (e.g. libpng16).
     if [[ -x "$wrapper" ]]; then
-        log_debug "brother-scanimage wrapper already exists: $wrapper"
-        return 0
+        local wrapper_test
+        wrapper_test=$("$wrapper" -L 2>&1 || true)
+        if ! echo "$wrapper_test" | grep -qi "error while loading shared libraries"; then
+            log_debug "brother-scanimage wrapper already exists and works: $wrapper"
+            return 0
+        fi
+        log_info "brother-scanimage wrapper exists but has missing libraries — re-installing dependencies..."
+        log_debug "Wrapper test output: $wrapper_test"
     fi
 
     log_info "Setting up i386 scanner environment for ARM..."
