@@ -256,6 +256,7 @@ install_dependencies() {
         sane-utils
         "$LIBSANE"
         "$LIBUSB"
+        patchelf
     )
 
     log_debug "Final package list: ${packages[*]}"
@@ -416,6 +417,28 @@ install_drivers() {
         sudo ldconfig 2>/dev/null || true
     else
         log_debug "All SANE backend symlinks already in place."
+    fi
+
+    # Clear the executable stack flag from Brother shared libraries.
+    # The Brother brscan2 .so files have PT_GNU_STACK with execute permission,
+    # which modern kernels (6.12+) block via dlopen() with:
+    #   "cannot enable executable stack as shared object requires: Invalid argument"
+    # Clearing this flag is safe — the libraries don't actually need executable stack.
+    if command -v patchelf &>/dev/null; then
+        log_info "Clearing executable stack flag from Brother scanner libraries..."
+        for lib_dir in /usr/lib/sane /usr/lib; do
+            while IFS= read -r -d '' lib_file; do
+                if patchelf --print-execstack "$lib_file" 2>/dev/null | grep -q "X"; then
+                    sudo patchelf --clear-execstack "$lib_file"
+                    log_debug "Cleared execstack: $lib_file"
+                fi
+            done < <(find "$lib_dir" -maxdepth 1 -type f \
+                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
+                         -print0 2>/dev/null)
+        done
+    else
+        log_warn "patchelf not found — cannot clear executable stack flag from Brother libraries."
+        log_warn "On kernels 6.12+, SANE may fail to load the Brother backend."
     fi
 
     # Check if the Brother SANE binaries can execute on this architecture.
@@ -631,7 +654,7 @@ setup_i386_scanner() {
     if [[ -x "$wrapper" ]]; then
         local wrapper_test
         wrapper_test=$("$wrapper" -L 2>&1 || true)
-        if ! echo "$wrapper_test" | grep -qi "error while loading shared libraries"; then
+        if ! echo "$wrapper_test" | grep -qi "error while loading shared libraries\|cannot enable executable stack"; then
             log_debug "brother-scanimage wrapper already exists and works: $wrapper"
             return 0
         fi
@@ -823,6 +846,23 @@ setup_i386_scanner() {
         done < <(find "$check_dir" -maxdepth 1 -type l -print0 2>/dev/null)
     done
 
+    # Clear the executable stack flag from Brother libraries in the i386 env.
+    # Same issue as on host — modern kernels block dlopen() of .so files with
+    # PT_GNU_STACK execute permission. Must be done on actual files, not symlinks.
+    if command -v patchelf &>/dev/null; then
+        log_info "Clearing executable stack flag from i386 Brother libraries..."
+        for clear_dir in "$i386_root/usr/lib/sane" "$i386_root/usr/lib"; do
+            while IFS= read -r -d '' lib_file; do
+                if patchelf --print-execstack "$lib_file" 2>/dev/null | grep -q "X"; then
+                    sudo patchelf --clear-execstack "$lib_file"
+                    log_debug "Cleared execstack (i386): $lib_file"
+                fi
+            done < <(find "$clear_dir" -maxdepth 1 -type f \
+                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
+                         -print0 2>/dev/null)
+        done
+    fi
+
     # Copy Brother configuration files
     if [[ -d /usr/local/Brother/sane ]]; then
         sudo mkdir -p "$i386_root/usr/local/Brother"
@@ -964,7 +1004,7 @@ WRAPPER_EOF
     local verify_output
     verify_output=$("$wrapper" -L 2>&1 || true)
     # Check for shared library errors first — these indicate missing deps
-    if echo "$verify_output" | grep -qi "error while loading shared libraries"; then
+    if echo "$verify_output" | grep -qi "error while loading shared libraries\|cannot enable executable stack"; then
         local missing_so
         missing_so=$(echo "$verify_output" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
         log_warn "brother-scanimage failed: missing i386 library: ${missing_so:-unknown}"
@@ -1098,7 +1138,7 @@ test_scan() {
     local scanners
     scanners=$($scan_cmd -L 2>&1 || true)
 
-    if echo "$scanners" | grep -q "error while loading shared libraries"; then
+    if echo "$scanners" | grep -q "error while loading shared libraries\|cannot enable executable stack"; then
         local missing_so
         missing_so=$(echo "$scanners" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
         log_warn "Scanner command failed: missing i386 library: ${missing_so:-unknown}"
