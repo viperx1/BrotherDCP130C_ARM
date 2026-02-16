@@ -1265,14 +1265,31 @@ test_scan() {
         fi
     fi
 
-    # Select the best device for scanning — prefer USB (bus) over network (net)
-    local scan_device=""
+    # Collect available devices — prefer network (net) over USB (bus) when running
+    # through qemu, because qemu user-mode emulation cannot handle the USB ioctl
+    # calls that libusb needs for direct USB scanning. The network device (net1)
+    # communicates via the Brother protocol over localhost, which works under qemu.
+    local -a scan_devices=()
+    local net_device="" usb_device=""
+    if echo "$scanners" | grep -q "brother2:net"; then
+        net_device=$(echo "$scanners" | grep -oP "brother2:net[^'\"]*" | head -1)
+    fi
     if echo "$scanners" | grep -q "brother2:bus"; then
-        scan_device=$(echo "$scanners" | grep -oP "brother2:bus[^'\"]*" | head -1)
-        log_info "Selected USB scanner device: $scan_device"
-    elif echo "$scanners" | grep -q "brother2:net"; then
-        scan_device=$(echo "$scanners" | grep -oP "brother2:net[^'\"]*" | head -1)
-        log_info "Selected network scanner device: $scan_device"
+        usb_device=$(echo "$scanners" | grep -oP "brother2:bus[^'\"]*" | head -1)
+    fi
+
+    # When using qemu wrapper, prefer network device (USB ioctls don't work under qemu)
+    if [[ "$scan_cmd" == *"brother-scanimage"* ]] && [[ -n "$net_device" ]]; then
+        scan_devices=("$net_device")
+        [[ -n "$usb_device" ]] && scan_devices+=("$usb_device")
+        log_info "Selected network scanner device: $net_device (preferred under qemu)"
+    elif [[ -n "$usb_device" ]]; then
+        scan_devices=("$usb_device")
+        [[ -n "$net_device" ]] && scan_devices+=("$net_device")
+        log_info "Selected USB scanner device: $usb_device"
+    elif [[ -n "$net_device" ]]; then
+        scan_devices=("$net_device")
+        log_info "Selected network scanner device: $net_device"
     fi
 
     # Ask user if they want to perform a test scan
@@ -1282,36 +1299,58 @@ test_scan() {
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         local test_output="/tmp/brother_test_scan.pnm"
         local test_stderr="/tmp/brother_test_scan.err"
-        local device_args=""
-        if [[ -n "$scan_device" ]]; then
-            device_args="-d $scan_device"
-        fi
-        log_info "Performing test scan (this may take a moment)..."
-        log_debug "Scan command: $scan_cmd $device_args --format=pnm --resolution=150"
-        if timeout 60 $scan_cmd $device_args --format=pnm --resolution=150 > "$test_output" 2>"$test_stderr"; then
-            if [[ -s "$test_output" ]]; then
-                log_info "Test scan saved to: $test_output"
-                log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
+        local scan_ok=false
+
+        for try_device in "${scan_devices[@]}" ""; do
+            local -a scan_args=()
+            if [[ -n "$try_device" ]]; then
+                scan_args=(-d "$try_device")
+            fi
+            scan_args+=(--format=pnm --resolution=150)
+
+            log_info "Performing test scan (this may take a moment)..."
+            log_debug "Scan command: $scan_cmd ${scan_args[*]}"
+            if timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
+                if [[ -s "$test_output" ]]; then
+                    log_info "Test scan saved to: $test_output"
+                    log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
+                    scan_ok=true
+                    break
+                else
+                    log_warn "Test scan produced an empty file."
+                    if [[ -s "$test_stderr" ]]; then
+                        log_debug "Scan stderr: $(cat "$test_stderr")"
+                    fi
+                fi
             else
-                log_warn "Test scan produced an empty file."
+                local exit_code=$?
+                if [[ $exit_code -eq 124 ]]; then
+                    log_warn "Test scan timed out after 60 seconds."
+                else
+                    log_warn "Test scan with device '${try_device:-<default>}' failed (exit code: $exit_code)."
+                fi
                 if [[ -s "$test_stderr" ]]; then
-                    log_debug "Scan stderr: $(cat "$test_stderr")"
+                    local err_text
+                    err_text=$(cat "$test_stderr")
+                    log_info "Scan error output:"
+                    while IFS= read -r line; do
+                        log_info "  $line"
+                    done <<< "$err_text"
+                    # If "Invalid argument" on USB, explain the qemu limitation
+                    if [[ "$err_text" == *"Invalid argument"* ]] && [[ "$try_device" == *"bus"* ]]; then
+                        log_info "USB device failed — qemu user-mode cannot handle USB ioctls."
+                        if [[ ${#scan_devices[@]} -gt 1 ]]; then
+                            log_info "Trying next device..."
+                            continue
+                        fi
+                    fi
                 fi
             fi
-        else
-            local exit_code=$?
-            if [[ $exit_code -eq 124 ]]; then
-                log_warn "Test scan timed out after 60 seconds."
-            else
-                log_warn "Test scan failed (exit code: $exit_code)."
-            fi
-            if [[ -s "$test_stderr" ]]; then
-                log_info "Scan error output:"
-                while IFS= read -r line; do
-                    log_info "  $line"
-                done < "$test_stderr"
-            fi
-            log_info "Try: $scan_cmd ${device_args:--L}"
+            break
+        done
+
+        if ! $scan_ok; then
+            log_info "Try manually: $scan_cmd -d '${scan_devices[0]:-brother2:net1;dev0}' --format=pnm > scan.pnm"
         fi
         rm -f "$test_stderr"
     else
@@ -1342,9 +1381,10 @@ display_info() {
     echo
     if [[ -x /usr/local/bin/brother-scanimage ]]; then
         log_info "To scan a document (use brother-scanimage on ARM):"
-        log_info "  brother-scanimage -d 'brother2:bus1;dev0' --format=png --resolution=300 > scan.png"
+        log_info "  brother-scanimage -d 'brother2:net1;dev0' --format=png --resolution=300 > scan.png"
         log_info "To list available scanners:"
         log_info "  brother-scanimage -L"
+        log_info "Note: Use 'net1' device (not 'bus1') — USB ioctls don't work under qemu."
     else
         log_info "To scan a document:"
         log_info "  scanimage -d 'brother2:bus1;dev0' --format=png --resolution=300 > scan.png"
