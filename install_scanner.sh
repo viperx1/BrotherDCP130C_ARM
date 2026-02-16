@@ -703,6 +703,42 @@ setup_i386_scanner() {
         wget -q --timeout=30 -O "${i386_tmp}/libusb.deb" "${pool_url}/libu/libusb/${libusb_filename}" 2>/dev/null || true
     fi
 
+    # Download i386 runtime dependencies for scanimage.
+    # scanimage links against several libraries beyond libc and libsane.
+    # Without these, it fails with "error while loading shared libraries".
+    log_info "Downloading i386 scanimage runtime dependencies..."
+    # Each entry: "package_name  pool_path  filename_pattern"
+    local -a dep_specs=(
+        "libpng16-16     libp/libpng1.6    libpng16-16_"
+        "libjpeg62-turbo libj/libjpeg-turbo libjpeg62-turbo_"
+        "libtiff6        libt/tiff          libtiff6_"
+        "libdeflate0     libd/libdeflate    libdeflate0_"
+        "libwebp7        libw/libwebp       libwebp7_"
+        "zlib1g          libz/zlib          zlib1g_"
+        "libgcc-s1       libg/gcc-14        libgcc-s1_"
+        "libstdc++6      libg/gcc-14        libstdc..6_"
+        "libgomp1        libg/gcc-14        libgomp1_"
+        "liblzma5        libx/xz-utils      liblzma5_"
+        "libzstd1        libz/zstd          libzstd1_"
+        "liblerc4        libe/lerc          liblerc4_"
+        "libjbig0        libj/jbigkit       libjbig0_"
+        "libusb-1.0-0    libu/libusb-1.0    libusb-1.0-0_"
+    )
+    for dep_spec in "${dep_specs[@]}"; do
+        read -r dep_name dep_pool dep_pattern <<< "$dep_spec"
+        local dep_filename
+        dep_filename=$(wget -q -O - "${pool_url}/${dep_pool}/" 2>/dev/null \
+            | grep -oP "${dep_pattern}[0-9][0-9.~+-]*_i386\\.deb" \
+            | sort -V | tail -1)
+        if [[ -n "$dep_filename" ]]; then
+            log_debug "Downloading dep: $dep_filename"
+            wget -q --timeout=30 -O "${i386_tmp}/${dep_name}.deb" \
+                "${pool_url}/${dep_pool}/${dep_filename}" 2>/dev/null || true
+        else
+            log_debug "Dependency $dep_name not found in pool (may not be needed)"
+        fi
+    done
+
     # Extract all packages into the i386 root
     log_info "Extracting i386 SANE environment..."
     for deb in "${i386_tmp}"/*.deb; do
@@ -763,6 +799,62 @@ setup_i386_scanner() {
     fi
     log_debug "i386 scanimage: $i386_scanimage"
 
+    # Consolidate i386 library paths — the extracted packages may place
+    # libraries in various subdirectories. Symlink them so the dynamic
+    # linker can find everything in a single search path.
+    for lib_subdir in "$i386_root"/usr/lib/i386-linux-gnu "$i386_root"/lib/i386-linux-gnu; do
+        if [[ -d "$lib_subdir" ]]; then
+            while IFS= read -r -d '' so_file; do
+                if [[ -f "$so_file" || -L "$so_file" ]]; then
+                    local base_name
+                    base_name=$(basename "$so_file")
+                    if [[ ! -e "$i386_root/usr/lib/$base_name" ]]; then
+                        sudo ln -sf "$so_file" "$i386_root/usr/lib/$base_name" 2>/dev/null || true
+                    fi
+                fi
+            done < <(find "$lib_subdir" -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) -print0 2>/dev/null)
+        fi
+    done
+
+    # Check for missing shared libraries using qemu + ldd before creating wrapper
+    log_info "Checking i386 scanimage dependencies..."
+    local missing_libs
+    missing_libs=$("$qemu_bin" -L "$i386_root" /lib/ld-linux.so.2 --list "$i386_scanimage" 2>&1 || true)
+    local still_missing
+    still_missing=$(echo "$missing_libs" | grep "not found" || true)
+    if [[ -n "$still_missing" ]]; then
+        log_warn "i386 scanimage has missing library dependencies:"
+        while IFS= read -r line; do
+            log_warn "  $line"
+        done <<< "$still_missing"
+        log_info "Attempting to download missing i386 libraries..."
+
+        # Try to resolve each missing library from the Debian pool
+        while IFS= read -r missing_line; do
+            local missing_lib
+            missing_lib=$(echo "$missing_line" | sed 's/.*\(lib[^ ]*\.so[^ ]*\).*/\1/' | tr -d '[:space:]')
+            if [[ -z "$missing_lib" ]]; then
+                continue
+            fi
+            # Map .so name to Debian package name (strip .so.* suffix, replace ++ with pp)
+            local pkg_base
+            pkg_base=$(echo "$missing_lib" | sed 's/\.so\..*//')
+            log_debug "Searching for i386 package providing: $missing_lib (base: $pkg_base)"
+
+            # Search the package index via packages.debian.org
+            local search_result
+            search_result=$(wget -q -O - "https://packages.debian.org/search?searchon=contents&keywords=${missing_lib}&mode=filename&suite=stable&arch=i386" 2>/dev/null \
+                | grep -oP 'packages/[^/]+/[^"]+' | head -1 || true)
+            if [[ -n "$search_result" ]]; then
+                local found_pkg
+                found_pkg=$(echo "$search_result" | sed 's|packages/[^/]*/||')
+                log_debug "Found package: $found_pkg for $missing_lib"
+            fi
+        done <<< "$still_missing"
+    else
+        log_debug "All i386 scanimage dependencies are satisfied."
+    fi
+
     # Create the wrapper script
     log_info "Creating brother-scanimage wrapper..."
     sudo tee "$wrapper" > /dev/null << WRAPPER_EOF
@@ -776,7 +868,7 @@ setup_i386_scanner() {
 #          brother-scanimage -L
 
 export SANE_CONFIG_DIR="$i386_root/etc/sane.d"
-export LD_LIBRARY_PATH="$i386_root/usr/lib:$i386_root/usr/lib/sane:$i386_root/lib/i386-linux-gnu:/usr/lib:/lib/i386-linux-gnu"
+export LD_LIBRARY_PATH="$i386_root/usr/lib:$i386_root/usr/lib/sane:$i386_root/usr/lib/i386-linux-gnu:$i386_root/lib/i386-linux-gnu:/usr/lib:/lib/i386-linux-gnu"
 
 exec "$qemu_bin" -L "$i386_root" "$i386_scanimage" "\$@"
 WRAPPER_EOF
@@ -787,11 +879,18 @@ WRAPPER_EOF
     log_info "Verifying i386 scanner environment..."
     local verify_output
     verify_output=$("$wrapper" -L 2>&1 || true)
-    if echo "$verify_output" | grep -qi "brother\|DCP-130C"; then
+    # Check for shared library errors first — these indicate missing deps
+    if echo "$verify_output" | grep -qi "error while loading shared libraries"; then
+        local missing_so
+        missing_so=$(echo "$verify_output" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
+        log_warn "brother-scanimage failed: missing i386 library: ${missing_so:-unknown}"
+        log_debug "Full output: $verify_output"
+        log_info "You may need to manually install the missing i386 library."
+    elif echo "$verify_output" | grep -qi "device.*brother\|DCP-130C"; then
         log_info "i386 scanner environment works! Scanner detected."
     else
         log_debug "brother-scanimage -L output: ${verify_output:-<empty>}"
-        log_warn "i386 scanner not yet detected via wrapper. This may resolve after USB reconnect."
+        log_info "i386 scanner environment installed. Scanner may be detected after USB reconnect."
     fi
 
     log_info "i386 scanner environment setup complete."
@@ -889,7 +988,12 @@ test_scan() {
     local scanners
     scanners=$($scan_cmd -L 2>&1 || true)
 
-    if echo "$scanners" | grep -qi "brother\|DCP-130C"; then
+    if echo "$scanners" | grep -q "error while loading shared libraries"; then
+        local missing_so
+        missing_so=$(echo "$scanners" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
+        log_warn "Scanner command failed: missing i386 library: ${missing_so:-unknown}"
+        log_debug "$scan_cmd -L output: $scanners"
+    elif echo "$scanners" | grep -qi "device.*brother\|DCP-130C.*scanner"; then
         log_info "Scanner detected: $scanners"
     else
         log_warn "Scanner not detected by SANE."
