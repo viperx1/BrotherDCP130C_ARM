@@ -1137,14 +1137,21 @@ compile_arm_backend() {
     fi
     log_debug "Using SANE headers from: $(dirname "$(dirname "$sane_header")")"
 
-    # Compiler flags
-    local inc_flags="-I${brscan_src} -I${brscan_src}/include -I${brscan_src}/libbrscandec2 -I${brscan_src}/libbrcolm2"
-    local def_flags="-DHAVE_CONFIG_H -D_GNU_SOURCE -DPATH_SANE_CONFIG_DIR=\\\"/etc/sane.d\\\" -DPATH_SANE_DATA_DIR=\\\"/usr/share\\\" -DV_MAJOR=1 -DV_MINOR=0 -DBRSANESUFFIX=2 -DBACKEND_NAME=brother2"
-    local cc_flags="-O2 -fPIC -w"
+    # Compiler flags — use arrays to avoid eval
+    local -a common_flags=(-O2 -fPIC -w
+        "-I${brscan_src}" "-I${brscan_src}/include"
+        "-I${brscan_src}/libbrscandec2" "-I${brscan_src}/libbrcolm2"
+        -DHAVE_CONFIG_H -D_GNU_SOURCE
+    )
+    local -a backend_flags=(
+        '-DPATH_SANE_CONFIG_DIR="/etc/sane.d"'
+        '-DPATH_SANE_DATA_DIR="/usr/share"'
+        -DV_MAJOR=1 -DV_MINOR=0 -DBRSANESUFFIX=2 -DBACKEND_NAME=brother2
+    )
 
     # Compile main backend (brother2.c includes other .c files)
     log_info "Compiling SANE backend..."
-    if ! eval gcc -c $cc_flags $inc_flags $def_flags \
+    if ! gcc -c "${common_flags[@]}" "${backend_flags[@]}" \
         "${brscan_src}/backend_src/brother2.c" -o "$build_dir/brother2.o" 2>&1 | tail -3; then
         log_warn "Failed to compile brother2.c"
         return 1
@@ -1152,12 +1159,12 @@ compile_arm_backend() {
     log_debug "brother2.o compiled"
 
     # Compile sane_strstatus
-    eval gcc -c $cc_flags $inc_flags -DBACKEND_NAME=brother2 -DHAVE_CONFIG_H -D_GNU_SOURCE \
+    gcc -c "${common_flags[@]}" -DBACKEND_NAME=brother2 \
         "${brscan_src}/backend_src/sane_strstatus.c" -o "$build_dir/sane_strstatus.o" 2>/dev/null || true
 
     # Compile sanei support files
     for sf in sanei_constrain_value sanei_init_debug sanei_config; do
-        eval gcc -c $cc_flags $inc_flags -DHAVE_CONFIG_H -D_GNU_SOURCE \
+        gcc -c "${common_flags[@]}" \
             "${brscan_src}/sanei/${sf}.c" -o "$build_dir/${sf}.o" 2>/dev/null || true
         log_debug "${sf}.o compiled"
     done
@@ -1207,7 +1214,6 @@ static DWORD decode_packbits(const BYTE *in, DWORD inLen, BYTE *out, DWORD outMa
 }
 BOOL ScanDecOpen(SCANDEC_OPEN *p) {
     if (!p) return FALSE;
-    memcpy(&g_open, p, sizeof(*p));
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
     int bpp = (p->nColorType & 0x0400) ? 3 : 1;
     p->dwOutLineByte = p->dwOutLinePixCnt * bpp;
