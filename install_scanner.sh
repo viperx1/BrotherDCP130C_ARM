@@ -1046,6 +1046,32 @@ configure_scanner() {
     fi
 
     log_info "Scanner configured successfully."
+
+    # Sync updated config to i386 environment — setup_i386_scanner() copies
+    # configs BEFORE this function registers the scanner device, so the i386
+    # env has stale config without the registered device. Re-copy now.
+    local i386_root="/opt/brother/i386"
+    if [[ -d "$i386_root" ]]; then
+        log_debug "Syncing updated SANE config to i386 environment..."
+        if [[ -d /usr/local/Brother/sane ]]; then
+            sudo mkdir -p "$i386_root/usr/local/Brother"
+            sudo cp -a /usr/local/Brother/sane "$i386_root/usr/local/Brother/" 2>/dev/null || true
+            log_debug "Synced Brother sane config to i386 env"
+        fi
+        sudo mkdir -p "$i386_root/etc/sane.d"
+        sudo cp /etc/sane.d/*.conf "$i386_root/etc/sane.d/" 2>/dev/null || true
+        # Ensure brother2 is in the i386 env's dll.conf too
+        local i386_dll_conf="$i386_root/etc/sane.d/dll.conf"
+        if [[ -f "$i386_dll_conf" ]]; then
+            if ! grep -q '^brother2$' "$i386_dll_conf"; then
+                echo "brother2" | sudo tee -a "$i386_dll_conf" > /dev/null
+                log_debug "Added brother2 to i386 dll.conf"
+            fi
+        else
+            echo "brother2" | sudo tee "$i386_dll_conf" > /dev/null
+            log_debug "Created i386 dll.conf with brother2"
+        fi
+    fi
 }
 
 # Test scan
