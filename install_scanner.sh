@@ -379,6 +379,45 @@ install_drivers() {
     log_debug "Running apt-get install -f to fix dependencies..."
     sudo apt-get install -f -y || true
 
+    # Create SONAME symlinks for Brother SANE shared libraries.
+    # The brscan2 package installs versioned libraries like
+    #   libsane-brother2.so.1.0.7
+    #   libbrscandec2.so.1.0.0
+    #   libbrcolm2.so.1.0.0
+    # but SANE's dlopen() looks for the SONAME (e.g. libsane-brother2.so.1).
+    # Without these symlinks, SANE cannot load the brother2 backend.
+    log_info "Creating SANE backend symlinks..."
+    local symlinks_created=0
+    for lib_dir in /usr/lib/sane /usr/lib; do
+        if [[ -d "$lib_dir" ]]; then
+            while IFS= read -r -d '' lib_file; do
+                local lib_base
+                lib_base=$(basename "$lib_file")
+                # Extract SONAME: e.g. libsane-brother2.so.1.0.7 → libsane-brother2.so.1
+                local soname
+                soname=$(echo "$lib_base" | sed -n 's/^\(lib[^.]*\.so\.[0-9]*\)\..*/\1/p')
+                if [[ -n "$soname" && "$soname" != "$lib_base" ]]; then
+                    local symlink_path="${lib_dir}/${soname}"
+                    if [[ ! -e "$symlink_path" ]]; then
+                        sudo ln -sf "$lib_base" "$symlink_path"
+                        symlinks_created=$((symlinks_created + 1))
+                        log_debug "Created symlink: $symlink_path -> $lib_base"
+                    else
+                        log_debug "Symlink already exists: $symlink_path"
+                    fi
+                fi
+            done < <(find "$lib_dir" -maxdepth 1 -type f \
+                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
+                         -print0 2>/dev/null)
+        fi
+    done
+    if [[ $symlinks_created -gt 0 ]]; then
+        log_info "Created $symlinks_created SANE backend symlinks."
+        sudo ldconfig 2>/dev/null || true
+    else
+        log_debug "All SANE backend symlinks already in place."
+    fi
+
     # Check if the Brother SANE binaries can execute on this architecture.
     # The driver is compiled for i386 — brsaneconfig2 and the SANE shared
     # libraries are i386 ELF binaries that need binfmt_misc/qemu-user-static
