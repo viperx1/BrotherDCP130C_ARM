@@ -819,14 +819,20 @@ setup_i386_scanner() {
     # remaps guest paths. Absolute symlinks (e.g. pointing to
     # /opt/brother/i386/usr/lib/i386-linux-gnu/foo.so) get double-prefixed
     # by qemu to /opt/brother/i386/opt/brother/i386/..., which doesn't exist.
+    # NOTE: We must remove dangling symlinks before copying because GNU cp
+    # refuses to write through a dangling symlink ("cp: not writing through
+    # dangling symlink"). Old runs may have left dangling absolute symlinks.
     for lib_subdir in "$i386_root"/usr/lib/i386-linux-gnu "$i386_root"/lib/i386-linux-gnu; do
         if [[ -d "$lib_subdir" ]]; then
             while IFS= read -r -d '' so_file; do
                 if [[ -f "$so_file" || -L "$so_file" ]]; then
-                    local base_name
+                    local base_name dest_path
                     base_name=$(basename "$so_file")
-                    if [[ ! -e "$i386_root/usr/lib/$base_name" ]]; then
-                        sudo cp -a "$so_file" "$i386_root/usr/lib/$base_name" 2>/dev/null || true
+                    dest_path="$i386_root/usr/lib/$base_name"
+                    if [[ ! -e "$dest_path" ]]; then
+                        # Remove dangling symlinks left by previous installs
+                        [[ -L "$dest_path" ]] && sudo rm -f "$dest_path"
+                        sudo cp -a "$so_file" "$dest_path" 2>/dev/null || true
                     fi
                 fi
             done < <(find "$lib_subdir" -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) -print0 2>/dev/null)
