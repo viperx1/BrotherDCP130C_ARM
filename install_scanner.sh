@@ -1265,24 +1265,55 @@ test_scan() {
         fi
     fi
 
+    # Select the best device for scanning — prefer USB (bus) over network (net)
+    local scan_device=""
+    if echo "$scanners" | grep -q "brother2:bus"; then
+        scan_device=$(echo "$scanners" | grep -oP "brother2:bus[^'\"]*" | head -1)
+        log_info "Selected USB scanner device: $scan_device"
+    elif echo "$scanners" | grep -q "brother2:net"; then
+        scan_device=$(echo "$scanners" | grep -oP "brother2:net[^'\"]*" | head -1)
+        log_info "Selected network scanner device: $scan_device"
+    fi
+
     # Ask user if they want to perform a test scan
     read -p "Do you want to perform a test scan? (y/n): " -n 1 -r
     echo
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         local test_output="/tmp/brother_test_scan.pnm"
+        local test_stderr="/tmp/brother_test_scan.err"
+        local device_args=""
+        if [[ -n "$scan_device" ]]; then
+            device_args="-d $scan_device"
+        fi
         log_info "Performing test scan (this may take a moment)..."
-        if $scan_cmd --format=pnm --resolution=150 > "$test_output" 2>&1; then
+        log_debug "Scan command: $scan_cmd $device_args --format=pnm --resolution=150"
+        if timeout 60 $scan_cmd $device_args --format=pnm --resolution=150 > "$test_output" 2>"$test_stderr"; then
             if [[ -s "$test_output" ]]; then
                 log_info "Test scan saved to: $test_output"
                 log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
             else
                 log_warn "Test scan produced an empty file."
+                if [[ -s "$test_stderr" ]]; then
+                    log_debug "Scan stderr: $(cat "$test_stderr")"
+                fi
             fi
         else
-            log_warn "Test scan failed. The scanner may not be detected yet."
-            log_info "Try disconnecting and reconnecting the USB cable, then run: $scan_cmd -L"
+            local exit_code=$?
+            if [[ $exit_code -eq 124 ]]; then
+                log_warn "Test scan timed out after 60 seconds."
+            else
+                log_warn "Test scan failed (exit code: $exit_code)."
+            fi
+            if [[ -s "$test_stderr" ]]; then
+                log_info "Scan error output:"
+                while IFS= read -r line; do
+                    log_info "  $line"
+                done < "$test_stderr"
+            fi
+            log_info "Try: $scan_cmd ${device_args:--L}"
         fi
+        rm -f "$test_stderr"
     else
         log_info "Skipping test scan."
     fi
@@ -1311,12 +1342,12 @@ display_info() {
     echo
     if [[ -x /usr/local/bin/brother-scanimage ]]; then
         log_info "To scan a document (use brother-scanimage on ARM):"
-        log_info "  brother-scanimage --format=png --resolution=300 > scan.png"
+        log_info "  brother-scanimage -d 'brother2:bus1;dev0' --format=png --resolution=300 > scan.png"
         log_info "To list available scanners:"
         log_info "  brother-scanimage -L"
     else
         log_info "To scan a document:"
-        log_info "  scanimage --format=png --resolution=300 > scan.png"
+        log_info "  scanimage -d 'brother2:bus1;dev0' --format=png --resolution=300 > scan.png"
         log_info "To list available scanners:"
         log_info "  scanimage -L"
     fi
