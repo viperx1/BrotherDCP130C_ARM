@@ -716,7 +716,7 @@ setup_i386_scanner() {
         "libwebp7        libw/libwebp       libwebp7_"
         "zlib1g          libz/zlib          zlib1g_"
         "libgcc-s1       libg/gcc-14        libgcc-s1_"
-        "libstdc++6      libg/gcc-14        libstdc..6_"
+        "libstdc++6      libg/gcc-14        libstdc\\+\\+6_"
         "libgomp1        libg/gcc-14        libgomp1_"
         "liblzma5        libx/xz-utils      liblzma5_"
         "libzstd1        libz/zstd          libzstd1_"
