@@ -1300,15 +1300,12 @@ test_scan() {
         local test_output="/tmp/brother_test_scan.pnm"
         local test_stderr="/tmp/brother_test_scan.err"
         local scan_ok=false
+        local all_invalid_arg=true
 
-        for try_device in "${scan_devices[@]}" ""; do
-            local -a scan_args=()
-            if [[ -n "$try_device" ]]; then
-                scan_args=(-d "$try_device")
-            fi
-            scan_args+=(--format=pnm --resolution=150)
+        for try_device in "${scan_devices[@]}"; do
+            local -a scan_args=(-d "$try_device" --format=pnm --resolution=150)
 
-            log_info "Performing test scan (this may take a moment)..."
+            log_info "Performing test scan with device '$try_device'..."
             log_debug "Scan command: $scan_cmd ${scan_args[*]}"
             if timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
@@ -1318,6 +1315,7 @@ test_scan() {
                     break
                 else
                     log_warn "Test scan produced an empty file."
+                    all_invalid_arg=false
                     if [[ -s "$test_stderr" ]]; then
                         log_debug "Scan stderr: $(cat "$test_stderr")"
                     fi
@@ -1325,32 +1323,48 @@ test_scan() {
             else
                 local exit_code=$?
                 if [[ $exit_code -eq 124 ]]; then
-                    log_warn "Test scan timed out after 60 seconds."
+                    log_warn "Test scan with '$try_device' timed out after 60 seconds."
+                    all_invalid_arg=false
                 else
-                    log_warn "Test scan with device '${try_device:-<default>}' failed (exit code: $exit_code)."
+                    log_warn "Test scan with '$try_device' failed (exit code: $exit_code)."
                 fi
                 if [[ -s "$test_stderr" ]]; then
                     local err_text
                     err_text=$(cat "$test_stderr")
-                    log_info "Scan error output:"
-                    while IFS= read -r line; do
-                        log_info "  $line"
-                    done <<< "$err_text"
-                    # If "Invalid argument" on USB, explain the qemu limitation
-                    if [[ "$err_text" == *"Invalid argument"* ]] && [[ "$try_device" == *"bus"* ]]; then
-                        log_info "USB device failed — qemu user-mode cannot handle USB ioctls."
-                        if [[ ${#scan_devices[@]} -gt 1 ]]; then
-                            log_info "Trying next device..."
-                            continue
-                        fi
+                    # Show only the scanimage error, not SANE debug noise
+                    local scan_err
+                    scan_err=$(echo "$err_text" | grep -i "scanimage\|failed\|error\|Invalid" | head -3)
+                    if [[ -n "$scan_err" ]]; then
+                        log_info "  $scan_err"
+                    fi
+                    if [[ "$err_text" == *"Invalid argument"* ]]; then
+                        log_debug "Device '$try_device' returned 'Invalid argument'"
+                        # Try the next device
+                        continue
+                    else
+                        all_invalid_arg=false
                     fi
                 fi
             fi
+            # Non-"Invalid argument" failure — stop trying
             break
         done
 
         if ! $scan_ok; then
-            log_info "Try manually: $scan_cmd -d '${scan_devices[0]:-brother2:net1;dev0}' --format=pnm > scan.pnm"
+            if $all_invalid_arg && [[ "$scan_cmd" == *"brother-scanimage"* ]]; then
+                log_warn "All scan devices returned 'Invalid argument'."
+                log_info "This is a known limitation: qemu user-mode emulation cannot"
+                log_info "translate USB ioctl calls between i386 and ARM architectures."
+                log_info "The scanner IS detected and configured correctly, but the"
+                log_info "actual USB data transfer cannot work through qemu-user."
+                log_info ""
+                log_info "Workarounds:"
+                log_info "  1. Use an x86/x64 computer to scan (this scanner has no network interface)"
+                log_info "  2. Try a SANE-over-network setup from an x86 machine"
+                log_info "  3. Check if a future Brother ARM-native driver becomes available"
+            else
+                log_info "Try manually: $scan_cmd -d '${scan_devices[0]:-brother2:net1;dev0}' --format=pnm > scan.pnm"
+            fi
         fi
         rm -f "$test_stderr"
     else
