@@ -1109,23 +1109,86 @@ test_scan() {
         log_warn "Scanner not detected by SANE."
         log_info "$scan_cmd -L output: ${scanners:-<empty>}"
 
-        # If using native scanimage, explain the dlopen issue
-        if [[ "$scan_cmd" == "scanimage" ]]; then
-            log_info "Note: ARM scanimage cannot load i386 Brother backend (dlopen arch mismatch)."
-            log_info "The brother-scanimage wrapper should handle this — checking..."
+        # Run SANE debug to understand why the scanner isn't found.
+        # SANE_DEBUG_DLL=5 shows backend loading, SANE_DEBUG_BROTHER2=5
+        # shows brother2 backend activity including USB device detection.
+        log_info "Running SANE diagnostics..."
+        local sane_debug_output
+        sane_debug_output=$(SANE_DEBUG_DLL=5 SANE_DEBUG_BROTHER2=5 $scan_cmd -L 2>&1 || true)
 
-            # Run SANE debug to confirm the dlopen failure
-            log_debug "SANE backend debug (DLL loading):"
-            local sane_debug_output
-            sane_debug_output=$(SANE_DEBUG_DLL=3 scanimage -L 2>&1 || true)
-            local relevant_lines
-            relevant_lines=$(echo "$sane_debug_output" | grep -i 'brother\|dlopen\|error\|fail\|cannot\|not found' | head -10 || true)
-            if [[ -n "$relevant_lines" ]]; then
-                while IFS= read -r line; do
-                    log_debug "  $line"
-                done <<< "$relevant_lines"
+        # Show DLL loading info (which backends loaded/failed)
+        local dll_lines
+        dll_lines=$(echo "$sane_debug_output" | grep -i '\[dll\]' | grep -i 'load\|init\|brother\|error\|fail\|adding' | head -15 || true)
+        if [[ -n "$dll_lines" ]]; then
+            log_debug "SANE DLL backend loading:"
+            while IFS= read -r line; do
+                log_debug "  $line"
+            done <<< "$dll_lines"
+        fi
+
+        # Show brother2 backend activity (USB detection, device search)
+        local brother2_lines
+        brother2_lines=$(echo "$sane_debug_output" | grep -i '\[brother2\]\|brother.*usb\|brother.*device\|brother.*open\|brother.*init' | head -15 || true)
+        if [[ -n "$brother2_lines" ]]; then
+            log_debug "Brother2 backend activity:"
+            while IFS= read -r line; do
+                log_debug "  $line"
+            done <<< "$brother2_lines"
+        else
+            log_debug "Brother2 backend produced no debug output (backend may not have loaded)"
+        fi
+
+        # Show any error lines
+        local error_lines
+        error_lines=$(echo "$sane_debug_output" | grep -iE 'error|fail|cannot|denied|not found|No such' | grep -v '^\s*$' | head -10 || true)
+        if [[ -n "$error_lines" ]]; then
+            log_debug "SANE error/warning lines:"
+            while IFS= read -r line; do
+                log_debug "  $line"
+            done <<< "$error_lines"
+        fi
+
+        # Check USB device accessibility
+        log_debug "USB device access check:"
+        local usb_dev
+        usb_dev=$(lsusb 2>/dev/null | grep "04f9:01a8" | head -1 || true)
+        if [[ -n "$usb_dev" ]]; then
+            # Extract bus and device number to check /dev/bus/usb permissions
+            local bus_num dev_num
+            bus_num=$(echo "$usb_dev" | grep -oP 'Bus \K[0-9]+')
+            dev_num=$(echo "$usb_dev" | grep -oP 'Device \K[0-9]+')
+            if [[ -n "$bus_num" && -n "$dev_num" ]]; then
+                local usb_dev_path="/dev/bus/usb/${bus_num}/${dev_num}"
+                if [[ -e "$usb_dev_path" ]]; then
+                    log_debug "  USB device node: $(ls -la "$usb_dev_path" 2>/dev/null)"
+                else
+                    log_debug "  USB device node $usb_dev_path does not exist"
+                fi
             fi
         fi
+
+        # Check Brother config files used by the backend
+        log_debug "Brother backend config files:"
+        for cfg_file in /usr/local/Brother/sane/Brsane2.ini /usr/local/Brother/sane/brsanenetdevice2.cfg; do
+            if [[ -f "$cfg_file" ]]; then
+                log_debug "  $cfg_file exists ($(wc -l < "$cfg_file") lines)"
+                # Show the device-specific section
+                if [[ "$cfg_file" == *Brsane2.ini ]]; then
+                    local usb_id_line
+                    usb_id_line=$(grep -i "0x01a8\|DCP-130C\|DCP130C" "$cfg_file" | head -3 || true)
+                    if [[ -n "$usb_id_line" ]]; then
+                        log_debug "  DCP-130C entries: $usb_id_line"
+                    else
+                        log_warn "  DCP-130C NOT found in Brsane2.ini!"
+                    fi
+                fi
+                if [[ "$cfg_file" == *brsanenetdevice2.cfg ]]; then
+                    log_debug "  Content: $(cat "$cfg_file" 2>/dev/null)"
+                fi
+            else
+                log_warn "  $cfg_file NOT found"
+            fi
+        done
 
         # USB-level check
         if command -v sane-find-scanner &>/dev/null; then
