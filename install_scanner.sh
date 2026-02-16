@@ -813,8 +813,12 @@ setup_i386_scanner() {
     log_debug "i386 scanimage: $i386_scanimage"
 
     # Consolidate i386 library paths — the extracted packages may place
-    # libraries in various subdirectories. Symlink them so the dynamic
-    # linker can find everything in a single search path.
+    # libraries in various subdirectories. Copy them into /usr/lib/ so the
+    # dynamic linker can find everything in a single search path.
+    # NOTE: We use cp instead of symlinks because qemu-user-static -L
+    # remaps guest paths. Absolute symlinks (e.g. pointing to
+    # /opt/brother/i386/usr/lib/i386-linux-gnu/foo.so) get double-prefixed
+    # by qemu to /opt/brother/i386/opt/brother/i386/..., which doesn't exist.
     for lib_subdir in "$i386_root"/usr/lib/i386-linux-gnu "$i386_root"/lib/i386-linux-gnu; do
         if [[ -d "$lib_subdir" ]]; then
             while IFS= read -r -d '' so_file; do
@@ -822,7 +826,7 @@ setup_i386_scanner() {
                     local base_name
                     base_name=$(basename "$so_file")
                     if [[ ! -e "$i386_root/usr/lib/$base_name" ]]; then
-                        sudo ln -sf "$so_file" "$i386_root/usr/lib/$base_name" 2>/dev/null || true
+                        sudo cp -a "$so_file" "$i386_root/usr/lib/$base_name" 2>/dev/null || true
                     fi
                 fi
             done < <(find "$lib_subdir" -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) -print0 2>/dev/null)
