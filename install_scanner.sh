@@ -739,16 +739,36 @@ setup_i386_scanner() {
     )
     for dep_spec in "${dep_specs[@]}"; do
         read -r dep_name dep_pool dep_pattern <<< "$dep_spec"
-        local dep_filename
-        dep_filename=$(wget -q -O - "${pool_url}/${dep_pool}/" 2>/dev/null \
+        local dep_candidates dep_downloaded
+        dep_downloaded=false
+        # Get all matching versions, sorted newest-first
+        dep_candidates=$(wget -q -O - "${pool_url}/${dep_pool}/" 2>/dev/null \
             | grep -oP "${dep_pattern}[0-9][0-9a-z.~+:_-]*_i386\\.deb" \
-            | sort -V | tail -1)
-        if [[ -n "$dep_filename" ]]; then
-            log_debug "Downloading dep: $dep_filename"
-            wget -q --timeout=30 -O "${i386_tmp}/${dep_name}.deb" \
-                "${pool_url}/${dep_pool}/${dep_filename}" 2>/dev/null || true
-        else
+            | sort -V -r)
+        if [[ -z "$dep_candidates" ]]; then
             log_debug "Dependency $dep_name not found in pool (may not be needed)"
+            continue
+        fi
+        # Try each version from newest to oldest until one downloads successfully
+        while IFS= read -r dep_filename; do
+            [[ -z "$dep_filename" ]] && continue
+            log_debug "Downloading dep: $dep_filename"
+            if wget -q --timeout=30 -O "${i386_tmp}/${dep_name}.deb" \
+                "${pool_url}/${dep_pool}/${dep_filename}" 2>/dev/null; then
+                # Verify the download is a real deb, not an HTML error page
+                if file "${i386_tmp}/${dep_name}.deb" 2>/dev/null | grep -q "Debian binary package"; then
+                    dep_downloaded=true
+                    break
+                else
+                    log_debug "Download of $dep_filename is not a valid .deb (may be 404 HTML), trying older version..."
+                    rm -f "${i386_tmp}/${dep_name}.deb"
+                fi
+            else
+                log_debug "Failed to download $dep_filename, trying older version..."
+            fi
+        done <<< "$dep_candidates"
+        if [[ "$dep_downloaded" != true ]]; then
+            log_warn "Could not download any version of $dep_name from Debian pool"
         fi
     done
 
@@ -839,10 +859,20 @@ setup_i386_scanner() {
         fi
     done
 
+    # Debug: show key library files in the i386 environment
+    log_debug "Key libraries in i386 env:"
+    for check_lib in libxml2 libsane-brother2 libbrscandec2 libbrcolm2 libusb; do
+        log_debug "  $(ls -la "$i386_root"/usr/lib/${check_lib}* 2>/dev/null | head -3 || echo "$check_lib: not found")"
+    done
+
     # Check for missing shared libraries using qemu + ldd before creating wrapper
+    # Use the guest-root-relative path for scanimage so ld-linux can find it
+    # correctly under qemu's -L path remapping.
     log_info "Checking i386 scanimage dependencies..."
+    local guest_scanimage="${i386_scanimage#"$i386_root"}"  # Strip i386_root prefix for guest path
     local missing_libs
-    missing_libs=$("$qemu_bin" -L "$i386_root" /lib/ld-linux.so.2 --list "$i386_scanimage" 2>&1 || true)
+    missing_libs=$("$qemu_bin" -L "$i386_root" "$i386_root/lib/ld-linux.so.2" --list "$guest_scanimage" 2>&1 || true)
+    log_debug "ld-linux --list output: $(echo "$missing_libs" | head -20)"
     local still_missing
     still_missing=$(echo "$missing_libs" | grep "not found" || true)
     if [[ -n "$still_missing" ]]; then
