@@ -648,18 +648,45 @@ setup_i386_scanner() {
     local i386_root="/opt/brother/i386"
     local wrapper="/usr/local/bin/brother-scanimage"
 
-    # Skip only if wrapper already exists AND can run successfully.
-    # Just checking file existence is not enough — the wrapper may have been
-    # created before all i386 dependencies were downloaded (e.g. libpng16).
+    # Skip only if wrapper already exists AND can run successfully, including
+    # the brother2 SANE backend loading properly via dlopen(). We must enable
+    # SANE_DEBUG_DLL=1 to make dlopen() failures visible — without it, SANE
+    # silently skips failed backends and reports "No scanners were identified"
+    # which looks like "working" when the backend actually fails to load.
+    # Also check execstack on the i386 Brother libraries — even if the wrapper
+    # binary runs fine, the backend .so may have executable stack flag set which
+    # causes dlopen() to fail on modern kernels.
     if [[ -x "$wrapper" ]]; then
-        local wrapper_test
-        wrapper_test=$("$wrapper" -L 2>&1 || true)
-        if ! echo "$wrapper_test" | grep -qi "error while loading shared libraries\|cannot enable executable stack"; then
+        local needs_reinstall=false
+
+        # Check if any i386 Brother .so still has executable stack flag
+        if command -v patchelf &>/dev/null; then
+            while IFS= read -r -d '' lib_file; do
+                if patchelf --print-execstack "$lib_file" 2>/dev/null | grep -q "X"; then
+                    log_info "i386 Brother library still has executable stack: $lib_file"
+                    needs_reinstall=true
+                    break
+                fi
+            done < <(find "$i386_root/usr/lib/sane" "$i386_root/usr/lib" -maxdepth 1 -type f \
+                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
+                         -print0 2>/dev/null)
+        fi
+
+        if [[ "$needs_reinstall" != "true" ]]; then
+            # Test wrapper with SANE debug to catch dlopen failures
+            local wrapper_test
+            wrapper_test=$(SANE_DEBUG_DLL=1 "$wrapper" -L 2>&1 || true)
+            if echo "$wrapper_test" | grep -qi "error while loading shared libraries\|cannot enable executable stack\|dlopen() failed"; then
+                needs_reinstall=true
+                log_debug "Wrapper test found errors: $(echo "$wrapper_test" | grep -i 'error\|cannot\|failed')"
+            fi
+        fi
+
+        if [[ "$needs_reinstall" != "true" ]]; then
             log_debug "brother-scanimage wrapper already exists and works: $wrapper"
             return 0
         fi
-        log_info "brother-scanimage wrapper exists but has missing libraries — re-installing dependencies..."
-        log_debug "Wrapper test output: $wrapper_test"
+        log_info "brother-scanimage wrapper exists but has issues — re-running setup..."
     fi
 
     log_info "Setting up i386 scanner environment for ARM..."
