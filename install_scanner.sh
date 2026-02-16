@@ -389,7 +389,7 @@ install_drivers() {
     # NOTE: Only use on actual executables, NOT on shared libraries (.so).
     can_execute_binary() {
         local f="$1"
-        timeout 5 "$f" --version &>/dev/null 2>&1 || timeout 5 "$f" --help &>/dev/null 2>&1 || timeout 5 "$f" &>/dev/null 2>&1
+        timeout 5 "$f" --version &>/dev/null || timeout 5 "$f" --help &>/dev/null || timeout 5 "$f" &>/dev/null
     }
 
     log_debug "Scanning for Brother scanner i386 binaries..."
