@@ -716,27 +716,32 @@ setup_i386_scanner() {
     # Without these, it fails with "error while loading shared libraries".
     log_info "Downloading i386 scanimage runtime dependencies..."
     # Each entry: "package_name  pool_path  filename_pattern"
+    # NOTE: Debian pool paths use the SOURCE package name, not the binary
+    # package name. Packages whose source name starts with "lib" go under
+    # lib<first-letter>/<source>, others under <first-letter>/<source>.
     local -a dep_specs=(
-        "libpng16-16     libp/libpng1.6    libpng16-16_"
-        "libjpeg62-turbo libj/libjpeg-turbo libjpeg62-turbo_"
-        "libtiff6        libt/tiff          libtiff6_"
-        "libdeflate0     libd/libdeflate    libdeflate0_"
-        "libwebp7        libw/libwebp       libwebp7_"
-        "zlib1g          libz/zlib          zlib1g_"
-        "libgcc-s1       libg/gcc-14        libgcc-s1_"
-        "libstdc++6      libg/gcc-14        libstdc\\+\\+6_"
-        "libgomp1        libg/gcc-14        libgomp1_"
-        "liblzma5        libx/xz-utils      liblzma5_"
-        "libzstd1        libz/zstd          libzstd1_"
-        "liblerc4        libe/lerc          liblerc4_"
-        "libjbig0        libj/jbigkit       libjbig0_"
-        "libusb-1.0-0    libu/libusb-1.0    libusb-1.0-0_"
+        "libpng16-16     libp/libpng1.6     libpng16-16_"
+        "libjpeg62-turbo libj/libjpeg-turbo  libjpeg62-turbo_"
+        "libtiff6        t/tiff              libtiff6_"
+        "libdeflate0     libd/libdeflate     libdeflate0_"
+        "libwebp7        libw/libwebp        libwebp7_"
+        "zlib1g          z/zlib              zlib1g_"
+        "libgcc-s1       g/gcc-14            libgcc-s1_"
+        "libstdc++6      g/gcc-14            libstdc\\+\\+6_"
+        "libgomp1        g/gcc-14            libgomp1_"
+        "liblzma5        x/xz-utils          liblzma5_"
+        "libzstd1        libz/libzstd        libzstd1_"
+        "liblerc4        l/lerc              liblerc4_"
+        "libjbig0        j/jbigkit           libjbig0_"
+        "libusb-1.0-0    libu/libusb-1.0     libusb-1.0-0_"
+        "libxml2         libx/libxml2        libxml2_"
+        "libicu72        i/icu               libicu72_"
     )
     for dep_spec in "${dep_specs[@]}"; do
         read -r dep_name dep_pool dep_pattern <<< "$dep_spec"
         local dep_filename
         dep_filename=$(wget -q -O - "${pool_url}/${dep_pool}/" 2>/dev/null \
-            | grep -oP "${dep_pattern}[0-9][0-9.~+-]*_i386\\.deb" \
+            | grep -oP "${dep_pattern}[0-9][0-9a-z.~+:_-]*_i386\\.deb" \
             | sort -V | tail -1)
         if [[ -n "$dep_filename" ]]; then
             log_debug "Downloading dep: $dep_filename"
