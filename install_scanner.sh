@@ -384,17 +384,18 @@ install_drivers() {
     # libraries are i386 ELF binaries that need binfmt_misc/qemu-user-static
     # to run on ARM.
     #
-    # can_execute_binary: test if a single binary can run on this system.
-    # Uses a timeout to prevent hangs from binaries that block (e.g.
-    # waiting for input or a device).
+    # can_execute_binary: test if a single executable can run on this system.
+    # Uses a timeout to prevent hangs from binaries that block.
+    # NOTE: Only use on actual executables, NOT on shared libraries (.so).
     can_execute_binary() {
         local f="$1"
-        timeout 5 "$f" --version &>/dev/null || timeout 5 "$f" --help &>/dev/null || timeout 5 "$f" &>/dev/null
+        timeout 5 "$f" --version &>/dev/null 2>&1 || timeout 5 "$f" --help &>/dev/null 2>&1 || timeout 5 "$f" &>/dev/null 2>&1
     }
 
     log_debug "Scanning for Brother scanner i386 binaries..."
     local i386_binaries_found=0
     local i386_binaries_failed=0
+    local i386_libs_found=0
     # Only search Brother-specific directories and files — avoid scanning
     # broad system directories like /usr/lib/ which contain thousands of
     # unrelated files and would cause the script to hang for minutes.
@@ -402,25 +403,43 @@ install_drivers() {
         local bin_type
         bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
         if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
-            i386_binaries_found=$((i386_binaries_found + 1))
-            log_debug "i386 binary: $bin_file"
-            if ! can_execute_binary "$bin_file"; then
-                i386_binaries_failed=$((i386_binaries_failed + 1))
-                log_debug "  -> FAILED to execute"
+            # Shared libraries (.so) cannot be executed directly — only test
+            # actual executables. Shared libraries are loaded by SANE at runtime.
+            if echo "$bin_type" | grep -qi "shared object"; then
+                i386_libs_found=$((i386_libs_found + 1))
+                log_debug "i386 shared library: $bin_file (skipping execution test)"
             else
-                log_debug "  -> executes OK"
+                i386_binaries_found=$((i386_binaries_found + 1))
+                log_debug "i386 executable: $bin_file"
+                if ! can_execute_binary "$bin_file"; then
+                    i386_binaries_failed=$((i386_binaries_failed + 1))
+                    log_debug "  -> FAILED to execute"
+                else
+                    log_debug "  -> executes OK"
+                fi
             fi
         fi
     done < <(find /usr/local/Brother/sane/ -type f -print0 2>/dev/null
              find /usr/lib/sane/ /usr/lib/ -maxdepth 1 -type f \
                  \( -name '*brsane*' -o -name '*brcolm*' -o -name '*brscandec*' -o -name '*brother*' \) \
                  -print0 2>/dev/null)
-    log_debug "Binary scan complete: found $i386_binaries_found i386 binaries, $i386_binaries_failed failed"
+    log_debug "Binary scan complete: $i386_binaries_found executables ($i386_binaries_failed failed), $i386_libs_found shared libraries"
 
-    if [[ $i386_binaries_found -gt 0 ]]; then
-        log_debug "Found $i386_binaries_found i386 ELF binaries, $i386_binaries_failed failed to execute"
+    # i386 support is needed if any executables failed OR if there are i386
+    # shared libraries (which SANE dynamically loads and need qemu + i386 libc)
+    local need_i386_support=0
+    if [[ $i386_binaries_found -gt 0 || $i386_libs_found -gt 0 ]]; then
         if [[ $i386_binaries_failed -gt 0 ]]; then
-            log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 binaries cannot execute on this ARM system."
+            log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 executables cannot run on this ARM system."
+            need_i386_support=1
+        elif [[ $i386_libs_found -gt 0 ]]; then
+            log_debug "Found $i386_libs_found i386 shared libraries that need i386 runtime support"
+            need_i386_support=1
+        else
+            log_info "All Brother i386 executables run successfully on this ARM system."
+        fi
+
+        if [[ $need_i386_support -eq 1 ]]; then
             log_info "Setting up i386 binary support..."
 
             # Step 1: Ensure qemu-user-static is installed for binfmt_misc i386 emulation
@@ -520,13 +539,17 @@ install_drivers() {
                 log_debug "Commented out libarmmem preload to prevent i386 binary errors"
             fi
 
-            # Re-check binaries after installing i386 support
-            log_info "Re-checking binaries..."
+            # Re-check executables after installing i386 support
+            log_info "Re-checking executables..."
             local recheck_failed=0
             while IFS= read -r -d '' bin_file; do
                 local bin_type
                 bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
                 if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
+                    # Skip shared libraries — only test executables
+                    if echo "$bin_type" | grep -qi "shared object"; then
+                        continue
+                    fi
                     if ! can_execute_binary "$bin_file"; then
                         recheck_failed=$((recheck_failed + 1))
                         local run_err
@@ -540,15 +563,13 @@ install_drivers() {
                          \( -name '*brsane*' -o -name '*brcolm*' -o -name '*brscandec*' -o -name '*brother*' \) \
                          -print0 2>/dev/null)
             if [[ $recheck_failed -gt 0 ]]; then
-                log_warn "$recheck_failed binaries still can't execute. Scanning may not work."
+                log_warn "$recheck_failed executables still can't run. Scanning may not work."
                 log_warn "The Brother i386 binaries need additional i386 libraries."
                 log_warn "Check: file /usr/local/Brother/sane/brsaneconfig2"
                 log_warn "Then run the binary directly to see what libraries are missing."
             else
-                log_info "All Brother binaries now execute successfully."
+                log_info "All Brother executables now run successfully."
             fi
-        else
-            log_info "All Brother i386 binaries execute successfully on this ARM system."
         fi
     else
         log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
@@ -610,9 +631,16 @@ configure_scanner() {
         log_debug "brsaneconfig2: $line"
     done || log_warn "brsaneconfig2 returned non-zero exit code (this may be normal on ARM)"
 
-    # Verify scanner configuration
-    log_debug "Scanner device list:"
-    log_debug "$("$brsaneconfig" -q 2>&1 || echo 'query failed')"
+    # Verify scanner configuration — show only configured devices, not the
+    # full model list (which is 88+ lines of every supported Brother model)
+    local configured_devices
+    configured_devices=$("$brsaneconfig" -q 2>&1 | grep -A 999 '^Devices on network' || echo 'query failed')
+    if [[ -n "$configured_devices" ]]; then
+        log_debug "Configured devices:"
+        log_debug "$configured_devices"
+    else
+        log_debug "No configured devices found (brsaneconfig2 -q)"
+    fi
 
     log_info "Scanner configured successfully."
 }
@@ -631,7 +659,61 @@ test_scan() {
     log_info "Checking for available scanners..."
     local scanners
     scanners=$(scanimage -L 2>&1 || true)
-    log_info "Available scanners: ${scanners:-<none detected>}"
+
+    if echo "$scanners" | grep -qi "brother\|DCP-130C"; then
+        log_info "Scanner detected: $scanners"
+    else
+        log_warn "Scanner not detected by SANE."
+        log_info "scanimage -L output: ${scanners:-<empty>}"
+
+        # Diagnose: check if SANE can find the brother2 backend at all
+        log_info "Running SANE diagnostics..."
+
+        # Check the SANE backend shared library loads
+        local brother_so
+        brother_so=$(find /usr/lib/sane/ -name 'libsane-brother2*' -type f 2>/dev/null | head -1)
+        if [[ -n "$brother_so" ]]; then
+            log_debug "Brother SANE backend: $brother_so"
+            log_debug "File type: $(file "$brother_so" 2>/dev/null)"
+            # Check what i386 libraries the backend needs
+            local ldd_output
+            ldd_output=$(ldd "$brother_so" 2>&1 || true)
+            local missing_libs
+            missing_libs=$(echo "$ldd_output" | grep "not found" || true)
+            if [[ -n "$missing_libs" ]]; then
+                log_warn "Brother SANE backend is missing i386 libraries:"
+                while IFS= read -r line; do
+                    log_warn "  $line"
+                done <<< "$missing_libs"
+                log_info "These libraries need to be provided for the scanner to work."
+            else
+                log_debug "ldd output: $ldd_output"
+            fi
+        else
+            log_warn "Brother SANE backend library not found in /usr/lib/sane/"
+        fi
+
+        # Check USB-level scanner detection
+        if command -v sane-find-scanner &>/dev/null; then
+            log_debug "sane-find-scanner output:"
+            log_debug "$(sane-find-scanner 2>&1 | grep -i 'brother\|04f9\|USB\|found' || echo '<no relevant output>')"
+        fi
+
+        # Run scanimage with SANE debug to see backend loading errors
+        log_debug "SANE backend debug (DLL loading):"
+        local sane_debug_output
+        sane_debug_output=$(SANE_DEBUG_DLL=3 scanimage -L 2>&1 || true)
+        # Show only relevant lines (brother2 loading, errors)
+        local relevant_lines
+        relevant_lines=$(echo "$sane_debug_output" | grep -i 'brother\|error\|fail\|cannot\|not found\|loaded' | head -15 || true)
+        if [[ -n "$relevant_lines" ]]; then
+            while IFS= read -r line; do
+                log_debug "  $line"
+            done <<< "$relevant_lines"
+        else
+            log_debug "  No brother-related messages in SANE debug output"
+        fi
+    fi
 
     # Ask user if they want to perform a test scan
     read -p "Do you want to perform a test scan? (y/n): " -n 1 -r
@@ -690,7 +772,6 @@ display_info() {
     log_info "  3. Check SANE backend: grep brother2 /etc/sane.d/dll.conf"
     echo
     log_info "If you were added to the scanner group, you may need to log out and back in."
-    log_debug "SANE configuration: $(brsaneconfig2 -q 2>&1 || echo '<query failed>')"
 }
 
 # Main installation process
