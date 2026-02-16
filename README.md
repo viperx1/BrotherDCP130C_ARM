@@ -3,7 +3,7 @@ Driver installer for Brother DCP-130C on Raspberry PI 2B
 
 ## Overview
 
-This repository contains an automated installation script for the Brother DCP-130C printer driver on Raspberry Pi ARM-based systems (armv7l, armv6l, aarch64).
+This repository contains automated installation scripts for the Brother DCP-130C printer and scanner drivers on Raspberry Pi ARM-based systems (armv7l, armv6l, aarch64).
 
 ## System Requirements
 
@@ -11,11 +11,11 @@ This repository contains an automated installation script for the Brother DCP-13
 - Raspbian/Raspberry Pi OS
 - Linux kernel 6.x or compatible
 - Internet connection for downloading drivers
-- Brother DCP-130C printer connected via USB
+- Brother DCP-130C connected via USB
 
 ## Features
 
-The installation script (`install_printer.sh`) performs the following:
+### Printer (`install_printer.sh`)
 
 1. **Installs Dependencies**: Automatically installs CUPS and required packages
 2. **Downloads Drivers**: Fetches official Brother DCP-130C drivers from Brother's website
@@ -24,6 +24,15 @@ The installation script (`install_printer.sh`) performs the following:
 5. **Printer Sharing**: Optional LAN sharing with Avahi/Bonjour discovery so other devices on the network can find and use the printer
 6. **Test Print**: Offers optional test page printing to verify installation
 7. **Error Handling**: Includes robust error checking and logging
+
+### Scanner (`install_scanner.sh`)
+
+1. **Installs Dependencies**: Automatically installs SANE and required packages
+2. **Downloads Drivers**: Fetches official Brother brscan2 scanner driver from Brother's website
+3. **ARM Compatibility**: Modifies i386 driver to work on ARM architecture
+4. **Automatic Configuration**: Configures the scanner in SANE with brsaneconfig2
+5. **Test Scan**: Offers optional test scan to verify installation
+6. **Error Handling**: Includes robust error checking and logging
 
 ## Installation
 
@@ -35,24 +44,30 @@ The installation script (`install_printer.sh`) performs the following:
    cd BrotherDCP130C_ARM
    ```
 
-2. Connect your Brother DCP-130C printer via USB and power it on
+2. Connect your Brother DCP-130C via USB and power it on
 
-3. Run the installation script:
+3. Install the printer driver:
    ```bash
    ./install_printer.sh
    ```
 
-4. Follow the on-screen prompts
+4. Install the scanner driver:
+   ```bash
+   ./install_scanner.sh
+   ```
+
+5. Follow the on-screen prompts
 
 ### Manual Installation
 
-If you prefer to run the script step by step or with sudo:
+If you prefer to run the scripts with sudo:
 
 ```bash
 sudo ./install_printer.sh
+sudo ./install_scanner.sh
 ```
 
-The script will:
+The printer script will:
 - Check system architecture
 - Ask whether to enable printer sharing on the local network
 - Install CUPS and dependencies (plus Avahi if sharing is enabled)
@@ -62,7 +77,17 @@ The script will:
 - If sharing was enabled, configure CUPS for network access and Avahi/Bonjour discovery
 - Optionally print a test page
 
+The scanner script will:
+- Check system architecture
+- Install SANE and dependencies
+- Download and prepare the brscan2 driver for ARM
+- Install the scanner driver
+- Configure the scanner with brsaneconfig2
+- Optionally perform a test scan
+
 ## Usage
+
+### Printing
 
 After installation, you can:
 
@@ -84,6 +109,25 @@ After installation, you can:
 - **Manage printer via web interface**:
   Open http://localhost:631 in your browser
 
+### Scanning
+
+After installation, you can:
+
+- **Scan a document**:
+  ```bash
+  scanimage --format=png --resolution=300 > scan.png
+  ```
+
+- **List available scanners**:
+  ```bash
+  scanimage -L
+  ```
+
+- **Check scanner configuration**:
+  ```bash
+  brsaneconfig2 -q
+  ```
+
 ### Printer Sharing
 
 During installation, the script asks whether you want to share the printer on your local network. If you choose **yes**:
@@ -103,6 +147,8 @@ If you chose **no** during installation, the printer is only available locally o
 
 ## Verification
 
+### Printer
+
 To verify the printer is detected:
 
 ```bash
@@ -114,27 +160,49 @@ Expected output:
 direct usb://Brother/DCP-130C?serial=BROB7F595603
 ```
 
+### Scanner
+
+To verify the scanner is detected:
+
+```bash
+scanimage -L
+```
+
+Expected output:
+```
+device `brother2:bus1;dev1' is a Brother DCP-130C USB scanner
+```
+
 ## Troubleshooting
 
 ### Debug mode
 
-Run the script with `--debug` for verbose diagnostic output:
+Run the scripts with `--debug` for verbose diagnostic output:
 ```bash
 sudo ./install_printer.sh --debug
+sudo ./install_scanner.sh --debug
 ```
 
 ### Driver download fails
 
-Brother may remove or move driver files over time. The script tries multiple
+Brother may remove or move driver files over time. The scripts try multiple
 download sources automatically. If all sources fail, you can download the
-drivers manually and place them in `/tmp/brother_dcp130c_install/`:
+drivers manually and place them in the temporary directory:
 
+**Printer drivers:**
 ```bash
 mkdir -p /tmp/brother_dcp130c_install
 # Download dcp130clpr-1.0.1-1.i386.deb and dcp130ccupswrapper-1.0.1-1.i386.deb
 # from Brother's support website or another source, then:
 cp dcp130clpr-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130clpr.deb
 cp dcp130ccupswrapper-1.0.1-1.i386.deb /tmp/brother_dcp130c_install/dcp130ccupswrapper.deb
+```
+
+**Scanner driver:**
+```bash
+mkdir -p /tmp/brother_dcp130c_scanner_install
+# Download brscan2-0.2.5-1.i386.deb from Brother's support website or another source, then:
+cp brscan2-0.2.5-1.i386.deb /tmp/brother_dcp130c_scanner_install/brscan2.deb
 ```
 
 ### Printer not detected
@@ -177,14 +245,30 @@ entries, clear the Android print service cache:
 
 **Settings → Apps → Default Print Service → Storage → Clear Cache**
 
+### Scanner not detected
+- Ensure the device is powered on and connected via USB
+- Try a different USB cable or port
+- Run `lsusb` to check if the Brother device appears
+- Run `sudo scanimage -L` to list detected scanners
+- Verify the SANE backend: `grep brother2 /etc/sane.d/dll.conf`
+
+### Scanner permission issues
+- Check if your user has access to the USB device
+- Try running with sudo: `sudo scanimage -L`
+- You may need to add udev rules for the Brother scanner
+
 ## Technical Details
 
 ### Driver Sources
 
+**Printer:**
 - **LPR Driver**: dcp130clpr-1.0.1-1.i386.deb
 - **CUPS Wrapper**: dcp130ccupswrapper-1.0.1-1.i386.deb
 
-The script modifies these i386 packages to work on ARM architecture by:
+**Scanner:**
+- **SANE Backend**: brscan2-0.2.5-1.i386.deb
+
+The scripts modify these i386 packages to work on ARM architecture by:
 1. Extracting the .deb packages
 2. Changing architecture from i386 to "all" in control files
 3. Repackaging for ARM installation
