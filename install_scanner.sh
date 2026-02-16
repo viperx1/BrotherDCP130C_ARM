@@ -736,6 +736,8 @@ setup_i386_scanner() {
         "libusb-1.0-0    libu/libusb-1.0     libusb-1.0-0_"
         "libxml2         libx/libxml2        libxml2_"
         "libicu72        i/icu               libicu72_"
+        "libudev1        s/systemd           libudev1_"
+        "libcap2         libc/libcap2        libcap2_"
     )
     for dep_spec in "${dep_specs[@]}"; do
         read -r dep_name dep_pool dep_pattern <<< "$dep_spec"
@@ -783,6 +785,10 @@ setup_i386_scanner() {
     rm -rf "$i386_tmp"
 
     # Copy the Brother scanner backend .so files into the i386 SANE environment
+    # NOTE: cp -a preserves symlinks as-is, which may have absolute targets
+    # (e.g. libbrscandec2.so -> /usr/lib/libbrscandec2.so.1). These absolute
+    # symlinks get double-prefixed by qemu -L, so we must fix them to be
+    # relative after copying.
     local i386_sane_dir="$i386_root/usr/lib/sane"
     sudo mkdir -p "$i386_sane_dir"
     for brother_so in /usr/lib/sane/libsane-brother2*; do
@@ -797,6 +803,24 @@ setup_i386_scanner() {
             sudo cp -a "$brother_lib" "$i386_root/usr/lib/" 2>/dev/null || true
             log_debug "Copied to i386 env: $(basename "$brother_lib")"
         fi
+    done
+
+    # Fix absolute symlinks in the i386 environment — cp -a preserves the
+    # original symlink targets which may be absolute host paths like
+    # /usr/lib/libbrscandec2.so.1. Under qemu -L, these get double-prefixed
+    # to /opt/brother/i386/usr/lib/libbrscandec2.so.1 which doesn't exist.
+    # Convert them to relative symlinks that work correctly under qemu -L.
+    for check_dir in "$i386_root/usr/lib/sane" "$i386_root/usr/lib"; do
+        while IFS= read -r -d '' symlink; do
+            local target
+            target=$(readlink "$symlink")
+            if [[ "$target" == /* ]]; then
+                local base_target
+                base_target=$(basename "$target")
+                log_debug "Fixing absolute symlink: $(basename "$symlink") -> $target (changing to $base_target)"
+                sudo ln -sf "$base_target" "$symlink"
+            fi
+        done < <(find "$check_dir" -maxdepth 1 -type l -print0 2>/dev/null)
     done
 
     # Copy Brother configuration files
@@ -874,7 +898,7 @@ setup_i386_scanner() {
     missing_libs=$("$qemu_bin" -L "$i386_root" "$i386_root/lib/ld-linux.so.2" --list "$guest_scanimage" 2>&1 || true)
     log_debug "ld-linux --list output: $(echo "$missing_libs" | head -20)"
     local still_missing
-    still_missing=$(echo "$missing_libs" | grep "not found" || true)
+    still_missing=$(echo "$missing_libs" | grep -E "not found|cannot open shared object file" || true)
     if [[ -n "$still_missing" ]]; then
         log_warn "i386 scanimage has missing library dependencies:"
         while IFS= read -r line; do
