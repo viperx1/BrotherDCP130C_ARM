@@ -79,11 +79,12 @@ The printer script will:
 
 The scanner script will:
 - Check system architecture
-- Install SANE and dependencies
+- Install SANE, build tools, and dependencies
 - Download and prepare the brscan2 driver for ARM
 - Install the scanner driver and create SANE backend symlinks
-- Set up an i386 SANE environment with `qemu-i386-static` (needed because ARM SANE cannot `dlopen()` i386 shared libraries)
-- Create a `brother-scanimage` wrapper for scanning
+- **Compile a native ARM SANE backend from source** — this allows direct USB access without qemu emulation
+- Create ARM-native stub libraries for scan data decoding and color matching
+- Fall back to an i386 SANE environment with `qemu-i386-static` if native compilation fails
 - Configure the scanner with brsaneconfig2
 - Optionally perform a test scan
 
@@ -115,14 +116,14 @@ After installation, you can:
 
 After installation, you can:
 
-- **Scan a document** (use `brother-scanimage` on ARM):
+- **Scan a document**:
   ```bash
-  brother-scanimage --format=png --resolution=300 > scan.png
+  scanimage -d 'brother2:bus1;dev1' --format=png --resolution=300 > scan.png
   ```
 
 - **List available scanners**:
   ```bash
-  brother-scanimage -L
+  scanimage -L
   ```
 
 - **Check scanner configuration**:
@@ -130,11 +131,12 @@ After installation, you can:
   brsaneconfig2 -q
   ```
 
-> **Note:** On ARM (Raspberry Pi), the native `scanimage` cannot load the i386 Brother
-> SANE backend (`dlopen()` architecture mismatch). The install script creates a
-> `brother-scanimage` wrapper that runs an i386 `scanimage` through `qemu-i386-static`,
-> which can natively load the Brother backend. Use `brother-scanimage` instead of
-> `scanimage` for all scanning operations.
+> **Architecture Note:** The Brother brscan2 driver is distributed as i386 (x86) binaries.
+> The install script downloads the [brscan2 source code](https://download.brother.com/welcome/dlf006820/brscan2-src-0.2.5-1.tar.gz)
+> and compiles a native ARM SANE backend, with ARM stub libraries for the closed-source
+> scan decoder and color matching components. This allows direct USB access without qemu
+> emulation. If native compilation fails, the script falls back to running an i386
+> `scanimage` through `qemu-i386-static` (via the `brother-scanimage` wrapper).
 
 ### Printer Sharing
 

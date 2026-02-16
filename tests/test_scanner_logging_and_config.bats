@@ -64,6 +64,18 @@ teardown() {
     [[ "${DRIVER_BRSCAN2_URLS[0]}" == *"brother.com"* ]]
 }
 
+@test "scanner: DRIVER_BRSCAN2_SRC_URLS has at least 2 mirrors" {
+    [[ ${#DRIVER_BRSCAN2_SRC_URLS[@]} -ge 2 ]]
+}
+
+@test "scanner: Source URL contains brother.com" {
+    [[ "${DRIVER_BRSCAN2_SRC_URLS[0]}" == *"brother.com"* ]]
+}
+
+@test "scanner: Source filename ends in .tar.gz" {
+    [[ "$DRIVER_BRSCAN2_SRC_FILE" == *".tar.gz" ]]
+}
+
 @test "scanner: Driver filename ends in .i386.deb" {
     [[ "$DRIVER_BRSCAN2_FILE" == *".i386.deb" ]]
 }

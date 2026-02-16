@@ -49,6 +49,14 @@ TMP_DIR="/tmp/brother_dcp130c_scanner_install"
 # Driver filename
 DRIVER_BRSCAN2_FILE="brscan2-0.2.5-1.i386.deb"
 
+# Source code for native ARM compilation
+DRIVER_BRSCAN2_SRC_FILE="brscan2-src-0.2.5-1.tar.gz"
+DRIVER_BRSCAN2_SRC_URLS=(
+    "https://download.brother.com/welcome/dlf006820/${DRIVER_BRSCAN2_SRC_FILE}"
+    "http://download.brother.com/welcome/dlf006820/${DRIVER_BRSCAN2_SRC_FILE}"
+    "https://web.archive.org/web/2024if_/https://download.brother.com/welcome/dlf006820/${DRIVER_BRSCAN2_SRC_FILE}"
+)
+
 # Multiple download sources (tried in order). Brother has moved files across
 # domains over the years, so we try several known locations plus the
 # Internet Archive as a last resort.
@@ -257,6 +265,9 @@ install_dependencies() {
         "$LIBSANE"
         "$LIBUSB"
         patchelf
+        gcc
+        libsane-dev
+        libusb-dev
     )
 
     log_debug "Final package list: ${packages[*]}"
@@ -1016,12 +1027,25 @@ setup_i386_scanner() {
 # Usage: brother-scanimage [scanimage arguments...]
 # Example: brother-scanimage --format=png --resolution=300 > scan.png
 #          brother-scanimage -L
+#
+# Debug flags (pass as first argument):
+#   --strace   : Enable qemu syscall tracing (shows all system calls)
+#   --debug-usb: Enable LIBUSB_DEBUG=4 and SANE_DEBUG_BROTHER2=5
+
+QEMU_ARGS=()
+# Check for debug flags
+while [[ "\$1" == --strace || "\$1" == --debug-usb ]]; do
+    case "\$1" in
+        --strace)    QEMU_ARGS+=("-strace"); shift ;;
+        --debug-usb) export LIBUSB_DEBUG=4; export SANE_DEBUG_BROTHER2=5; export SANE_DEBUG_DLL=3; shift ;;
+    esac
+done
 
 # Paths are guest-relative (resolved under the qemu -L guest root)
 export SANE_CONFIG_DIR="/etc/sane.d"
 export LD_LIBRARY_PATH="/usr/lib:/usr/lib/sane:/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu:/usr/local/lib"
 
-exec "$qemu_bin" -L "$i386_root" "$i386_scanimage" "\$@"
+exec "$qemu_bin" "\${QEMU_ARGS[@]}" -L "$i386_root" "$i386_scanimage" "\$@"
 WRAPPER_EOF
     sudo chmod 755 "$wrapper"
     log_info "Created: $wrapper"
@@ -1046,6 +1070,273 @@ WRAPPER_EOF
 
     log_info "i386 scanner environment setup complete."
     log_info "Use 'brother-scanimage' instead of 'scanimage' for scanning."
+}
+
+# Compile the Brother SANE backend natively for ARM from source.
+# This produces a native ARM libsane-brother2.so that can use the real
+# USB stack directly, bypassing qemu entirely.
+compile_arm_backend() {
+    local src_dir="$TMP_DIR/brscan2-src"
+    local build_dir="$TMP_DIR/arm_build"
+
+    # Check if native backend already works
+    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]]; then
+        local arch
+        arch=$(file -b /usr/lib/sane/libsane-brother2.so.1.0.7 2>/dev/null || true)
+        if echo "$arch" | grep -qi "ARM\|aarch64"; then
+            log_debug "Native ARM SANE backend already installed"
+            return 0
+        fi
+    fi
+
+    # Check for compiler
+    if ! command -v gcc &>/dev/null; then
+        log_warn "gcc not found — cannot compile native ARM backend"
+        return 1
+    fi
+
+    log_info "Compiling native ARM SANE backend from source..."
+    log_info "This bypasses qemu to access USB directly from ARM."
+
+    # Download source
+    log_info "Downloading brscan2 source code..."
+    mkdir -p "$src_dir" "$build_dir"
+
+    local src_tarball="$TMP_DIR/$DRIVER_BRSCAN2_SRC_FILE"
+    if [[ ! -f "$src_tarball" ]]; then
+        if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
+            log_warn "Failed to download brscan2 source code"
+            return 1
+        fi
+    fi
+
+    # Extract source
+    tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 || {
+        log_warn "Failed to extract brscan2 source"
+        return 1
+    }
+
+    local brscan_src="$src_dir/brscan"
+    if [[ ! -d "$brscan_src/backend_src" ]]; then
+        log_warn "brscan2 source structure not as expected"
+        return 1
+    fi
+    log_debug "Source extracted to: $brscan_src"
+
+    # Check for required headers
+    local sane_header=""
+    for hdr_path in /usr/include/sane/sane.h "$brscan_src/include/sane/sane.h"; do
+        if [[ -f "$hdr_path" ]]; then
+            sane_header="$hdr_path"
+            break
+        fi
+    done
+    if [[ -z "$sane_header" ]]; then
+        log_warn "SANE headers not found (install libsane-dev)"
+        return 1
+    fi
+    log_debug "Using SANE headers from: $(dirname "$(dirname "$sane_header")")"
+
+    # Compiler flags
+    local inc_flags="-I${brscan_src} -I${brscan_src}/include -I${brscan_src}/libbrscandec2 -I${brscan_src}/libbrcolm2"
+    local def_flags="-DHAVE_CONFIG_H -D_GNU_SOURCE -DPATH_SANE_CONFIG_DIR=\\\"/etc/sane.d\\\" -DPATH_SANE_DATA_DIR=\\\"/usr/share\\\" -DV_MAJOR=1 -DV_MINOR=0 -DBRSANESUFFIX=2 -DBACKEND_NAME=brother2"
+    local cc_flags="-O2 -fPIC -w"
+
+    # Compile main backend (brother2.c includes other .c files)
+    log_info "Compiling SANE backend..."
+    if ! eval gcc -c $cc_flags $inc_flags $def_flags \
+        "${brscan_src}/backend_src/brother2.c" -o "$build_dir/brother2.o" 2>&1 | tail -3; then
+        log_warn "Failed to compile brother2.c"
+        return 1
+    fi
+    log_debug "brother2.o compiled"
+
+    # Compile sane_strstatus
+    eval gcc -c $cc_flags $inc_flags -DBACKEND_NAME=brother2 -DHAVE_CONFIG_H -D_GNU_SOURCE \
+        "${brscan_src}/backend_src/sane_strstatus.c" -o "$build_dir/sane_strstatus.o" 2>/dev/null || true
+
+    # Compile sanei support files
+    for sf in sanei_constrain_value sanei_init_debug sanei_config; do
+        eval gcc -c $cc_flags $inc_flags -DHAVE_CONFIG_H -D_GNU_SOURCE \
+            "${brscan_src}/sanei/${sf}.c" -o "$build_dir/${sf}.o" 2>/dev/null || true
+        log_debug "${sf}.o compiled"
+    done
+
+    # Create ARM stub for libbrscandec2 (scan data decompression)
+    log_info "Creating ARM scan decoder library..."
+    cat > "$build_dir/libbrscandec2_stub.c" << 'SCANDEC_EOF'
+/* ARM stub for libbrscandec2 — scan data decompression (PackBits etc.) */
+#include <string.h>
+#include <stdlib.h>
+typedef int BOOL; typedef unsigned char BYTE; typedef unsigned long DWORD;
+typedef int INT; typedef void *HANDLE;
+#define TRUE 1
+#define FALSE 0
+#define SCIDC_WHITE 1
+#define SCIDC_NONCOMP 2
+#define SCIDC_PACK 3
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind;
+    BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+static SCANDEC_OPEN g_open;
+static DWORD decode_packbits(const BYTE *in, DWORD inLen, BYTE *out, DWORD outMax) {
+    DWORD iP=0, oP=0;
+    while (iP < inLen && oP < outMax) {
+        signed char n = (signed char)in[iP++];
+        if (n >= 0) {
+            DWORD c = (DWORD)(n+1);
+            if (iP+c > inLen) c = inLen-iP;
+            if (oP+c > outMax) c = outMax-oP;
+            memcpy(out+oP, in+iP, c); iP += c; oP += c;
+        } else if (n != -128) {
+            DWORD c = (DWORD)(1-n);
+            if (iP >= inLen) break;
+            BYTE v = in[iP++];
+            if (oP+c > outMax) c = outMax-oP;
+            memset(out+oP, v, c); oP += c;
+        }
+    }
+    return oP;
+}
+BOOL ScanDecOpen(SCANDEC_OPEN *p) {
+    if (!p) return FALSE;
+    memcpy(&g_open, p, sizeof(*p));
+    p->dwOutLinePixCnt = p->dwInLinePixCnt;
+    int bpp = (p->nColorType & 0x0400) ? 3 : 1;
+    p->dwOutLineByte = p->dwOutLinePixCnt * bpp;
+    if (p->bLongBoundary) p->dwOutLineByte = (p->dwOutLineByte + 3) & ~3UL;
+    p->dwOutWriteMaxSize = p->dwOutLineByte * 16;
+    memcpy(&g_open, p, sizeof(*p));
+    return TRUE;
+}
+void ScanDecSetTblHandle(HANDLE h1, HANDLE h2) { (void)h1; (void)h2; }
+BOOL ScanDecPageStart(void) { return TRUE; }
+DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
+    if (!w || !w->pLineData || !w->pWriteBuff) { if(st) *st=-1; return 0; }
+    DWORD n = 0;
+    switch (w->nInDataComp) {
+        case SCIDC_WHITE:
+            n = g_open.dwOutLineByte;
+            if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
+            memset(w->pWriteBuff, 0xFF, n); break;
+        case SCIDC_NONCOMP:
+            n = w->dwLineDataSize;
+            if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
+            memcpy(w->pWriteBuff, w->pLineData, n); break;
+        case SCIDC_PACK:
+            n = decode_packbits(w->pLineData, w->dwLineDataSize,
+                                w->pWriteBuff, w->dwWriteBuffSize); break;
+        default:
+            n = w->dwLineDataSize;
+            if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
+            memcpy(w->pWriteBuff, w->pLineData, n); break;
+    }
+    if (st) *st = 0;
+    return n;
+}
+DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) { (void)w; if(st) *st=0; return 0; }
+BOOL ScanDecClose(void) { memset(&g_open, 0, sizeof(g_open)); return TRUE; }
+void *bugchk_malloc(size_t s, const char *f, int l) { (void)f;(void)l; return malloc(s); }
+void bugchk_free(void *p, const char *f, int l) { (void)f;(void)l; free(p); }
+SCANDEC_EOF
+    gcc -shared -fPIC -O2 -w -o "$build_dir/libbrscandec2.so.1.0.0" \
+        "$build_dir/libbrscandec2_stub.c" || {
+        log_warn "Failed to compile libbrscandec2 stub"
+        return 1
+    }
+    log_debug "libbrscandec2.so.1.0.0 compiled (ARM stub with PackBits decoder)"
+
+    # Create ARM stub for libbrcolm2 (color matching — pass-through)
+    log_info "Creating ARM color matching library..."
+    cat > "$build_dir/libbrcolm2_stub.c" << 'COLM_EOF'
+/* ARM stub for libbrcolm2 — color matching (pass-through, no correction) */
+#include <stdlib.h>
+typedef int BOOL; typedef unsigned char BYTE; typedef unsigned long DWORD;
+#define TRUE 1
+#define FALSE 0
+BOOL ColorMatchingInit(int t) { (void)t; return TRUE; }
+BOOL ColorMatchingEnd(void) { return TRUE; }
+DWORD ColorMatching(BYTE *d, DWORD s) { (void)d; return s; }
+DWORD LutColorMatching(BYTE *d, DWORD s) { (void)d; return s; }
+void InitLUT(void) {}
+DWORD MatchDataGet(BYTE *d, DWORD s) { (void)d; return s; }
+void *bugchk_malloc(size_t s, const char *f, int l) { (void)f;(void)l; return malloc(s); }
+void bugchk_free(void *p, const char *f, int l) { (void)f;(void)l; free(p); }
+COLM_EOF
+    gcc -shared -fPIC -O2 -w -o "$build_dir/libbrcolm2.so.1.0.0" \
+        "$build_dir/libbrcolm2_stub.c" || {
+        log_warn "Failed to compile libbrcolm2 stub"
+        return 1
+    }
+    log_debug "libbrcolm2.so.1.0.0 compiled (ARM pass-through stub)"
+
+    # Link the SANE backend shared library
+    log_info "Linking native ARM SANE backend..."
+    gcc -shared -fPIC -o "$build_dir/libsane-brother2.so.1.0.7" \
+        "$build_dir/brother2.o" \
+        "$build_dir/sane_strstatus.o" \
+        "$build_dir/sanei_constrain_value.o" \
+        "$build_dir/sanei_init_debug.o" \
+        "$build_dir/sanei_config.o" \
+        -lpthread -lusb -lm -ldl -lc \
+        -Wl,-soname,libsane-brother2.so.1 || {
+        log_warn "Failed to link libsane-brother2.so"
+        return 1
+    }
+
+    # Verify it's the right architecture
+    local built_arch
+    built_arch=$(file -b "$build_dir/libsane-brother2.so.1.0.7")
+    log_debug "Built backend: $built_arch"
+    if echo "$built_arch" | grep -qi "Intel 80386\|x86-64"; then
+        log_warn "Built library is not ARM (got: $built_arch)"
+        log_warn "This shouldn't happen on a Raspberry Pi"
+        return 1
+    fi
+
+    # Install the native ARM libraries
+    log_info "Installing native ARM SANE backend..."
+
+    # Backup original i386 libraries
+    for lib_path in /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                    /usr/lib/libbrscandec2.so.1.0.0 \
+                    /usr/lib/libbrcolm2.so.1.0.0; do
+        if [[ -f "$lib_path" ]] && file -b "$lib_path" 2>/dev/null | grep -qi "Intel 80386"; then
+            sudo cp "$lib_path" "${lib_path}.i386.bak"
+            log_debug "Backed up i386 library: ${lib_path}.i386.bak"
+        fi
+    done
+
+    # Install ARM libraries
+    sudo cp "$build_dir/libsane-brother2.so.1.0.7" /usr/lib/sane/
+    sudo cp "$build_dir/libbrscandec2.so.1.0.0" /usr/lib/
+    sudo cp "$build_dir/libbrcolm2.so.1.0.0" /usr/lib/
+
+    # Create/update symlinks
+    (cd /usr/lib/sane && sudo ln -sf libsane-brother2.so.1.0.7 libsane-brother2.so.1 && \
+     sudo ln -sf libsane-brother2.so.1.0.7 libsane-brother2.so)
+    (cd /usr/lib && sudo ln -sf libbrscandec2.so.1.0.0 libbrscandec2.so.1 && \
+     sudo ln -sf libbrscandec2.so.1.0.0 libbrscandec2.so)
+    (cd /usr/lib && sudo ln -sf libbrcolm2.so.1.0.0 libbrcolm2.so.1 && \
+     sudo ln -sf libbrcolm2.so.1.0.0 libbrcolm2.so)
+
+    # Run ldconfig to update library cache
+    sudo ldconfig 2>/dev/null || true
+
+    log_info "Native ARM SANE backend installed successfully!"
+    log_debug "Libraries installed:"
+    log_debug "  $(file /usr/lib/sane/libsane-brother2.so.1.0.7)"
+    log_debug "  $(file /usr/lib/libbrscandec2.so.1.0.0)"
+    log_debug "  $(file /usr/lib/libbrcolm2.so.1.0.0)"
+
+    return 0
 }
 
 # Detect scanner USB connection
@@ -1146,16 +1437,27 @@ test_scan() {
     log_info "Testing scanner..."
 
     # Determine the best scanimage command to use.
-    # On ARM, the native scanimage cannot load i386 Brother SANE backends
-    # (dlopen architecture mismatch), so we prefer brother-scanimage.
+    # If we have a native ARM backend, use native scanimage (direct USB access).
+    # Otherwise fall back to the i386 qemu wrapper.
     local scan_cmd=""
-    if [[ -x /usr/local/bin/brother-scanimage ]]; then
+    local using_native=false
+    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]] && \
+       file -b /usr/lib/sane/libsane-brother2.so.1.0.7 2>/dev/null | grep -qi "ARM\|aarch64"; then
+        # Native ARM backend — use native scanimage for direct USB access
+        if command -v scanimage &>/dev/null; then
+            scan_cmd="scanimage"
+            using_native=true
+            log_debug "Using native ARM scanimage (direct USB access)"
+        fi
+    fi
+    if [[ -z "$scan_cmd" ]] && [[ -x /usr/local/bin/brother-scanimage ]]; then
         scan_cmd="/usr/local/bin/brother-scanimage"
         log_debug "Using i386 wrapper: $scan_cmd"
-    elif command -v scanimage &>/dev/null; then
+    elif [[ -z "$scan_cmd" ]] && command -v scanimage &>/dev/null; then
         scan_cmd="scanimage"
         log_debug "Using native scanimage"
-    else
+    fi
+    if [[ -z "$scan_cmd" ]]; then
         log_warn "scanimage not found. Install sane-utils to test scanning."
         return
     fi
@@ -1265,10 +1567,9 @@ test_scan() {
         fi
     fi
 
-    # Collect available devices — prefer network (net) over USB (bus) when running
-    # through qemu, because qemu user-mode emulation cannot handle the USB ioctl
-    # calls that libusb needs for direct USB scanning. The network device (net1)
-    # communicates via the Brother protocol over localhost, which works under qemu.
+    # Collect available devices.
+    # With native ARM backend: prefer USB device (direct access works).
+    # With qemu wrapper: prefer network device (USB ioctls don't work under qemu).
     local -a scan_devices=()
     local net_device="" usb_device=""
     if echo "$scanners" | grep -q "brother2:net"; then
@@ -1278,8 +1579,18 @@ test_scan() {
         usb_device=$(echo "$scanners" | grep -oP "brother2:bus[^'\"]*" | head -1)
     fi
 
-    # When using qemu wrapper, prefer network device (USB ioctls don't work under qemu)
-    if [[ "$scan_cmd" == *"brother-scanimage"* ]] && [[ -n "$net_device" ]]; then
+    if $using_native; then
+        # Native ARM backend — prefer USB device (direct hardware access)
+        if [[ -n "$usb_device" ]]; then
+            scan_devices=("$usb_device")
+            [[ -n "$net_device" ]] && scan_devices+=("$net_device")
+            log_info "Selected USB scanner device: $usb_device (native ARM backend)"
+        elif [[ -n "$net_device" ]]; then
+            scan_devices=("$net_device")
+            log_info "Selected network scanner device: $net_device"
+        fi
+    elif [[ "$scan_cmd" == *"brother-scanimage"* ]] && [[ -n "$net_device" ]]; then
+        # Qemu wrapper — prefer network device (USB ioctls don't work under qemu)
         scan_devices=("$net_device")
         [[ -n "$usb_device" ]] && scan_devices+=("$usb_device")
         log_info "Selected network scanner device: $net_device (preferred under qemu)"
@@ -1353,15 +1664,70 @@ test_scan() {
         if ! $scan_ok; then
             if $all_invalid_arg && [[ "$scan_cmd" == *"brother-scanimage"* ]]; then
                 log_warn "All scan devices returned 'Invalid argument'."
-                log_info "This is a known limitation: qemu user-mode emulation cannot"
-                log_info "translate USB ioctl calls between i386 and ARM architectures."
-                log_info "The scanner IS detected and configured correctly, but the"
-                log_info "actual USB data transfer cannot work through qemu-user."
+                log_info "Running qemu strace to diagnose the failing syscall..."
+
+                # Run with qemu -strace to capture the exact syscall that fails
+                local strace_device="${scan_devices[0]:-brother2:net1;dev0}"
+                local strace_output="/tmp/brother_strace_diag.log"
+                timeout 15 "$scan_cmd" --strace -d "$strace_device" --format=pnm --resolution=150 \
+                    > /dev/null 2>"$strace_output" || true
+
+                if [[ -s "$strace_output" ]]; then
+                    # Show the failing ioctl/syscall lines
+                    local ioctl_fails
+                    ioctl_fails=$(grep -i "ioctl\|EINVAL\|Invalid\|= -1 errno" "$strace_output" | tail -20)
+                    if [[ -n "$ioctl_fails" ]]; then
+                        log_debug "Failing syscalls from qemu strace:"
+                        while IFS= read -r line; do
+                            log_debug "  $line"
+                        done <<< "$ioctl_fails"
+                    fi
+
+                    # Show USB-related syscalls
+                    local usb_calls
+                    usb_calls=$(grep -i "usb\|/dev/bus\|usbdev\|usbfs" "$strace_output" | head -10)
+                    if [[ -n "$usb_calls" ]]; then
+                        log_debug "USB-related syscalls:"
+                        while IFS= read -r line; do
+                            log_debug "  $line"
+                        done <<< "$usb_calls"
+                    fi
+
+                    # Show open() calls that fail
+                    local open_fails
+                    open_fails=$(grep "open.*= -1\|openat.*= -1" "$strace_output" | head -10)
+                    if [[ -n "$open_fails" ]]; then
+                        log_debug "Failed open() calls:"
+                        while IFS= read -r line; do
+                            log_debug "  $line"
+                        done <<< "$open_fails"
+                    fi
+                fi
+                rm -f "$strace_output"
+
+                # Also run with LIBUSB_DEBUG for libusb-level diagnostics
+                log_info "Running with LIBUSB_DEBUG for USB diagnostics..."
+                local libusb_output
+                libusb_output=$(timeout 15 "$scan_cmd" --debug-usb -d "$strace_device" --format=pnm --resolution=150 \
+                    2>&1 >/dev/null || true)
+                if [[ -n "$libusb_output" ]]; then
+                    local libusb_info
+                    libusb_info=$(echo "$libusb_output" | grep -i "libusb\|usb\|open.*device\|claim\|interface\|ioctl\|error\|brother" | head -20)
+                    if [[ -n "$libusb_info" ]]; then
+                        log_debug "USB/SANE debug output:"
+                        while IFS= read -r line; do
+                            log_debug "  $line"
+                        done <<< "$libusb_info"
+                    fi
+                fi
+
+                log_warn "Scan failed with 'Invalid argument' on all devices."
+                log_info "The scanner IS detected and configured correctly."
+                log_info "The failure occurs during USB device access under qemu emulation."
                 log_info ""
-                log_info "Workarounds:"
-                log_info "  1. Use an x86/x64 computer to scan (this scanner has no network interface)"
-                log_info "  2. Try a SANE-over-network setup from an x86 machine"
-                log_info "  3. Check if a future Brother ARM-native driver becomes available"
+                log_info "To run diagnostics manually:"
+                log_info "  sudo brother-scanimage --strace -L 2>&1 | grep -i ioctl"
+                log_info "  sudo brother-scanimage --debug-usb -L"
             else
                 log_info "Try manually: $scan_cmd -d '${scan_devices[0]:-brother2:net1;dev0}' --format=pnm > scan.pnm"
             fi
@@ -1393,12 +1759,28 @@ display_info() {
     echo
     log_info "Scanner Name: $SCANNER_NAME"
     echo
-    if [[ -x /usr/local/bin/brother-scanimage ]]; then
+    # Check if we have a native ARM backend
+    local has_native_backend=false
+    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]] && \
+       file -b /usr/lib/sane/libsane-brother2.so.1.0.7 2>/dev/null | grep -qi "ARM\|aarch64"; then
+        has_native_backend=true
+    fi
+
+    if $has_native_backend; then
+        log_info "Backend: Native ARM (compiled from source — direct USB access)"
+        log_info "To scan a document:"
+        log_info "  scanimage -d 'brother2:bus1;dev1' --format=png --resolution=300 > scan.png"
+        log_info "To list available scanners:"
+        log_info "  scanimage -L"
+    elif [[ -x /usr/local/bin/brother-scanimage ]]; then
+        log_info "Backend: i386 via qemu (brother-scanimage wrapper)"
         log_info "To scan a document (use brother-scanimage on ARM):"
         log_info "  brother-scanimage -d 'brother2:net1;dev0' --format=png --resolution=300 > scan.png"
         log_info "To list available scanners:"
         log_info "  brother-scanimage -L"
-        log_info "Note: Use 'net1' device (not 'bus1') — USB ioctls don't work under qemu."
+        log_info "Debug flags (pass before other arguments):"
+        log_info "  brother-scanimage --strace -L          # Show all syscalls (for diagnosing USB issues)"
+        log_info "  brother-scanimage --debug-usb -L       # Show USB/SANE debug output"
     else
         log_info "To scan a document:"
         log_info "  scanimage -d 'brother2:bus1;dev0' --format=png --resolution=300 > scan.png"
@@ -1441,7 +1823,16 @@ main() {
     extract_and_modify_drivers
     repackage_drivers
     install_drivers
-    setup_i386_scanner
+
+    # Try native ARM compilation first (best approach — direct USB access).
+    # Falls back to i386/qemu approach if compilation fails.
+    if compile_arm_backend; then
+        log_info "Using native ARM SANE backend (direct USB access)."
+    else
+        log_info "Native ARM compilation failed — falling back to i386/qemu approach."
+        setup_i386_scanner
+    fi
+
     detect_scanner
     configure_scanner
     test_scan
