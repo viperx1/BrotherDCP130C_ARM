@@ -1155,10 +1155,11 @@ test_scan() {
         if [[ -n "$usb_dev" ]]; then
             # Extract bus and device number to check /dev/bus/usb permissions
             local bus_num dev_num
-            bus_num=$(echo "$usb_dev" | grep -oP 'Bus \K[0-9]+')
-            dev_num=$(echo "$usb_dev" | grep -oP 'Device \K[0-9]+')
+            bus_num=$(echo "$usb_dev" | awk '{print $2}')
+            dev_num=$(echo "$usb_dev" | awk '{print $4}' | tr -d ':')
             if [[ -n "$bus_num" && -n "$dev_num" ]]; then
-                local usb_dev_path="/dev/bus/usb/${bus_num}/${dev_num}"
+                local usb_dev_path
+                usb_dev_path=$(printf "/dev/bus/usb/%03d/%03d" "$bus_num" "$dev_num")
                 if [[ -e "$usb_dev_path" ]]; then
                     log_debug "  USB device node: $(ls -la "$usb_dev_path" 2>/dev/null)"
                 else
