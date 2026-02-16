@@ -870,6 +870,12 @@ setup_i386_scanner() {
 
     # Create the wrapper script
     log_info "Creating brother-scanimage wrapper..."
+    # NOTE: qemu-user-static -L sets the guest root for the i386 process.
+    # The i386 dynamic linker resolves ALL paths (including LD_LIBRARY_PATH
+    # and SANE_CONFIG_DIR) relative to this guest root. So we must use
+    # guest-relative paths (e.g. /usr/lib), NOT host-absolute paths
+    # (e.g. /opt/brother/i386/usr/lib) — the latter would be doubled to
+    # /opt/brother/i386/opt/brother/i386/usr/lib which doesn't exist.
     sudo tee "$wrapper" > /dev/null << WRAPPER_EOF
 #!/bin/bash
 # Brother scanner wrapper — runs i386 scanimage via qemu-i386-static.
@@ -880,8 +886,9 @@ setup_i386_scanner() {
 # Example: brother-scanimage --format=png --resolution=300 > scan.png
 #          brother-scanimage -L
 
-export SANE_CONFIG_DIR="$i386_root/etc/sane.d"
-export LD_LIBRARY_PATH="$i386_root/usr/lib:$i386_root/usr/lib/sane:$i386_root/usr/lib/i386-linux-gnu:$i386_root/lib/i386-linux-gnu:/usr/lib:/lib/i386-linux-gnu"
+# Paths are guest-relative (resolved under the qemu -L guest root)
+export SANE_CONFIG_DIR="/etc/sane.d"
+export LD_LIBRARY_PATH="/usr/lib:/usr/lib/sane:/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu:/usr/local/lib"
 
 exec "$qemu_bin" -L "$i386_root" "$i386_scanimage" "\$@"
 WRAPPER_EOF
