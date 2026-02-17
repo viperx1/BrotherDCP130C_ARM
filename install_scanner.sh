@@ -1137,9 +1137,16 @@ compile_arm_backend() {
     fi
     log_debug "Using SANE headers from: $(dirname "$(dirname "$sane_header")")"
 
+    # Check for libusb-0.1 header (usb.h)
+    if [[ ! -f /usr/include/usb.h ]] && [[ ! -f "$brscan_src/include/usb.h" ]]; then
+        log_warn "usb.h header not found (install libusb-dev)"
+        return 1
+    fi
+
     # Compiler flags — use arrays to avoid eval
     local -a common_flags=(-O2 -fPIC -w
         "-I${brscan_src}" "-I${brscan_src}/include"
+        "-I${brscan_src}/backend_src"
         "-I${brscan_src}/libbrscandec2" "-I${brscan_src}/libbrcolm2"
         -DHAVE_CONFIG_H -D_GNU_SOURCE
     )
@@ -1149,11 +1156,14 @@ compile_arm_backend() {
         -DV_MAJOR=1 -DV_MINOR=0 -DBRSANESUFFIX=2 -DBACKEND_NAME=brother2
     )
 
-    # Compile main backend (brother2.c includes other .c files)
+    # Compile main backend (brother2.c #includes all other .c files)
     log_info "Compiling SANE backend..."
-    if ! gcc -c "${common_flags[@]}" "${backend_flags[@]}" \
-        "${brscan_src}/backend_src/brother2.c" -o "$build_dir/brother2.o" 2>&1 | tail -3; then
+    local gcc_output
+    gcc_output=$(gcc -c "${common_flags[@]}" "${backend_flags[@]}" \
+        "${brscan_src}/backend_src/brother2.c" -o "$build_dir/brother2.o" 2>&1) || true
+    if [[ ! -f "$build_dir/brother2.o" ]]; then
         log_warn "Failed to compile brother2.c"
+        log_debug "gcc output: $gcc_output"
         return 1
     fi
     log_debug "brother2.o compiled"
@@ -1166,6 +1176,10 @@ compile_arm_backend() {
     for sf in sanei_constrain_value sanei_init_debug sanei_config; do
         gcc -c "${common_flags[@]}" \
             "${brscan_src}/sanei/${sf}.c" -o "$build_dir/${sf}.o" 2>/dev/null || true
+        if [[ ! -f "$build_dir/${sf}.o" ]]; then
+            log_warn "Failed to compile ${sf}.c"
+            return 1
+        fi
         log_debug "${sf}.o compiled"
     done
 
@@ -1249,8 +1263,6 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
 }
 DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) { (void)w; if(st) *st=0; return 0; }
 BOOL ScanDecClose(void) { memset(&g_open, 0, sizeof(g_open)); return TRUE; }
-void *bugchk_malloc(size_t s, const char *f, int l) { (void)f;(void)l; return malloc(s); }
-void bugchk_free(void *p, const char *f, int l) { (void)f;(void)l; free(p); }
 SCANDEC_EOF
     gcc -shared -fPIC -O2 -w -o "$build_dir/libbrscandec2.so.1.0.0" \
         "$build_dir/libbrscandec2_stub.c" || {
@@ -1263,18 +1275,22 @@ SCANDEC_EOF
     log_info "Creating ARM color matching library..."
     cat > "$build_dir/libbrcolm2_stub.c" << 'COLM_EOF'
 /* ARM stub for libbrcolm2 — color matching (pass-through, no correction) */
+/* Function signatures must match the typedefs in brcolor.h exactly:
+ *   typedef BOOL (*COLORINIT)(CMATCH_INIT);
+ *   typedef void (*COLOREND)(void);
+ *   typedef BOOL (*COLORMATCHING)(BYTE *, long, long);
+ */
 #include <stdlib.h>
-typedef int BOOL; typedef unsigned char BYTE; typedef unsigned long DWORD;
+typedef int BOOL; typedef unsigned char BYTE;
+typedef char *LPSTR;
 #define TRUE 1
 #define FALSE 0
-BOOL ColorMatchingInit(int t) { (void)t; return TRUE; }
-BOOL ColorMatchingEnd(void) { return TRUE; }
-DWORD ColorMatching(BYTE *d, DWORD s) { (void)d; return s; }
-DWORD LutColorMatching(BYTE *d, DWORD s) { (void)d; return s; }
-void InitLUT(void) {}
-DWORD MatchDataGet(BYTE *d, DWORD s) { (void)d; return s; }
-void *bugchk_malloc(size_t s, const char *f, int l) { (void)f;(void)l; return malloc(s); }
-void bugchk_free(void *p, const char *f, int l) { (void)f;(void)l; free(p); }
+#pragma pack(1)
+typedef struct { int nRgbLine; int nPaperType; int nMachineId; LPSTR lpLutName; } CMATCH_INIT;
+#pragma pack()
+BOOL ColorMatchingInit(CMATCH_INIT d) { (void)d; return TRUE; }
+void ColorMatchingEnd(void) {}
+BOOL ColorMatching(BYTE *d, long len, long cnt) { (void)d;(void)len;(void)cnt; return TRUE; }
 COLM_EOF
     gcc -shared -fPIC -O2 -w -o "$build_dir/libbrcolm2.so.1.0.0" \
         "$build_dir/libbrcolm2_stub.c" || {
@@ -1285,17 +1301,20 @@ COLM_EOF
 
     # Link the SANE backend shared library
     log_info "Linking native ARM SANE backend..."
-    gcc -shared -fPIC -o "$build_dir/libsane-brother2.so.1.0.7" \
+    local link_output
+    link_output=$(gcc -shared -fPIC -o "$build_dir/libsane-brother2.so.1.0.7" \
         "$build_dir/brother2.o" \
         "$build_dir/sane_strstatus.o" \
         "$build_dir/sanei_constrain_value.o" \
         "$build_dir/sanei_init_debug.o" \
         "$build_dir/sanei_config.o" \
         -lpthread -lusb -lm -ldl -lc \
-        -Wl,-soname,libsane-brother2.so.1 || {
+        -Wl,-soname,libsane-brother2.so.1 2>&1) || true
+    if [[ ! -f "$build_dir/libsane-brother2.so.1.0.7" ]]; then
         log_warn "Failed to link libsane-brother2.so"
+        log_debug "Linker output: $link_output"
         return 1
-    }
+    fi
 
     # Verify it's the right architecture
     local built_arch
@@ -1681,7 +1700,7 @@ test_scan() {
                 if [[ -s "$strace_output" ]]; then
                     # Show the failing ioctl/syscall lines
                     local ioctl_fails
-                    ioctl_fails=$(grep -i "ioctl\|EINVAL\|Invalid\|= -1 errno" "$strace_output" | tail -20)
+                    ioctl_fails=$(grep --text -i "ioctl\|EINVAL\|Invalid\|= -1 errno" "$strace_output" | tail -20)
                     if [[ -n "$ioctl_fails" ]]; then
                         log_debug "Failing syscalls from qemu strace:"
                         while IFS= read -r line; do
@@ -1691,7 +1710,7 @@ test_scan() {
 
                     # Show USB-related syscalls
                     local usb_calls
-                    usb_calls=$(grep -i "usb\|/dev/bus\|usbdev\|usbfs" "$strace_output" | head -10)
+                    usb_calls=$(grep --text -i "usb\|/dev/bus\|usbdev\|usbfs" "$strace_output" | head -10)
                     if [[ -n "$usb_calls" ]]; then
                         log_debug "USB-related syscalls:"
                         while IFS= read -r line; do
@@ -1701,7 +1720,7 @@ test_scan() {
 
                     # Show open() calls that fail
                     local open_fails
-                    open_fails=$(grep "open.*= -1\|openat.*= -1" "$strace_output" | head -10)
+                    open_fails=$(grep --text "open.*= -1\|openat.*= -1" "$strace_output" | head -10)
                     if [[ -n "$open_fails" ]]; then
                         log_debug "Failed open() calls:"
                         while IFS= read -r line; do
