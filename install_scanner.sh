@@ -528,156 +528,35 @@ compile_arm_backend() {
         log_debug "${sf}.o compiled"
     done
 
-    # Create ARM stub for libbrscandec2 (scan data decompression)
+    # Compile ARM stub for libbrscandec2 (scan data decode)
     log_info "Creating ARM scan decoder library..."
-    cat > "$build_dir/libbrscandec2_stub.c" << 'SCANDEC_EOF'
-/* ARM stub for libbrscandec2 — scan data decode (PackBits decompression) */
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-typedef int BOOL; typedef unsigned char BYTE; typedef unsigned long DWORD;
-typedef int INT; typedef void *HANDLE;
-#define TRUE 1
-#define FALSE 0
-#define SCIDC_WHITE 1
-#define SCIDC_NONCOMP 2
-#define SCIDC_PACK 3
-typedef struct {
-    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
-    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
-    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
-} SCANDEC_OPEN;
-typedef struct {
-    INT nInDataComp, nInDataKind;
-    BYTE *pLineData; DWORD dwLineDataSize;
-    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
-} SCANDEC_WRITE;
-static SCANDEC_OPEN g_open;
-static int g_write_count = 0;
-static int g_nonzero_lines = 0;
-static DWORD decode_packbits(const BYTE *in, DWORD inLen, BYTE *out, DWORD outMax) {
-    DWORD iP=0, oP=0;
-    while (iP < inLen && oP < outMax) {
-        signed char n = (signed char)in[iP++];
-        if (n >= 0) {
-            DWORD c = (DWORD)(n+1);
-            if (iP+c > inLen) c = inLen-iP;
-            if (oP+c > outMax) c = outMax-oP;
-            memcpy(out+oP, in+iP, c); iP += c; oP += c;
-        } else if (n != -128) {
-            DWORD c = (DWORD)(1-n);
-            if (iP >= inLen) break;
-            BYTE v = in[iP++];
-            if (oP+c > outMax) c = outMax-oP;
-            memset(out+oP, v, c); oP += c;
-        }
-    }
-    return oP;
-}
-BOOL ScanDecOpen(SCANDEC_OPEN *p) {
-    if (!p) { fprintf(stderr, "SCANDEC: ScanDecOpen called with NULL\n"); return FALSE; }
-    g_write_count = 0;
-    g_nonzero_lines = 0;
-    p->dwOutLinePixCnt = p->dwInLinePixCnt;
-    DWORD bpp;
-    if (p->nColorType & 0x0400)       bpp = 3;  /* SC_24BIT: RGB */
-    else if (p->nColorType & 0x0200)  bpp = 1;  /* SC_8BIT: gray */
-    else                              bpp = 1;  /* SC_2BIT: B&W → 8-bit */
-    p->dwOutLineByte = p->dwOutLinePixCnt * bpp;
-    if (p->bLongBoundary) p->dwOutLineByte = (p->dwOutLineByte + 3) & ~3UL;
-    p->dwOutWriteMaxSize = p->dwOutLineByte * 16;
-    memcpy(&g_open, p, sizeof(*p));
-    fprintf(stderr, "SCANDEC: ScanDecOpen nColorType=0x%x dwInLinePixCnt=%lu bpp=%lu dwOutLineByte=%lu dwOutWriteMaxSize=%lu bLongBoundary=%d\n",
-            p->nColorType, p->dwInLinePixCnt, bpp, p->dwOutLineByte, p->dwOutWriteMaxSize, p->bLongBoundary);
-    return TRUE;
-}
-void ScanDecSetTblHandle(HANDLE h1, HANDLE h2) { (void)h1; (void)h2; }
-BOOL ScanDecPageStart(void) { fprintf(stderr, "SCANDEC: ScanDecPageStart\n"); return TRUE; }
-DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
-    if (!w) { fprintf(stderr, "SCANDEC: ScanDecWrite w=NULL\n"); if(st) *st=-1; return 0; }
-    if (!w->pLineData || !w->pWriteBuff) {
-        fprintf(stderr, "SCANDEC: ScanDecWrite NULL ptrs pLineData=%p pWriteBuff=%p\n",
-                (void*)w->pLineData, (void*)w->pWriteBuff);
-        if(st) *st=-1; return 0;
-    }
-    DWORD outLine = g_open.dwOutLineByte;
-    if (outLine == 0 || outLine > w->dwWriteBuffSize) {
-        fprintf(stderr, "SCANDEC: ScanDecWrite bad outLine=%lu dwWriteBuffSize=%lu\n", outLine, w->dwWriteBuffSize);
-        if(st) *st=0; return 0;
-    }
-    g_write_count++;
-    memset(w->pWriteBuff, 0, outLine);
-    DWORD decoded = 0;
-    switch (w->nInDataComp) {
-        case SCIDC_WHITE:
-            memset(w->pWriteBuff, 0xFF, outLine); decoded = outLine; break;
-        case SCIDC_NONCOMP:
-            decoded = w->dwLineDataSize;
-            if (decoded > outLine) decoded = outLine;
-            memcpy(w->pWriteBuff, w->pLineData, decoded); break;
-        case SCIDC_PACK:
-            decoded = decode_packbits(w->pLineData, w->dwLineDataSize,
-                            w->pWriteBuff, outLine); break;
-        default:
-            decoded = w->dwLineDataSize;
-            if (decoded > outLine) decoded = outLine;
-            memcpy(w->pWriteBuff, w->pLineData, decoded); break;
-    }
-    /* Check if output has any non-zero bytes */
-    int has_data = 0;
-    for (DWORD i = 0; i < outLine && !has_data; i++)
-        if (w->pWriteBuff[i] != 0) has_data = 1;
-    if (has_data) g_nonzero_lines++;
-    /* Log first 5 calls and every 100th, plus summary at end */
-    if (g_write_count <= 5 || g_write_count % 100 == 0)
-        fprintf(stderr, "SCANDEC: ScanDecWrite #%d comp=%d kind=%d inLen=%lu decoded=%lu outLine=%lu hasData=%d pWriteBuff=%p\n",
-                g_write_count, w->nInDataComp, w->nInDataKind, w->dwLineDataSize, decoded, outLine, has_data, (void*)w->pWriteBuff);
-    if (st) *st = 1;
-    return outLine;
-}
-DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) {
-    fprintf(stderr, "SCANDEC: ScanDecPageEnd total_writes=%d nonzero_lines=%d\n", g_write_count, g_nonzero_lines);
-    (void)w; if(st) *st=0; return 0;
-}
-BOOL ScanDecClose(void) {
-    fprintf(stderr, "SCANDEC: ScanDecClose total_writes=%d nonzero_lines=%d\n", g_write_count, g_nonzero_lines);
-    memset(&g_open, 0, sizeof(g_open)); return TRUE;
-}
-SCANDEC_EOF
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local stub_src="$script_dir/DCP-130C/scandec_stubs.c"
+    if [[ ! -f "$stub_src" ]]; then
+        log_warn "Source file not found: $stub_src"
+        return 1
+    fi
     gcc -shared -fPIC -O2 -w -o "$build_dir/libbrscandec2.so.1.0.0" \
-        "$build_dir/libbrscandec2_stub.c" || {
+        "$stub_src" || {
         log_warn "Failed to compile libbrscandec2 stub"
         return 1
     }
-    log_debug "libbrscandec2.so.1.0.0 compiled (ARM stub with PackBits decoder)"
+    log_debug "libbrscandec2.so.1.0.0 compiled (from DCP-130C/scandec_stubs.c)"
 
-    # Create ARM stub for libbrcolm2 (color matching — pass-through)
+    # Compile ARM stub for libbrcolm2 (color matching — pass-through)
     log_info "Creating ARM color matching library..."
-    cat > "$build_dir/libbrcolm2_stub.c" << 'COLM_EOF'
-/* ARM stub for libbrcolm2 — color matching (pass-through, no correction) */
-/* Function signatures must match the typedefs in brcolor.h exactly:
- *   typedef BOOL (*COLORINIT)(CMATCH_INIT);
- *   typedef void (*COLOREND)(void);
- *   typedef BOOL (*COLORMATCHING)(BYTE *, long, long);
- */
-#include <stdlib.h>
-typedef int BOOL; typedef unsigned char BYTE;
-typedef char *LPSTR;
-#define TRUE 1
-#define FALSE 0
-#pragma pack(1)
-typedef struct { int nRgbLine; int nPaperType; int nMachineId; LPSTR lpLutName; } CMATCH_INIT;
-#pragma pack()
-BOOL ColorMatchingInit(CMATCH_INIT d) { (void)d; return TRUE; }
-void ColorMatchingEnd(void) {}
-BOOL ColorMatching(BYTE *d, long len, long cnt) { (void)d;(void)len;(void)cnt; return TRUE; }
-COLM_EOF
+    local colm_src="$script_dir/DCP-130C/brcolor_stubs.c"
+    if [[ ! -f "$colm_src" ]]; then
+        log_warn "Source file not found: $colm_src"
+        return 1
+    fi
     gcc -shared -fPIC -O2 -w -o "$build_dir/libbrcolm2.so.1.0.0" \
-        "$build_dir/libbrcolm2_stub.c" || {
+        "$colm_src" || {
         log_warn "Failed to compile libbrcolm2 stub"
         return 1
     }
-    log_debug "libbrcolm2.so.1.0.0 compiled (ARM pass-through stub)"
+    log_debug "libbrcolm2.so.1.0.0 compiled (from DCP-130C/brcolor_stubs.c)"
 
     # Link the SANE backend shared library
     log_info "Linking native ARM SANE backend..."
@@ -983,7 +862,7 @@ test_scan() {
                     # Show SCANDEC summary on success too
                     if [[ -s "$test_stderr" ]]; then
                         local scandec_summary
-                        scandec_summary=$(grep "^SCANDEC:.*ScanDecClose\|^SCANDEC:.*ScanDecPageEnd" "$test_stderr" | head -2)
+                        scandec_summary=$(grep "^\[SCANDEC\].*ScanDecClose\|^\[SCANDEC\].*ScanDecPageEnd" "$test_stderr" | head -2)
                         if [[ -n "$scandec_summary" ]]; then
                             log_debug "SCANDEC summary: $scandec_summary"
                         fi
@@ -995,11 +874,11 @@ test_scan() {
                     all_invalid_arg=false
                     if [[ -s "$test_stderr" ]]; then
                         log_info "SCANDEC debug output:"
-                        grep "^SCANDEC:" "$test_stderr" | while IFS= read -r line; do
+                        grep "^\[SCANDEC\]" "$test_stderr" | while IFS= read -r line; do
                             log_info "  $line"
                         done
                         local other_err
-                        other_err=$(grep -v "^SCANDEC:" "$test_stderr" | grep -i "error\|fail\|warn\|invalid\|fault" | head -5)
+                        other_err=$(grep -v "^\[SCANDEC\]" "$test_stderr" | grep -i "error\|fail\|warn\|invalid\|fault" | head -5)
                         if [[ -n "$other_err" ]]; then
                             log_info "Other scan errors:"
                             echo "$other_err" | while IFS= read -r line; do log_info "  $line"; done
@@ -1033,14 +912,14 @@ test_scan() {
                     err_text=$(cat "$test_stderr")
                     # Show SCANDEC debug output
                     local scandec_out
-                    scandec_out=$(echo "$err_text" | grep "^SCANDEC:" | head -20)
+                    scandec_out=$(echo "$err_text" | grep "^\[SCANDEC\]" | head -20)
                     if [[ -n "$scandec_out" ]]; then
                         log_info "SCANDEC debug output:"
                         echo "$scandec_out" | while IFS= read -r line; do log_info "  $line"; done
                     fi
                     # Show only the scanimage error, not SANE debug noise
                     local scan_err
-                    scan_err=$(echo "$err_text" | grep -v "^SCANDEC:" | grep -i "scanimage\|failed\|error\|Invalid" | head -3)
+                    scan_err=$(echo "$err_text" | grep -v "^\[SCANDEC\]" | grep -i "scanimage\|failed\|error\|Invalid" | head -3)
                     if [[ -n "$scan_err" ]]; then
                         log_info "  $scan_err"
                     fi
