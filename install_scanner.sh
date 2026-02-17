@@ -547,7 +547,7 @@ compile_arm_backend() {
         # Original is: DBG(DEBUG_JUNK,"found dev %04X/%04X\n",
         #                  pdev->descriptor.idVendor,
         #                  pdev->descriptor.idProduct);
-        sed -i '/DBG(DEBUG_JANK\|DBG(DEBUG_JUNK,"found dev %04X\/%04X/{
+        sed -i '/DBG(DEBUG_JUNK,"found dev %04X\/%04X/{
 N;N
 s|DBG(DEBUG_JUNK,"found dev %04X/%04X\\n",\n.*pdev->descriptor.idVendor,\n.*pdev->descriptor.idProduct);|fprintf(stderr, "[BROTHER2-DBG] found dev %04X/%04X on bus %d dev %d\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, iBus, iDev); fflush(stderr);|
 }' "$brother2_c"
@@ -872,24 +872,21 @@ test_scan() {
     # usb_claim_interface() and can cause segfaults in older libusb-0.1.
     if lsmod 2>/dev/null | grep -q usblp; then
         log_debug "usblp kernel module is loaded"
-        # Find the Brother scanner's USB bus/device path
+        # Find any Brother USB device (vendor 04f9) and unbind usblp from it
         local usblp_bound=false
-        local brother_usbpath=""
         for devpath in /sys/bus/usb/devices/*/idVendor; do
             local ddir
             ddir=$(dirname "$devpath")
-            if [[ -f "$ddir/idVendor" ]] && [[ -f "$ddir/idProduct" ]]; then
-                local vid pid
+            if [[ -f "$ddir/idVendor" ]]; then
+                local vid
                 vid=$(cat "$ddir/idVendor" 2>/dev/null)
-                pid=$(cat "$ddir/idProduct" 2>/dev/null)
-                if [[ "$vid" == "04f9" ]] && [[ "$pid" == "01a8" ]]; then
-                    brother_usbpath="$ddir"
+                if [[ "$vid" == "04f9" ]]; then
                     # Check if usblp is bound to any interface of this device
-                    for intf in "$ddir"/${ddir##*/}:*/driver; do
-                        if [[ -L "$intf" ]] && readlink "$intf" 2>/dev/null | grep -q usblp; then
+                    local devname
+                    devname=$(basename "$ddir")
+                    for intf_dir in "$ddir"/"$devname":*; do
+                        if [[ -L "$intf_dir/driver" ]] && readlink "$intf_dir/driver" 2>/dev/null | grep -q usblp; then
                             usblp_bound=true
-                            local intf_dir
-                            intf_dir=$(dirname "$intf")
                             local intf_name
                             intf_name=$(basename "$intf_dir")
                             log_debug "usblp is bound to $intf_name — unbinding for SANE access"
@@ -1230,7 +1227,7 @@ except OSError as e:
                             SANE_DEBUG_BROTHER2=5 timeout 30 gdb -batch \
                                 -ex "set confirm off" \
                                 -ex "handle SIGSEGV stop print" \
-                                -ex "run -d '$try_device' --format=pnm --resolution=150 --mode 'True Gray' > /dev/null" \
+                                -ex "run" \
                                 -ex "bt" \
                                 -ex "info registers" \
                                 -ex "info sharedlibrary" \
