@@ -648,6 +648,48 @@ compile_arm_backend() {
     log_debug "  $(file /usr/lib/libbrscandec2.so.1.0.0)"
     log_debug "  $(file /usr/lib/libbrcolm2.so.1.0.0)"
 
+    # Verify library dependencies are resolvable
+    if command -v ldd &>/dev/null; then
+        log_debug "Checking library dependencies..."
+        local ldd_errors=""
+        for lib in /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                   /usr/lib/libbrscandec2.so.1.0.0 \
+                   /usr/lib/libbrcolm2.so.1.0.0; do
+            local ldd_out
+            ldd_out=$(ldd "$lib" 2>&1)
+            local missing
+            missing=$(echo "$ldd_out" | grep "not found" || true)
+            if [[ -n "$missing" ]]; then
+                log_warn "Missing dependencies for $(basename "$lib"):"
+                log_warn "  $missing"
+                ldd_errors="$ldd_errors $missing"
+            else
+                log_debug "  $(basename "$lib"): all dependencies OK"
+            fi
+        done
+        if [[ -n "$ldd_errors" ]]; then
+            log_warn "Some library dependencies are missing. The scanner backend may crash."
+            log_warn "Try: sudo apt-get install libusb-0.1-4 libsane1"
+        fi
+    fi
+
+    # Verify exported symbols in stub libraries
+    if command -v nm &>/dev/null; then
+        log_debug "Verifying exported symbols..."
+        local scandec_syms
+        scandec_syms=$(nm -D /usr/lib/libbrscandec2.so.1.0.0 2>/dev/null | grep -c " T ScanDec" || echo 0)
+        local colm_syms
+        colm_syms=$(nm -D /usr/lib/libbrcolm2.so.1.0.0 2>/dev/null | grep -c " T ColorMatch" || echo 0)
+        log_debug "  libbrscandec2: $scandec_syms ScanDec* exports"
+        log_debug "  libbrcolm2: $colm_syms ColorMatch* exports"
+        if [[ "$scandec_syms" -lt 5 ]]; then
+            log_warn "libbrscandec2 has fewer exports than expected ($scandec_syms, need >= 5)"
+        fi
+        if [[ "$colm_syms" -lt 3 ]]; then
+            log_warn "libbrcolm2 has fewer exports than expected ($colm_syms, need >= 3)"
+        fi
+    fi
+
     return 0
 }
 
@@ -742,6 +784,37 @@ test_scan() {
     if [[ -z "$scan_cmd" ]]; then
         log_warn "scanimage not found. Install sane-utils to test scanning."
         return
+    fi
+
+    # Pre-scan: verify the SANE backend can be loaded (catches linker issues
+    # before they manifest as mysterious segfaults in scanimage)
+    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]]; then
+        log_debug "Pre-scan backend load verification..."
+        local dlopen_test
+        dlopen_test=$(python3 -c "
+import ctypes, sys
+try:
+    lib = ctypes.CDLL('/usr/lib/sane/libsane-brother2.so.1.0.7')
+    print('OK: backend loaded successfully')
+    # Verify key symbols exist
+    for sym in ['sane_brother2_init', 'sane_brother2_open', 'sane_brother2_start']:
+        try:
+            getattr(lib, sym)
+        except AttributeError:
+            print(f'WARN: symbol {sym} not found')
+except OSError as e:
+    print(f'FAIL: {e}')
+    sys.exit(1)
+" 2>&1 || true)
+        if echo "$dlopen_test" | grep -q "^FAIL:"; then
+            log_warn "Backend library failed to load: $dlopen_test"
+            log_warn "This will cause scanimage to crash. Checking dependencies..."
+            ldd /usr/lib/sane/libsane-brother2.so.1.0.7 2>&1 | grep -i "not found\|error" | while IFS= read -r line; do
+                log_warn "  $line"
+            done
+        else
+            log_debug "  $dlopen_test"
+        fi
     fi
 
     # List available scanners
@@ -883,8 +956,22 @@ test_scan() {
 
             log_info "Performing test scan with device '$try_device'..."
             log_debug "Scan command: $scan_cmd ${scan_args[*]}"
-            # SANE_DEBUG_DLL=1 shows backend loading; stderr captures SCANDEC debug
-            if SANE_DEBUG_DLL=1 timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
+            # SANE_DEBUG_DLL=1 shows backend loading; SANE_DEBUG_BROTHER2=3
+            # shows backend activity; stderr captures SCANDEC/BRCOLOR debug
+            local -a scan_env=(SANE_DEBUG_DLL=1 SANE_DEBUG_BROTHER2=3)
+            # Use libSegFault for automatic backtrace on crash (if available)
+            local segfault_lib=""
+            for sf_path in /lib/*/libSegFault.so /usr/lib/*/libSegFault.so /lib/libSegFault.so; do
+                if [[ -f "$sf_path" ]]; then
+                    segfault_lib="$sf_path"
+                    break
+                fi
+            done
+            if [[ -n "$segfault_lib" ]]; then
+                scan_env+=(LD_PRELOAD="$segfault_lib" SEGFAULT_SIGNALS="segv" SEGFAULT_USE_ALTSTACK=1)
+                log_debug "Using libSegFault for crash backtrace: $segfault_lib"
+            fi
+            if env "${scan_env[@]}" timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
                     log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
@@ -942,6 +1029,68 @@ test_scan() {
                             done
                         else
                             log_warn "BrMfc32.log is empty — crash happened before backend init"
+                        fi
+
+                        # Run library dependency check on the backend
+                        log_info "Checking library dependencies for crash diagnosis..."
+                        for lib in /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                                   /usr/lib/libbrscandec2.so.1.0.0 \
+                                   /usr/lib/libbrcolm2.so.1.0.0; do
+                            if [[ -f "$lib" ]]; then
+                                local ldd_out
+                                ldd_out=$(ldd "$lib" 2>&1 || true)
+                                local missing
+                                missing=$(echo "$ldd_out" | grep "not found" || true)
+                                if [[ -n "$missing" ]]; then
+                                    log_warn "  $(basename "$lib"): MISSING deps: $missing"
+                                else
+                                    log_debug "  $(basename "$lib"): all deps OK"
+                                fi
+                            else
+                                log_warn "  $lib NOT found"
+                            fi
+                        done
+
+                        # Retry with LD_DEBUG to trace library loading
+                        log_info "Re-running with LD_DEBUG to trace crash..."
+                        local ld_debug_stderr="/tmp/brother_ld_debug.err"
+                        LD_DEBUG=libs SANE_DEBUG_DLL=3 SANE_DEBUG_BROTHER2=5 \
+                            timeout 30 "$scan_cmd" -L > /dev/null 2>"$ld_debug_stderr" || true
+                        if [[ -s "$ld_debug_stderr" ]]; then
+                            # Show library load/init events
+                            local ld_events
+                            ld_events=$(grep -E "calling init:|init:.*brother|error|brother2|brscandec|brcolm|libusb|symbol.*not found" "$ld_debug_stderr" | tail -30 || true)
+                            if [[ -n "$ld_events" ]]; then
+                                log_info "Library loading trace (relevant lines):"
+                                echo "$ld_events" | while IFS= read -r line; do log_info "  $line"; done
+                            fi
+                            # Show SANE backend loading
+                            local sane_events
+                            sane_events=$(grep -i "brother\|sane_init\|load.*dll\|adding" "$ld_debug_stderr" | grep -v "^$" | tail -20 || true)
+                            if [[ -n "$sane_events" ]]; then
+                                log_info "SANE backend events:"
+                                echo "$sane_events" | while IFS= read -r line; do log_info "  $line"; done
+                            fi
+                        fi
+                        rm -f "$ld_debug_stderr"
+
+                        # Check for core dump
+                        local core_pattern
+                        core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo "unknown")
+                        log_debug "Core dump pattern: $core_pattern"
+                        local core_file=""
+                        for cf in core core.* /tmp/core.* /var/crash/*scanimage*; do
+                            if [[ -f "$cf" ]] && [[ $(find "$cf" -mmin -2 2>/dev/null) ]]; then
+                                core_file="$cf"
+                                break
+                            fi
+                        done
+                        if [[ -n "$core_file" ]] && command -v gdb &>/dev/null; then
+                            log_info "Core dump found: $core_file"
+                            local bt_output
+                            bt_output=$(gdb -batch -ex "bt" -ex "info sharedlibrary" "$scan_cmd" "$core_file" 2>&1 | head -40 || true)
+                            log_info "Backtrace:"
+                            echo "$bt_output" | while IFS= read -r line; do log_info "  $line"; done
                         fi
                     fi
                 fi
