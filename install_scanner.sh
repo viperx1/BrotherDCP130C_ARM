@@ -268,6 +268,7 @@ install_dependencies() {
         gcc
         libsane-dev
         libusb-dev
+        libncurses-dev
     )
 
     log_debug "Final package list: ${packages[*]}"
@@ -1140,6 +1141,12 @@ compile_arm_backend() {
     # Check for libusb-0.1 header (usb.h)
     if [[ ! -f /usr/include/usb.h ]] && [[ ! -f "$brscan_src/include/usb.h" ]]; then
         log_warn "usb.h header not found (install libusb-dev)"
+        return 1
+    fi
+
+    # Check for curses header (brother_advini.c needs it)
+    if [[ ! -f /usr/include/curses.h ]] && [[ ! -f /usr/include/ncurses.h ]]; then
+        log_warn "curses.h header not found (install libncurses-dev)"
         return 1
     fi
 
