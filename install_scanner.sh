@@ -520,6 +520,17 @@ compile_arm_backend() {
         fi
     fi
 
+    # Fix time_t/long size mismatch in WriteLogFileString (brother_log.c).
+    # On 32-bit ARM with 64-bit time_t (Raspbian Trixie), the expression
+    # (ltime%1000) is 64-bit but sprintf's %ld reads only 32 bits. This
+    # misaligns the subsequent %s argument, causing strlen() to SIGSEGV
+    # on a garbage pointer. Cast to (long) to match the %ld format.
+    local brother_log_c="$brscan_src/backend_src/brother_log.c"
+    if [[ -f "$brother_log_c" ]]; then
+        sed -i 's/(ltime%1000)/(long)(ltime%1000)/' "$brother_log_c"
+        log_debug "Patched brother_log.c: cast (ltime%1000) to (long) for time_t safety"
+    fi
+
     # Add debug instrumentation to brother2.c for crash diagnosis.
     # The bus scan loop in sane_init is the site of the segfault
     # (issue #65). We inject fflush(stderr) after every DBG() so output
@@ -578,7 +589,27 @@ s|DBG(DEBUG_JUNK,"found dev %04X/%04X\\n",\n.*pdev->descriptor.idVendor,\n.*pdev
         sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/i\
   fprintf(stderr, "[BROTHER2-DBG] sane_open: calling OpenDevice(seriesNo=%d)\\n", pdev->modelInf.seriesNo); fflush(stderr);' "$brother2_c"
 
+        # 9. Add trace after OpenDevice returns
+        sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_open: OpenDevice returned %d\\n", rc); fflush(stderr);' "$brother2_c"
+
         log_debug "Injected bus-scan debug instrumentation into brother2.c"
+    fi
+
+    # Add debug instrumentation inside OpenDevice (brother_devaccs.c)
+    # to trace USB claim/control operations that follow WriteLog.
+    local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
+    if [[ -f "$devaccs_c" ]]; then
+        # Add trace before and after usb_claim_interface
+        sed -i '/usb_claim_interface(hScanner->usb, 1)/{
+i\\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: calling usb_claim_interface\\n"); fflush(stderr);
+}' "$devaccs_c"
+
+        # Add trace after usb_control_msg
+        sed -i '/if (rc >= 0) {/i\
+\t\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: usb_control_msg returned %d\\n", rc); fflush(stderr);' "$devaccs_c"
+
+        log_debug "Injected OpenDevice debug instrumentation into brother_devaccs.c"
     fi
 
     # Check for required headers
