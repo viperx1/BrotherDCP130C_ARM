@@ -586,15 +586,33 @@ compile_arm_backend() {
     }
     log_debug "libbrcolm2.so.1.0.0 compiled (from DCP-130C/brcolor_stubs.c)"
 
+    # Compile backend init stub (constructor logging + SIGSEGV handler)
+    local init_src="$SCRIPT_DIR/DCP-130C/backend_init.c"
+    if [[ -f "$init_src" ]]; then
+        gcc -c -fPIC -O2 -w -o "$build_dir/backend_init.o" "$init_src" || {
+            log_warn "Failed to compile backend_init.c (non-fatal, skipping)"
+        }
+        if [[ -f "$build_dir/backend_init.o" ]]; then
+            log_debug "backend_init.o compiled (from DCP-130C/backend_init.c)"
+        fi
+    fi
+
     # Link the SANE backend shared library
     log_info "Linking native ARM SANE backend..."
+    local -a link_objs=(
+        "$build_dir/brother2.o"
+        "$build_dir/sane_strstatus.o"
+        "$build_dir/sanei_constrain_value.o"
+        "$build_dir/sanei_init_debug.o"
+        "$build_dir/sanei_config.o"
+    )
+    # Include backend init stub if compiled
+    if [[ -f "$build_dir/backend_init.o" ]]; then
+        link_objs+=("$build_dir/backend_init.o")
+    fi
     local link_output
     link_output=$(gcc -shared -fPIC -o "$build_dir/libsane-brother2.so.1.0.7" \
-        "$build_dir/brother2.o" \
-        "$build_dir/sane_strstatus.o" \
-        "$build_dir/sanei_constrain_value.o" \
-        "$build_dir/sanei_init_debug.o" \
-        "$build_dir/sanei_config.o" \
+        "${link_objs[@]}" \
         -lpthread -lusb -lm -ldl -lc \
         -Wl,-soname,libsane-brother2.so.1 2>&1) || true
     if [[ ! -f "$build_dir/libsane-brother2.so.1.0.7" ]]; then
@@ -796,14 +814,13 @@ import ctypes, sys
 try:
     lib = ctypes.CDLL('/usr/lib/sane/libsane-brother2.so.1.0.7')
     print('OK: backend loaded successfully')
-    # Verify key symbols exist
     for sym in ['sane_brother2_init', 'sane_brother2_open', 'sane_brother2_start']:
         try:
             getattr(lib, sym)
         except AttributeError:
-            print(f'WARN: symbol {sym} not found')
+            print('WARN: symbol %s not found' % sym)
 except OSError as e:
-    print(f'FAIL: {e}')
+    print('FAIL: %s' % e)
     sys.exit(1)
 " 2>&1 || true)
         if echo "$dlopen_test" | grep -q "^FAIL:"; then
@@ -1057,7 +1074,8 @@ except OSError as e:
                         LD_DEBUG=libs SANE_DEBUG_DLL=3 SANE_DEBUG_BROTHER2=5 \
                             timeout 30 "$scan_cmd" -L > /dev/null 2>"$ld_debug_stderr" || true
                         if [[ -s "$ld_debug_stderr" ]]; then
-                            # Show library load/init events
+                            # Filter LD_DEBUG output for: library init calls,
+                            # brother/scanner libs, errors, and missing symbols
                             local ld_events
                             ld_events=$(grep -E "calling init:|init:.*brother|error|brother2|brscandec|brcolm|libusb|symbol.*not found" "$ld_debug_stderr" | tail -30 || true)
                             if [[ -n "$ld_events" ]]; then
@@ -1080,7 +1098,7 @@ except OSError as e:
                         log_debug "Core dump pattern: $core_pattern"
                         local core_file=""
                         for cf in core core.* /tmp/core.* /var/crash/*scanimage*; do
-                            if [[ -f "$cf" ]] && [[ $(find "$cf" -mmin -2 2>/dev/null) ]]; then
+                            if [[ -f "$cf" ]] && [[ -n $(find "$cf" -mmin -2 2>/dev/null) ]]; then
                                 core_file="$cf"
                                 break
                             fi
