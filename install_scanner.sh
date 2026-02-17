@@ -520,6 +520,67 @@ compile_arm_backend() {
         fi
     fi
 
+    # Add debug instrumentation to brother2.c for crash diagnosis.
+    # The bus scan loop in sane_init is the site of the segfault
+    # (issue #65). We inject fflush(stderr) after every DBG() so output
+    # appears even if the process crashes immediately after, and add
+    # fine-grained trace messages around every pointer dereference in
+    # the bus scan to pinpoint the exact crash location.
+    local brother2_c="$brscan_src/backend_src/brother2.c"
+    if [[ -f "$brother2_c" ]]; then
+        # 1. Force stderr flush after every DBG() call in sane_init's bus scan
+        #    so crash output is not lost in stdio buffers
+        sed -i 's/DBG(DEBUG_INFO,"starting bus scan\\n");/DBG(DEBUG_INFO,"starting bus scan\\n"); fflush(stderr);/' "$brother2_c"
+
+        # 2. Inject fine-grained trace messages inside the bus scan loop.
+        #    The crash occurs between "starting bus scan" and the first device
+        #    found message — we need to know if it is the bus pointer,
+        #    the device pointer, or the model-info chain that is corrupt.
+        #
+        #    Replace the sparse debug around the loop with a verbose version
+        #    that traces every pointer dereference and flushes after each.
+        sed -i '/DBG(DEBUG_JUNK,"scanning bus %s\\n", pbus->dirname);/c\
+      fprintf(stderr, "[BROTHER2-DBG] scanning bus %p dirname=%s\\n", (void*)pbus, pbus->dirname ? pbus->dirname : "(null)"); fflush(stderr);' "$brother2_c"
+
+        # Replace the 3-line DBG(DEBUG_JUNK,"found dev ...") with a single fprintf
+        # that adds bus/device numbers and flushes immediately.
+        # Original is: DBG(DEBUG_JUNK,"found dev %04X/%04X\n",
+        #                  pdev->descriptor.idVendor,
+        #                  pdev->descriptor.idProduct);
+        sed -i '/DBG(DEBUG_JANK\|DBG(DEBUG_JUNK,"found dev %04X\/%04X/{
+N;N
+s|DBG(DEBUG_JUNK,"found dev %04X/%04X\\n",\n.*pdev->descriptor.idVendor,\n.*pdev->descriptor.idProduct);|fprintf(stderr, "[BROTHER2-DBG] found dev %04X/%04X on bus %d dev %d\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, iBus, iDev); fflush(stderr);|
+}' "$brother2_c"
+
+        # 3. Add a trace right before the vendorID/productID comparison
+        #    (this is where model info pointers are dereferenced)
+        sed -i '/pdev->descriptor.idVendor  ==  pModelInf->vendorID/i\
+\t      fprintf(stderr, "[BROTHER2-DBG] comparing dev %04X/%04X with model vendor=%04X product=%04X (pModelInf=%p)\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, pModelInf->vendorID, pModelInf->productID, (void*)pModelInf); fflush(stderr);' "$brother2_c"
+
+        # 4. Add a trace after the bus scan loop finishes
+        sed -i '/WriteLog.*sane_init Check Interface/i\
+    fprintf(stderr, "[BROTHER2-DBG] bus scan complete, checking network interfaces\\n"); fflush(stderr);' "$brother2_c"
+
+        # 5. Add sane_open tracing — the crash may actually be in sane_open
+        #    when it calls usb_open() or usb_set_configuration() on the device.
+        sed -i '/WriteLog.*sane_open start dev_name/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_open: device=\\"%s\\"\\n", devicename); fflush(stderr);' "$brother2_c"
+
+        # 6. Add trace before usb_open in sane_open (NET_AND_ADVINI path)
+        sed -i '/this->hScanner->usb = usb_open(pdev->pdev);/i\
+\t\t    fprintf(stderr, "[BROTHER2-DBG] sane_open: calling usb_open(pdev=%p pdev->pdev=%p)\\n", (void*)pdev, (void*)pdev->pdev); fflush(stderr);' "$brother2_c"
+
+        # 7. Add trace after usb_open
+        sed -i '/if (!this->hScanner->usb)/i\
+\t\t    fprintf(stderr, "[BROTHER2-DBG] sane_open: usb_open returned %p\\n", (void*)this->hScanner->usb); fflush(stderr);' "$brother2_c"
+
+        # 8. Add trace before OpenDevice
+        sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/i\
+  fprintf(stderr, "[BROTHER2-DBG] sane_open: calling OpenDevice(seriesNo=%d)\\n", pdev->modelInf.seriesNo); fflush(stderr);' "$brother2_c"
+
+        log_debug "Injected bus-scan debug instrumentation into brother2.c"
+    fi
+
     # Check for required headers
     local sane_header=""
     for hdr_path in /usr/include/sane/sane.h "$brscan_src/include/sane/sane.h"; do
@@ -806,6 +867,45 @@ configure_scanner() {
 test_scan() {
     log_info "Testing scanner..."
 
+    # Unbind the usblp kernel module from the scanner if it is attached.
+    # usblp grabs USB interface 1 for printing; this blocks SANE's
+    # usb_claim_interface() and can cause segfaults in older libusb-0.1.
+    if lsmod 2>/dev/null | grep -q usblp; then
+        log_debug "usblp kernel module is loaded"
+        # Find the Brother scanner's USB bus/device path
+        local usblp_bound=false
+        local brother_usbpath=""
+        for devpath in /sys/bus/usb/devices/*/idVendor; do
+            local ddir
+            ddir=$(dirname "$devpath")
+            if [[ -f "$ddir/idVendor" ]] && [[ -f "$ddir/idProduct" ]]; then
+                local vid pid
+                vid=$(cat "$ddir/idVendor" 2>/dev/null)
+                pid=$(cat "$ddir/idProduct" 2>/dev/null)
+                if [[ "$vid" == "04f9" ]] && [[ "$pid" == "01a8" ]]; then
+                    brother_usbpath="$ddir"
+                    # Check if usblp is bound to any interface of this device
+                    for intf in "$ddir"/${ddir##*/}:*/driver; do
+                        if [[ -L "$intf" ]] && readlink "$intf" 2>/dev/null | grep -q usblp; then
+                            usblp_bound=true
+                            local intf_dir
+                            intf_dir=$(dirname "$intf")
+                            local intf_name
+                            intf_name=$(basename "$intf_dir")
+                            log_debug "usblp is bound to $intf_name — unbinding for SANE access"
+                            echo "$intf_name" | sudo tee /sys/bus/usb/drivers/usblp/unbind > /dev/null 2>&1 || true
+                        fi
+                    done
+                fi
+            fi
+        done
+        if $usblp_bound; then
+            log_info "Unbound usblp from scanner to allow SANE access."
+        else
+            log_debug "usblp loaded but not bound to Brother scanner"
+        fi
+    fi
+
     local scan_cmd=""
     if command -v scanimage &>/dev/null; then
         scan_cmd="scanimage"
@@ -985,9 +1085,10 @@ except OSError as e:
 
             log_info "Performing test scan with device '$try_device'..."
             log_debug "Scan command: $scan_cmd ${scan_args[*]}"
-            # SANE_DEBUG_DLL=1 shows backend loading; SANE_DEBUG_BROTHER2=3
-            # shows backend activity; stderr captures SCANDEC/BRCOLOR debug
-            local -a scan_env=(SANE_DEBUG_DLL=1 SANE_DEBUG_BROTHER2=3)
+            # SANE_DEBUG_DLL=1 shows backend loading; SANE_DEBUG_BROTHER2=5
+            # shows ALL backend activity including USB device enumeration.
+            # Level 5 is needed to see individual device matches in bus scan.
+            local -a scan_env=(SANE_DEBUG_DLL=1 SANE_DEBUG_BROTHER2=5)
             # Use libSegFault for automatic backtrace on crash (if available)
             local segfault_lib=""
             for sf_path in /lib/*/libSegFault.so /usr/lib/*/libSegFault.so /lib/libSegFault.so; do
@@ -1000,6 +1101,8 @@ except OSError as e:
                 scan_env+=(LD_PRELOAD="$segfault_lib" SEGFAULT_SIGNALS="segv" SEGFAULT_USE_ALTSTACK=1)
                 log_debug "Using libSegFault for crash backtrace: $segfault_lib"
             fi
+            # Enable core dumps so we can get a backtrace if the scan crashes
+            ulimit -c unlimited 2>/dev/null || true
             if env "${scan_env[@]}" timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
@@ -1060,6 +1163,16 @@ except OSError as e:
                             log_warn "BrMfc32.log is empty — crash happened before backend init"
                         fi
 
+                        # Show our injected bus-scan debug trace
+                        if [[ -s "$test_stderr" ]]; then
+                            local dbg_trace
+                            dbg_trace=$(grep '^\[BROTHER2-DBG\]' "$test_stderr" || true)
+                            if [[ -n "$dbg_trace" ]]; then
+                                log_info "Bus scan trace (last line before crash):"
+                                echo "$dbg_trace" | while IFS= read -r line; do log_info "  $line"; done
+                            fi
+                        fi
+
                         # Run library dependency check on the backend
                         log_info "Checking library dependencies for crash diagnosis..."
                         check_lib_deps /usr/lib/sane/libsane-brother2.so.1.0.7 \
@@ -1068,7 +1181,7 @@ except OSError as e:
 
                         # Retry with LD_DEBUG and higher SANE debug levels to
                         # capture more detail about the crash
-                        # (the actual scan uses DLL=1/BROTHER2=3 to reduce noise)
+                        # (the actual scan uses DLL=1/BROTHER2=5 to reduce noise)
                         log_info "Re-running with LD_DEBUG to trace crash..."
                         local ld_debug_stderr="/tmp/brother_ld_debug.err"
                         LD_DEBUG=libs SANE_DEBUG_DLL=3 SANE_DEBUG_BROTHER2=5 \
@@ -1109,6 +1222,33 @@ except OSError as e:
                             bt_output=$(gdb -batch -ex "bt" -ex "info sharedlibrary" "$scan_cmd" "$core_file" 2>&1 | head -40 || true)
                             log_info "Backtrace:"
                             echo "$bt_output" | while IFS= read -r line; do log_info "  $line"; done
+                        elif command -v gdb &>/dev/null; then
+                            # No core dump available — try to get a backtrace by running
+                            # under GDB directly (catches the segfault live)
+                            log_info "No core dump, re-running under GDB for backtrace..."
+                            local gdb_stderr="/tmp/brother_gdb_bt.txt"
+                            SANE_DEBUG_BROTHER2=5 timeout 30 gdb -batch \
+                                -ex "set confirm off" \
+                                -ex "handle SIGSEGV stop print" \
+                                -ex "run -d '$try_device' --format=pnm --resolution=150 --mode 'True Gray' > /dev/null" \
+                                -ex "bt" \
+                                -ex "info registers" \
+                                -ex "info sharedlibrary" \
+                                --args "$scan_cmd" -d "$try_device" --format=pnm --resolution=150 --mode "True Gray" \
+                                > "$gdb_stderr" 2>&1 || true
+                            if [[ -s "$gdb_stderr" ]]; then
+                                local gdb_bt
+                                gdb_bt=$(grep -A30 'Thread.*received signal SIGSEGV\|^#[0-9]\|Program received signal' "$gdb_stderr" | head -30 || true)
+                                if [[ -n "$gdb_bt" ]]; then
+                                    log_info "GDB backtrace:"
+                                    echo "$gdb_bt" | while IFS= read -r line; do log_info "  $line"; done
+                                else
+                                    # Show the last 20 lines if no specific backtrace found
+                                    log_info "GDB output (last 20 lines):"
+                                    tail -20 "$gdb_stderr" | while IFS= read -r line; do log_info "  $line"; done
+                                fi
+                            fi
+                            rm -f "$gdb_stderr"
                         fi
                     fi
                 fi
