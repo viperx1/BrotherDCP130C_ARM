@@ -784,12 +784,13 @@ configure_scanner() {
     # Enable Brother debug logging for diagnostics
     local ini_file="/usr/local/Brother/sane/Brsane2.ini"
     if [[ -f "$ini_file" ]]; then
-        if ! grep -q "^LogFile=" "$ini_file"; then
-            if grep -q "^\[Driver\]" "$ini_file"; then
-                sudo sed -i '/^\[Driver\]/a LogFile=1' "$ini_file"
-                log_debug "Enabled Brother debug logging in Brsane2.ini"
-            fi
+        if grep -q "^LogFile=" "$ini_file"; then
+            # Ensure it's set to 1 (may be 0 from original deb)
+            sudo sed -i 's/^LogFile=.*/LogFile=1/' "$ini_file"
+        elif grep -q "^\[Driver\]" "$ini_file"; then
+            sudo sed -i '/^\[Driver\]/a LogFile=1' "$ini_file"
         fi
+        log_debug "Brother debug logging enabled in Brsane2.ini"
     fi
 }
 
