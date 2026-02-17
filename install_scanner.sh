@@ -470,17 +470,24 @@ compile_arm_backend() {
     # Fix: count white line bytes in *lpFwBufcnt so memmove copies them.
     local scanner_c="$brscan_src/backend_src/brother_scanner.c"
     if [[ -f "$scanner_c" ]]; then
-        # The white line pattern: advance lpFwBuf but don't update lpFwBufcnt
-        # Original:   lRealY++; lpFwBuf += this->scanInfo.ScanAreaByte.lWidth;
-        # Patched:    lRealY++; *lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth; lpFwBuf += ...
-        local patch_count
-        patch_count=$(grep -c 'lRealY++;' "$scanner_c" 2>/dev/null || echo 0)
-        if [[ "$patch_count" -gt 0 ]]; then
-            sed -i '/if( lpFwBuf ){/{
-                N
-                s/lRealY++;/lRealY++;\n\t\t\t\t\t*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth;/
-            }' "$scanner_c"
-            log_debug "Patched brother_scanner.c: white lines now counted in FwTempBuffLength"
+        # Match the exact white-line block inside ProcessMain:
+        #   if( lpFwBuf ){
+        #       lRealY++;
+        #       lpFwBuf += this->scanInfo.ScanAreaByte.lWidth;
+        # Insert *lpFwBufcnt increment after lRealY++
+        local before_count after_count
+        before_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
+        sed -i '/White line/,/lpFwBuf +=.*ScanAreaByte/{
+            s/lRealY++;/lRealY++;\n\t\t\t\t\t*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth;/
+        }' "$scanner_c"
+        after_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
+        local added=$((after_count - before_count))
+        if [[ "$added" -eq 1 ]]; then
+            log_debug "Patched brother_scanner.c: white lines now counted in FwTempBuffLength (1 location)"
+        elif [[ "$added" -gt 1 ]]; then
+            log_warn "Patch applied to $added locations — expected 1, review brother_scanner.c"
+        else
+            log_debug "White line patch not applied (pattern not found or already patched)"
         fi
     fi
 
