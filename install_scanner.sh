@@ -1241,7 +1241,7 @@ except OSError as e:
                     # Show scan-progress traces on timeout (sane_start/sane_read/PageScan)
                     if [[ -s "$test_stderr" ]]; then
                         local timeout_trace
-                        timeout_trace=$(grep '^\[BROTHER2-DBG\]' "$test_stderr" | grep -v 'comparing dev' | tail -30 || true)
+                        timeout_trace=$(grep '^\[BROTHER2-DBG\]' "$test_stderr" | tail -30 || true)
                         if [[ -n "$timeout_trace" ]]; then
                             log_info "Scan progress trace:"
                             echo "$timeout_trace" | while IFS= read -r line; do log_info "  $line"; done
