@@ -272,13 +272,15 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         if (w->pWriteBuff[i] != 0) has_data = 1;
     if (has_data) g_nonzero_lines++;
 
-    /* Log first 5 calls and every 100th */
-    if (g_write_count <= 5 || g_write_count % 100 == 0)
+    /* Log first 10 calls, every 100th, and last known */
+    if (g_write_count <= 10 || g_write_count % 100 == 0)
         fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
-                "inLen=%lu outLine=%lu hasData=%d bpp=%d\n",
+                "inLen=%lu outLine=%lu hasData=%d bpp=%d "
+                "outBuf=%p\n",
                 g_write_count, w->nInDataComp, w->nInDataKind,
                 (unsigned long)w->dwLineDataSize,
-                (unsigned long)outLine, has_data, g_bpp);
+                (unsigned long)outLine, has_data, g_bpp,
+                (void*)w->pWriteBuff);
 
     if (st) *st = 1;
     return outLine;

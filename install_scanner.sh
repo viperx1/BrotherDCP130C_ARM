@@ -851,7 +851,7 @@ test_scan() {
         local all_invalid_arg=true
 
         for try_device in "${scan_devices[@]}"; do
-            local -a scan_args=(-d "$try_device" --format=pnm --resolution=150)
+            local -a scan_args=(-d "$try_device" --format=pnm --resolution=150 --mode Gray)
 
             log_info "Performing test scan with device '$try_device'..."
             log_debug "Scan command: $scan_cmd ${scan_args[*]}"
@@ -979,8 +979,10 @@ display_info() {
     log_info "Scanner Name: $SCANNER_NAME"
     echo
     log_info "Backend: Native ARM (compiled from source — direct USB access)"
-    log_info "To scan a document:"
-    log_info "  scanimage -d 'brother2:bus1;dev1' --format=png --resolution=300 > scan.png"
+    log_info "To scan a document (grayscale):"
+    log_info "  scanimage -d 'brother2:bus1;dev1' --mode Gray --resolution=150 --format=pnm > scan.pnm"
+    log_info "To scan in color:"
+    log_info "  scanimage -d 'brother2:bus1;dev1' --mode 'True Gray' --resolution=300 --format=pnm > scan.pnm"
     log_info "To list available scanners:"
     log_info "  scanimage -L"
     log_info "To check SANE configuration:"
