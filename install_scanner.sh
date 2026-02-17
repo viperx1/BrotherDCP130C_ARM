@@ -463,49 +463,59 @@ compile_arm_backend() {
     fi
     log_debug "Source extracted to: $brscan_src"
 
-    # Patch brother_scanner.c: white lines in ProcessMain advance lpFwBuf
-    # but don't increment *lpFwBufcnt (FwTempBuffLength). This causes the
-    # output buffer to have data at high offsets but memmove only copies
-    # FwTempBuffLength bytes (all zeros from leading white lines).
-    # Fix: count white line bytes in *lpFwBufcnt so memmove copies them.
+    # Patch brother_scanner.c to:
+    # 1. Increase FwTempBuff to hold entire page (was only 12 lines)
+    # 2. Add debug WriteLog calls at key buffer management points
     local scanner_c="$brscan_src/backend_src/brother_scanner.c"
     if [[ -f "$scanner_c" ]]; then
-        # In ProcessMain, the white line block (Header==0) advances lpFwBuf
-        # but does NOT increment *lpFwBufcnt. We insert that after the
-        # lpFwBuf += line. Use awk for reliable multi-line matching.
-        local before_count after_count
-        before_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
-        # Check if already patched (exact lpFwBufcnt line between 'White line' and '}else')
-        if awk '/White line/{f=1} f && /\*lpFwBufcnt \+= this->scanInfo\.ScanAreaByte\.lWidth/{found=1; exit} f && /\}else/{exit} END{exit !found}' "$scanner_c" 2>/dev/null; then
-            log_debug "White line patch already applied"
-        else
+        local patch_count=0
+
+        # Patch 1: Increase dwFwTempBuffMaxSize to hold the full page.
+        # Original: dwFwTempBuffMaxSize = ScanAreaByte.lWidth * 6  (only 12 lines after *2)
+        # Changed:  dwFwTempBuffMaxSize = ScanAreaByte.lWidth * ScanAreaByte.lHeight
+        # This prevents buffer overflow when white lines consume space.
+        if grep -q 'ScanAreaByte\.lWidth \* 6' "$scanner_c"; then
+            sed -i 's/ScanAreaByte\.lWidth \* 6/ScanAreaByte.lWidth * this->scanInfo.ScanAreaByte.lHeight/g' "$scanner_c"
+            log_debug "Patch: increased FwTempBuff to full page size"
+            patch_count=$((patch_count + 1))
+        fi
+
+        # Patch 2: Count white line bytes in FwTempBuffLength.
+        # White lines advance lpFwBuf but don't increment *lpFwBufcnt,
+        # causing memmove to miss the actual data. Now safe because
+        # the buffer is large enough to hold the entire page.
+        if ! grep -q 'lpFwBufcnt.*ScanAreaByte.*White line fix' "$scanner_c"; then
             awk '
             /White line/ && !patched { in_white=1 }
             in_white && /lpFwBuf \+=.*ScanAreaByte/ && !patched {
                 print
                 match($0, /^[[:space:]]*/)
                 indent = substr($0, RSTART, RLENGTH)
-                print indent "*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth;"
+                print indent "*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth; // White line fix"
                 patched=1; in_white=0; next
             }
             { print }
             ' "$scanner_c" > "${scanner_c}.patched"
             if [[ $? -eq 0 ]] && [[ -s "${scanner_c}.patched" ]]; then
                 mv "${scanner_c}.patched" "$scanner_c"
-            else
-                log_warn "White line patch: awk or mv failed"
-                rm -f "${scanner_c}.patched"
+                log_debug "Patch: white lines now counted in FwTempBuffLength"
+                patch_count=$((patch_count + 1))
             fi
-            after_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
-            local added=$((after_count - before_count))
-            if [[ "$added" -eq 1 ]]; then
-                log_debug "Patched brother_scanner.c: white lines now counted in FwTempBuffLength (1 location)"
-            elif [[ "$added" -gt 1 ]]; then
-                log_warn "Patch applied to $added locations — expected 1, review brother_scanner.c"
-            else
-                log_debug "White line patch not applied (pattern not found)"
-            fi
+        else
+            log_debug "White line patch already applied"
         fi
+
+        # Patch 3: Add debug WriteLog calls at key points in PageScan.
+        # Insert after "PageScan FwTempBuffLength" log to show lpFwLen.
+        if ! grep -q 'ARMFIX_DEBUG' "$scanner_c"; then
+            sed -i '/PageScan FwTempBuffLength/a\\tWriteLog( "ARMFIX_DEBUG lpFwLen=%d FwTempBuffLength=%d dwFwTempBuffMaxSize=%d", *lpFwLen, FwTempBuffLength, dwFwTempBuffMaxSize );' "$scanner_c"
+            # Also add debug after ProcessMain call to show the result
+            sed -i '/ProcessMain End dwRxTempBuffLength/a\\tWriteLog( "ARMFIX_DEBUG post-ProcessMain FwTempBuffLength=%d lRealY=%ld", FwTempBuffLength, lRealY );' "$scanner_c"
+            log_debug "Patch: added ARMFIX_DEBUG WriteLog calls"
+            patch_count=$((patch_count + 1))
+        fi
+
+        log_debug "Applied $patch_count source patches to brother_scanner.c"
     fi
 
     # Check for required headers
@@ -948,7 +958,16 @@ test_scan() {
                     log_warn "Test scan with '$try_device' failed (exit code: $exit_code)."
                     if [[ $exit_code -eq 139 ]]; then
                         log_warn "Segmentation fault detected in scan backend."
-                        log_warn "Check /usr/local/Brother/sane/BrMfc32.log for details."
+                        # Show BrMfc32.log immediately on segfault
+                        local brother_log="/usr/local/Brother/sane/BrMfc32.log"
+                        if [[ -f "$brother_log" ]] && [[ -s "$brother_log" ]]; then
+                            log_info "Brother backend log (last 50 lines):"
+                            tail -50 "$brother_log" | while IFS= read -r bline; do
+                                log_info "  $bline"
+                            done
+                        else
+                            log_warn "BrMfc32.log is empty — crash happened before backend init"
+                        fi
                     fi
                 fi
                 if [[ -s "$test_stderr" ]]; then
@@ -961,11 +980,17 @@ test_scan() {
                         log_info "SCANDEC debug output:"
                         echo "$scandec_out" | while IFS= read -r line; do log_info "  $line"; done
                     fi
-                    # Show only the scanimage error, not SANE debug noise
-                    local scan_err
-                    scan_err=$(echo "$err_text" | grep -v "^\[SCANDEC\]" | grep -i "scanimage\|failed\|error\|Invalid" | head -3)
-                    if [[ -n "$scan_err" ]]; then
-                        log_info "  $scan_err"
+                    # Show ALL stderr on segfault (not just filtered lines)
+                    if [[ $exit_code -eq 139 ]]; then
+                        log_info "Full stderr from segfaulted scan:"
+                        head -30 "$test_stderr" | while IFS= read -r line; do log_info "  $line"; done
+                    else
+                        # Show only the scanimage error, not SANE debug noise
+                        local scan_err
+                        scan_err=$(echo "$err_text" | grep -v "^\[SCANDEC\]" | grep -i "scanimage\|failed\|error\|Invalid" | head -5)
+                        if [[ -n "$scan_err" ]]; then
+                            log_info "  $scan_err"
+                        fi
                     fi
                     if [[ "$err_text" == *"Invalid argument"* ]]; then
                         log_debug "Device '$try_device' returned 'Invalid argument'"
@@ -986,11 +1011,22 @@ test_scan() {
 
             # Show Brother backend debug log if available
             local brother_log="/usr/local/Brother/sane/BrMfc32.log"
-            if [[ -f "$brother_log" ]]; then
-                log_info "Brother backend log (last 30 lines):"
-                tail -30 "$brother_log" | while IFS= read -r line; do
+            if [[ -f "$brother_log" ]] && [[ -s "$brother_log" ]]; then
+                log_info "Brother backend log (last 50 lines):"
+                tail -50 "$brother_log" | while IFS= read -r line; do
                     log_info "  $line"
                 done
+                # Highlight ARMFIX_DEBUG entries
+                local armfix_lines
+                armfix_lines=$(grep 'ARMFIX_DEBUG' "$brother_log" 2>/dev/null | tail -10)
+                if [[ -n "$armfix_lines" ]]; then
+                    log_info "ARMFIX debug summary:"
+                    echo "$armfix_lines" | while IFS= read -r line; do
+                        log_info "  $line"
+                    done
+                fi
+            else
+                log_warn "BrMfc32.log is empty or missing"
             fi
 
             log_info "Try manually: sudo $scan_cmd -d '${scan_devices[0]:-brother2:bus1;dev1}' --format=pnm > scan.pnm"
