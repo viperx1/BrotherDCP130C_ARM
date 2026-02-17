@@ -420,6 +420,34 @@ install_drivers() {
     log_info "Scanner driver config installed successfully."
 }
 
+# Check library dependencies with ldd, logging any missing libraries.
+# Usage: check_lib_deps lib1 lib2 ...
+# Returns 0 if all deps OK, 1 if any missing.
+check_lib_deps() {
+    if ! command -v ldd &>/dev/null; then
+        return 0
+    fi
+    local has_errors=0
+    for lib in "$@"; do
+        if [[ ! -f "$lib" ]]; then
+            log_warn "  $lib NOT found"
+            has_errors=1
+            continue
+        fi
+        local ldd_out
+        ldd_out=$(ldd "$lib" 2>&1 || true)
+        local missing
+        missing=$(echo "$ldd_out" | grep "not found" || true)
+        if [[ -n "$missing" ]]; then
+            log_warn "  $(basename "$lib"): MISSING deps: $missing"
+            has_errors=1
+        else
+            log_debug "  $(basename "$lib"): all dependencies OK"
+        fi
+    done
+    return "$has_errors"
+}
+
 # Compile the Brother SANE backend natively for ARM from source.
 # This produces a native ARM libsane-brother2.so that can use the real
 # USB stack directly.
@@ -490,6 +518,150 @@ compile_arm_backend() {
             rm -f "${scanner_c}.stripped"
             log_debug "Strip failed, compiling with original source"
         fi
+    fi
+
+    # Fix time_t/long size mismatch in WriteLogFileString (brother_log.c).
+    # On 32-bit ARM with 64-bit time_t (Raspbian Trixie), the expression
+    # (ltime%1000) is 64-bit but sprintf's %ld reads only 32 bits. This
+    # misaligns the subsequent %s argument, causing strlen() to SIGSEGV
+    # on a garbage pointer. Cast to (long) to match the %ld format.
+    # There is exactly one occurrence of (ltime%1000) in brother_log.c.
+    local brother_log_c="$brscan_src/backend_src/brother_log.c"
+    if [[ -f "$brother_log_c" ]]; then
+        sed -i 's/(ltime%1000)/(long)(ltime%1000)/' "$brother_log_c"
+        log_debug "Patched brother_log.c: cast (ltime%1000) to (long) for time_t safety"
+    fi
+
+    # Add debug instrumentation to brother2.c for crash diagnosis.
+    # The bus scan loop in sane_init is the site of the segfault
+    # (issue #65). We inject fflush(stderr) after every DBG() so output
+    # appears even if the process crashes immediately after, and add
+    # fine-grained trace messages around every pointer dereference in
+    # the bus scan to pinpoint the exact crash location.
+    local brother2_c="$brscan_src/backend_src/brother2.c"
+    if [[ -f "$brother2_c" ]]; then
+        # 1. Force stderr flush after every DBG() call in sane_init's bus scan
+        #    so crash output is not lost in stdio buffers
+        sed -i 's/DBG(DEBUG_INFO,"starting bus scan\\n");/DBG(DEBUG_INFO,"starting bus scan\\n"); fflush(stderr);/' "$brother2_c"
+
+        # 2. Inject fine-grained trace messages inside the bus scan loop.
+        #    The crash occurs between "starting bus scan" and the first device
+        #    found message — we need to know if it is the bus pointer,
+        #    the device pointer, or the model-info chain that is corrupt.
+        #
+        #    Replace the sparse debug around the loop with a verbose version
+        #    that traces every pointer dereference and flushes after each.
+        sed -i '/DBG(DEBUG_JUNK,"scanning bus %s\\n", pbus->dirname);/c\
+      fprintf(stderr, "[BROTHER2-DBG] scanning bus %p dirname=%s\\n", (void*)pbus, pbus->dirname ? pbus->dirname : "(null)"); fflush(stderr);' "$brother2_c"
+
+        # Replace the 3-line DBG(DEBUG_JUNK,"found dev ...") with a single fprintf
+        # that adds bus/device numbers and flushes immediately.
+        # Original is: DBG(DEBUG_JUNK,"found dev %04X/%04X\n",
+        #                  pdev->descriptor.idVendor,
+        #                  pdev->descriptor.idProduct);
+        sed -i '/DBG(DEBUG_JUNK,"found dev %04X\/%04X/{
+N;N
+s|DBG(DEBUG_JUNK,"found dev %04X/%04X\\n",\n.*pdev->descriptor.idVendor,\n.*pdev->descriptor.idProduct);|fprintf(stderr, "[BROTHER2-DBG] found dev %04X/%04X on bus %d dev %d\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, iBus, iDev); fflush(stderr);|
+}' "$brother2_c"
+
+        # 3. Add a trace when a matching device IS found (not for every comparison).
+        #    The per-model comparison logging was removed — it produced ~200+
+        #    lines of noise per device and is no longer needed (issue #65 fixed).
+        sed -i '/RegisterSaneDev(pdev,ach,pModelInf/i\
+\t\t\t      fprintf(stderr, "[BROTHER2-DBG] MATCH: dev %04X/%04X matches model vendor=%04X product=%04X\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, pModelInf->vendorID, pModelInf->productID); fflush(stderr);' "$brother2_c"
+
+        # 4. Add a trace after the bus scan loop finishes
+        sed -i '/WriteLog.*sane_init Check Interface/i\
+    fprintf(stderr, "[BROTHER2-DBG] bus scan complete, checking network interfaces\\n"); fflush(stderr);' "$brother2_c"
+
+        # 5. Add sane_open tracing — the crash may actually be in sane_open
+        #    when it calls usb_open() or usb_set_configuration() on the device.
+        sed -i '/WriteLog.*sane_open start dev_name/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_open: device=\\"%s\\"\\n", devicename); fflush(stderr);' "$brother2_c"
+
+        # 6. Add trace before usb_open in sane_open (NET_AND_ADVINI path)
+        sed -i '/this->hScanner->usb = usb_open(pdev->pdev);/i\
+\t\t    fprintf(stderr, "[BROTHER2-DBG] sane_open: calling usb_open(pdev=%p pdev->pdev=%p)\\n", (void*)pdev, (void*)pdev->pdev); fflush(stderr);' "$brother2_c"
+
+        # 7. Add trace after usb_open
+        sed -i '/if (!this->hScanner->usb)/i\
+\t\t    fprintf(stderr, "[BROTHER2-DBG] sane_open: usb_open returned %p\\n", (void*)this->hScanner->usb); fflush(stderr);' "$brother2_c"
+
+        # 8. Add trace before OpenDevice
+        sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/i\
+  fprintf(stderr, "[BROTHER2-DBG] sane_open: calling OpenDevice(seriesNo=%d)\\n", pdev->modelInf.seriesNo); fflush(stderr);' "$brother2_c"
+
+        # 9. Add trace after OpenDevice returns
+        sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_open: OpenDevice returned %d\\n", rc); fflush(stderr);' "$brother2_c"
+
+        log_debug "Injected bus-scan debug instrumentation into brother2.c"
+    fi
+
+    # Add debug instrumentation inside OpenDevice (brother_devaccs.c)
+    # to trace USB claim/control operations that follow WriteLog.
+    local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
+    if [[ -f "$devaccs_c" ]]; then
+        # Add trace before and after usb_claim_interface
+        sed -i '/usb_claim_interface(hScanner->usb, 1)/{
+i\\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: calling usb_claim_interface\\n"); fflush(stderr);
+}' "$devaccs_c"
+
+        # Add trace after usb_control_msg
+        sed -i '/if (rc >= 0) {/i\
+\t\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: usb_control_msg returned %d\\n", rc); fflush(stderr);' "$devaccs_c"
+
+        log_debug "Injected OpenDevice debug instrumentation into brother_devaccs.c"
+
+        # Add ReadDeviceData tracing for USB read debugging.
+        # The scan timeout (issue #68) occurs during ReadDeviceData where
+        # usb_bulk_read returns 0 bytes repeatedly. These traces show
+        # every USB read attempt and result on stderr.
+        sed -i '/WriteLog.*ReadDeviceData Start nReadSize/a\
+\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData: nReadSize=%d iReadStatus=%d\\n", nReadSize, iReadStatus); fflush(stderr);' "$devaccs_c"
+
+        sed -i '/WriteLog.*ReadDeviceData ReadEnd nResultSize/a\
+\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData: nResultSize=%d\\n", nResultSize); fflush(stderr);' "$devaccs_c"
+
+        log_debug "Injected ReadDeviceData debug instrumentation into brother_devaccs.c"
+    fi
+
+    # Add scan-progress debug instrumentation into brother2.c and
+    # brother_scanner.c so the scan process emits stderr traces during
+    # sane_start, sane_read, and PageScan. This lets us diagnose hangs
+    # where the scan times out without any visible progress.
+    if [[ -f "$brother2_c" ]]; then
+        # Trace sane_start
+        sed -i '/WriteLog.*sane_start start/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_start: starting scan\\n"); fflush(stderr);' "$brother2_c"
+
+        # Trace sane_read entry (shows maxlen — how many bytes scanimage wants)
+        sed -i '/WriteLog.*sane_read start.*maxlen/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_read: maxlen=%d\\n", maxlen); fflush(stderr);' "$brother2_c"
+
+        # Trace sane_read exit (shows how many bytes are returned)
+        sed -i '/WriteLog.*sane_read End.*rc.*len/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_read: rc=%d len=%d\\n", rc, *len); fflush(stderr);' "$brother2_c"
+
+        log_debug "Injected sane_start/sane_read debug instrumentation into brother2.c"
+    fi
+
+    local scanner_c="$brscan_src/backend_src/brother_scanner.c"
+    if [[ -f "$scanner_c" ]]; then
+        # Trace PageScan entry (shows buffer sizes and page count)
+        sed -i '/WriteLog.*PageScan Start.*cnt=%d.*nMaxLen/a\
+\tfprintf(stderr, "[BROTHER2-DBG] PageScan: cnt=%d nMaxLen=%d bReadbufEnd=%d iProcessEnd=%d\\n", nPageScanCnt, nMaxLen, this->scanState.bReadbufEnd, this->scanState.iProcessEnd); fflush(stderr);' "$scanner_c"
+
+        # Trace ReadNonFixedData result inside PageScan
+        # (the if/else block after rc = ReadNonFixedData)
+        sed -i '/WriteLog.*bReadbufEnd =TRUE/i\
+\t\t\t\tfprintf(stderr, "[BROTHER2-DBG] PageScan: ReadNonFixedData rc=%d wData=%d\\n", rc, wData); fflush(stderr);' "$scanner_c"
+
+        # Trace ProcessMain exit with FwTempBuffLength
+        sed -i '/WriteLog.*ProcessMain End dwRxTempBuffLength/a\
+\tfprintf(stderr, "[BROTHER2-DBG] PageScan: ProcessMain done FwTemp=%d lRealY=%ld iProcessEnd=%d\\n", FwTempBuffLength, lRealY, this->scanState.iProcessEnd); fflush(stderr);' "$scanner_c"
+
+        log_debug "Injected PageScan debug instrumentation into brother_scanner.c"
     fi
 
     # Check for required headers
@@ -586,15 +758,33 @@ compile_arm_backend() {
     }
     log_debug "libbrcolm2.so.1.0.0 compiled (from DCP-130C/brcolor_stubs.c)"
 
+    # Compile backend init stub (constructor logging + SIGSEGV handler)
+    local init_src="$SCRIPT_DIR/DCP-130C/backend_init.c"
+    if [[ -f "$init_src" ]]; then
+        gcc -c -fPIC -O2 -w -o "$build_dir/backend_init.o" "$init_src" || {
+            log_warn "Failed to compile backend_init.c (non-fatal, skipping)"
+        }
+        if [[ -f "$build_dir/backend_init.o" ]]; then
+            log_debug "backend_init.o compiled (from DCP-130C/backend_init.c)"
+        fi
+    fi
+
     # Link the SANE backend shared library
     log_info "Linking native ARM SANE backend..."
+    local -a link_objs=(
+        "$build_dir/brother2.o"
+        "$build_dir/sane_strstatus.o"
+        "$build_dir/sanei_constrain_value.o"
+        "$build_dir/sanei_init_debug.o"
+        "$build_dir/sanei_config.o"
+    )
+    # Include backend init stub if compiled
+    if [[ -f "$build_dir/backend_init.o" ]]; then
+        link_objs+=("$build_dir/backend_init.o")
+    fi
     local link_output
     link_output=$(gcc -shared -fPIC -o "$build_dir/libsane-brother2.so.1.0.7" \
-        "$build_dir/brother2.o" \
-        "$build_dir/sane_strstatus.o" \
-        "$build_dir/sanei_constrain_value.o" \
-        "$build_dir/sanei_init_debug.o" \
-        "$build_dir/sanei_config.o" \
+        "${link_objs[@]}" \
         -lpthread -lusb -lm -ldl -lc \
         -Wl,-soname,libsane-brother2.so.1 2>&1) || true
     if [[ ! -f "$build_dir/libsane-brother2.so.1.0.7" ]]; then
@@ -647,6 +837,32 @@ compile_arm_backend() {
     log_debug "  $(file /usr/lib/sane/libsane-brother2.so.1.0.7)"
     log_debug "  $(file /usr/lib/libbrscandec2.so.1.0.0)"
     log_debug "  $(file /usr/lib/libbrcolm2.so.1.0.0)"
+
+    # Verify library dependencies are resolvable
+    log_debug "Checking library dependencies..."
+    if ! check_lib_deps /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                        /usr/lib/libbrscandec2.so.1.0.0 \
+                        /usr/lib/libbrcolm2.so.1.0.0; then
+        log_warn "Some library dependencies are missing. The scanner backend may crash."
+        log_warn "Try: sudo apt-get install libusb-0.1-4 libsane1"
+    fi
+
+    # Verify exported symbols in stub libraries
+    if command -v nm &>/dev/null; then
+        log_debug "Verifying exported symbols..."
+        local scandec_syms
+        scandec_syms=$(nm -D /usr/lib/libbrscandec2.so.1.0.0 2>/dev/null | grep -c " T ScanDec" || echo 0)
+        local colm_syms
+        colm_syms=$(nm -D /usr/lib/libbrcolm2.so.1.0.0 2>/dev/null | grep -c " T ColorMatch" || echo 0)
+        log_debug "  libbrscandec2: $scandec_syms ScanDec* exports"
+        log_debug "  libbrcolm2: $colm_syms ColorMatch* exports"
+        if [[ "$scandec_syms" -lt 5 ]]; then
+            log_warn "libbrscandec2 has fewer exports than expected ($scandec_syms, need >= 5)"
+        fi
+        if [[ "$colm_syms" -lt 3 ]]; then
+            log_warn "libbrcolm2 has fewer exports than expected ($colm_syms, need >= 3)"
+        fi
+    fi
 
     return 0
 }
@@ -734,6 +950,42 @@ configure_scanner() {
 test_scan() {
     log_info "Testing scanner..."
 
+    # Unbind the usblp kernel module from the scanner if it is attached.
+    # usblp grabs USB interface 1 for printing; this blocks SANE's
+    # usb_claim_interface() and can cause segfaults in older libusb-0.1.
+    if lsmod 2>/dev/null | grep -q usblp; then
+        log_debug "usblp kernel module is loaded"
+        # Find any Brother USB device (vendor 04f9) and unbind usblp from it
+        local usblp_bound=false
+        for devpath in /sys/bus/usb/devices/*/idVendor; do
+            local ddir
+            ddir=$(dirname "$devpath")
+            if [[ -f "$ddir/idVendor" ]]; then
+                local vid
+                vid=$(cat "$ddir/idVendor" 2>/dev/null)
+                if [[ "$vid" == "04f9" ]]; then
+                    # Check if usblp is bound to any interface of this device
+                    local devname
+                    devname=$(basename "$ddir")
+                    for intf_dir in "$ddir"/"$devname":*; do
+                        if [[ -L "$intf_dir/driver" ]] && readlink "$intf_dir/driver" 2>/dev/null | grep -q usblp; then
+                            usblp_bound=true
+                            local intf_name
+                            intf_name=$(basename "$intf_dir")
+                            log_debug "usblp is bound to $intf_name — unbinding for SANE access"
+                            echo "$intf_name" | sudo tee /sys/bus/usb/drivers/usblp/unbind > /dev/null 2>&1 || true
+                        fi
+                    done
+                fi
+            fi
+        done
+        if $usblp_bound; then
+            log_info "Unbound usblp from scanner to allow SANE access."
+        else
+            log_debug "usblp loaded but not bound to Brother scanner"
+        fi
+    fi
+
     local scan_cmd=""
     if command -v scanimage &>/dev/null; then
         scan_cmd="scanimage"
@@ -742,6 +994,36 @@ test_scan() {
     if [[ -z "$scan_cmd" ]]; then
         log_warn "scanimage not found. Install sane-utils to test scanning."
         return
+    fi
+
+    # Pre-scan: verify the SANE backend can be loaded (catches linker issues
+    # before they manifest as mysterious segfaults in scanimage)
+    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]]; then
+        log_debug "Pre-scan backend load verification..."
+        local dlopen_test
+        dlopen_test=$(python3 -c "
+import ctypes, sys
+try:
+    lib = ctypes.CDLL('/usr/lib/sane/libsane-brother2.so.1.0.7')
+    print('OK: backend loaded successfully')
+    for sym in ['sane_brother2_init', 'sane_brother2_open', 'sane_brother2_start']:
+        try:
+            getattr(lib, sym)
+        except AttributeError:
+            print('WARN: symbol %s not found' % sym)
+except OSError as e:
+    print('FAIL: %s' % e)
+    sys.exit(1)
+" 2>&1 || true)
+        if echo "$dlopen_test" | grep -q "^FAIL:"; then
+            log_warn "Backend library failed to load: $dlopen_test"
+            log_warn "This will cause scanimage to crash. Checking dependencies..."
+            ldd /usr/lib/sane/libsane-brother2.so.1.0.7 2>&1 | grep -i "not found\|error" | while IFS= read -r line; do
+                log_warn "  $line"
+            done
+        else
+            log_debug "  $dlopen_test"
+        fi
     fi
 
     # List available scanners
@@ -883,8 +1165,25 @@ test_scan() {
 
             log_info "Performing test scan with device '$try_device'..."
             log_debug "Scan command: $scan_cmd ${scan_args[*]}"
-            # SANE_DEBUG_DLL=1 shows backend loading; stderr captures SCANDEC debug
-            if SANE_DEBUG_DLL=1 timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
+            # SANE_DEBUG_DLL=1 shows backend loading; SANE_DEBUG_BROTHER2=3
+            # shows backend activity. Our injected fprintf traces provide
+            # USB-level detail independently of SANE debug levels.
+            local -a scan_env=(SANE_DEBUG_DLL=1 SANE_DEBUG_BROTHER2=3)
+            # Use libSegFault for automatic backtrace on crash (if available)
+            local segfault_lib=""
+            for sf_path in /lib/*/libSegFault.so /usr/lib/*/libSegFault.so /lib/libSegFault.so; do
+                if [[ -f "$sf_path" ]]; then
+                    segfault_lib="$sf_path"
+                    break
+                fi
+            done
+            if [[ -n "$segfault_lib" ]]; then
+                scan_env+=(LD_PRELOAD="$segfault_lib" SEGFAULT_SIGNALS="segv" SEGFAULT_USE_ALTSTACK=1)
+                log_debug "Using libSegFault for crash backtrace: $segfault_lib"
+            fi
+            # Enable core dumps so we can get a backtrace if the scan crashes
+            ulimit -c unlimited 2>/dev/null || true
+            if env "${scan_env[@]}" timeout 120 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
                     log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
@@ -927,8 +1226,27 @@ test_scan() {
             else
                 local exit_code=$?
                 if [[ $exit_code -eq 124 ]]; then
-                    log_warn "Test scan with '$try_device' timed out after 60 seconds."
+                    log_warn "Test scan with '$try_device' timed out after 120 seconds."
                     all_invalid_arg=false
+                    # Show BrMfc32.log on timeout for diagnosis
+                    local brother_log_timeout="/usr/local/Brother/sane/BrMfc32.log"
+                    if [[ -f "$brother_log_timeout" ]] && [[ -s "$brother_log_timeout" ]]; then
+                        log_info "Brother backend log (BrMfc32.log):"
+                        cat "$brother_log_timeout" | while IFS= read -r bline; do
+                            log_info "  $bline"
+                        done
+                    else
+                        log_warn "BrMfc32.log is empty or missing"
+                    fi
+                    # Show scan-progress traces on timeout (sane_start/sane_read/PageScan)
+                    if [[ -s "$test_stderr" ]]; then
+                        local timeout_trace
+                        timeout_trace=$(grep '^\[BROTHER2-DBG\]' "$test_stderr" | tail -30 || true)
+                        if [[ -n "$timeout_trace" ]]; then
+                            log_info "Scan progress trace:"
+                            echo "$timeout_trace" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
+                    fi
                 else
                     log_warn "Test scan with '$try_device' failed (exit code: $exit_code)."
                     if [[ $exit_code -eq 139 ]]; then
@@ -942,6 +1260,94 @@ test_scan() {
                             done
                         else
                             log_warn "BrMfc32.log is empty — crash happened before backend init"
+                        fi
+
+                        # Show our injected bus-scan debug trace
+                        if [[ -s "$test_stderr" ]]; then
+                            local dbg_trace
+                            dbg_trace=$(grep '^\[BROTHER2-DBG\]' "$test_stderr" || true)
+                            if [[ -n "$dbg_trace" ]]; then
+                                log_info "Bus scan trace (last line before crash):"
+                                echo "$dbg_trace" | while IFS= read -r line; do log_info "  $line"; done
+                            fi
+                        fi
+
+                        # Run library dependency check on the backend
+                        log_info "Checking library dependencies for crash diagnosis..."
+                        check_lib_deps /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                                       /usr/lib/libbrscandec2.so.1.0.0 \
+                                       /usr/lib/libbrcolm2.so.1.0.0 || true
+
+                        # Retry with LD_DEBUG and higher SANE debug levels to
+                        # capture more detail about the crash
+                        # (the actual scan uses DLL=1/BROTHER2=5 to reduce noise)
+                        log_info "Re-running with LD_DEBUG to trace crash..."
+                        local ld_debug_stderr="/tmp/brother_ld_debug.err"
+                        LD_DEBUG=libs SANE_DEBUG_DLL=3 SANE_DEBUG_BROTHER2=5 \
+                            timeout 30 "$scan_cmd" -L > /dev/null 2>"$ld_debug_stderr" || true
+                        if [[ -s "$ld_debug_stderr" ]]; then
+                            # Filter LD_DEBUG output for: library init calls,
+                            # brother/scanner libs, errors, and missing symbols
+                            local ld_events
+                            ld_events=$(grep -E "calling init:|init:.*brother|error|brother2|brscandec|brcolm|libusb|symbol.*not found" "$ld_debug_stderr" | tail -30 || true)
+                            if [[ -n "$ld_events" ]]; then
+                                log_info "Library loading trace (relevant lines):"
+                                echo "$ld_events" | while IFS= read -r line; do log_info "  $line"; done
+                            fi
+                            # Show SANE backend loading
+                            local sane_events
+                            sane_events=$(grep -i "brother\|sane_init\|load.*dll\|adding" "$ld_debug_stderr" | grep -v "^$" | tail -20 || true)
+                            if [[ -n "$sane_events" ]]; then
+                                log_info "SANE backend events:"
+                                echo "$sane_events" | while IFS= read -r line; do log_info "  $line"; done
+                            fi
+                        fi
+                        rm -f "$ld_debug_stderr"
+
+                        # Check for core dump
+                        local core_pattern
+                        core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo "unknown")
+                        log_debug "Core dump pattern: $core_pattern"
+                        local core_file=""
+                        for cf in core core.* /tmp/core.* /var/crash/*scanimage*; do
+                            if [[ -f "$cf" ]] && [[ -n $(find "$cf" -mmin -2 2>/dev/null) ]]; then
+                                core_file="$cf"
+                                break
+                            fi
+                        done
+                        if [[ -n "$core_file" ]] && command -v gdb &>/dev/null; then
+                            log_info "Core dump found: $core_file"
+                            local bt_output
+                            bt_output=$(gdb -batch -ex "bt" -ex "info sharedlibrary" "$scan_cmd" "$core_file" 2>&1 | head -40 || true)
+                            log_info "Backtrace:"
+                            echo "$bt_output" | while IFS= read -r line; do log_info "  $line"; done
+                        elif command -v gdb &>/dev/null; then
+                            # No core dump available — try to get a backtrace by running
+                            # under GDB directly (catches the segfault live)
+                            log_info "No core dump, re-running under GDB for backtrace..."
+                            local gdb_stderr="/tmp/brother_gdb_bt.txt"
+                            SANE_DEBUG_BROTHER2=5 timeout 30 gdb -batch \
+                                -ex "set confirm off" \
+                                -ex "handle SIGSEGV stop print" \
+                                -ex "run" \
+                                -ex "bt" \
+                                -ex "info registers" \
+                                -ex "info sharedlibrary" \
+                                --args "$scan_cmd" -d "$try_device" --format=pnm --resolution=150 --mode "True Gray" \
+                                > "$gdb_stderr" 2>&1 || true
+                            if [[ -s "$gdb_stderr" ]]; then
+                                local gdb_bt
+                                gdb_bt=$(grep -A30 'Thread.*received signal SIGSEGV\|^#[0-9]\|Program received signal' "$gdb_stderr" | head -30 || true)
+                                if [[ -n "$gdb_bt" ]]; then
+                                    log_info "GDB backtrace:"
+                                    echo "$gdb_bt" | while IFS= read -r line; do log_info "  $line"; done
+                                else
+                                    # Show the last 20 lines if no specific backtrace found
+                                    log_info "GDB output (last 20 lines):"
+                                    tail -20 "$gdb_stderr" | while IFS= read -r line; do log_info "  $line"; done
+                                fi
+                            fi
+                            rm -f "$gdb_stderr"
                         fi
                     fi
                 fi

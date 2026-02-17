@@ -15,6 +15,8 @@
  * Copyright: 2026, based on Brother brscan2-src-0.2.5-1 API
  */
 #include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
 
 typedef int           BOOL;
 typedef unsigned char BYTE;
@@ -22,6 +24,13 @@ typedef char         *LPSTR;
 
 #define TRUE  1
 #define FALSE 0
+
+/* Log library load for diagnostics */
+__attribute__((constructor))
+static void brcolor_init(void) {
+    const char msg[] = "[BRCOLOR] Library loaded (ARM native stub)\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+}
 
 #pragma pack(1)
 typedef struct {
