@@ -1066,8 +1066,8 @@ except OSError as e:
                                        /usr/lib/libbrscandec2.so.1.0.0 \
                                        /usr/lib/libbrcolm2.so.1.0.0 || true
 
-                        # Retry with LD_DEBUG to trace library loading
-                        # Retry with higher debug levels to capture more detail
+                        # Retry with LD_DEBUG and higher SANE debug levels to
+                        # capture more detail about the crash
                         # (the actual scan uses DLL=1/BROTHER2=3 to reduce noise)
                         log_info "Re-running with LD_DEBUG to trace crash..."
                         local ld_debug_stderr="/tmp/brother_ld_debug.err"
