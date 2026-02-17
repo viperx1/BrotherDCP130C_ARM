@@ -470,24 +470,35 @@ compile_arm_backend() {
     # Fix: count white line bytes in *lpFwBufcnt so memmove copies them.
     local scanner_c="$brscan_src/backend_src/brother_scanner.c"
     if [[ -f "$scanner_c" ]]; then
-        # Match the exact white-line block inside ProcessMain:
-        #   if( lpFwBuf ){
-        #       lRealY++;
-        #       lpFwBuf += this->scanInfo.ScanAreaByte.lWidth;
-        # Insert *lpFwBufcnt increment after lRealY++
+        # In ProcessMain, the white line block (Header==0) advances lpFwBuf
+        # but does NOT increment *lpFwBufcnt. We insert that after the
+        # lpFwBuf += line. Use awk for reliable multi-line matching.
         local before_count after_count
         before_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
-        sed -i '/White line/,/lpFwBuf +=.*ScanAreaByte/{
-            s/lRealY++;/lRealY++;\n\t\t\t\t\t*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth;/
-        }' "$scanner_c"
-        after_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
-        local added=$((after_count - before_count))
-        if [[ "$added" -eq 1 ]]; then
-            log_debug "Patched brother_scanner.c: white lines now counted in FwTempBuffLength (1 location)"
-        elif [[ "$added" -gt 1 ]]; then
-            log_warn "Patch applied to $added locations — expected 1, review brother_scanner.c"
+        # Check if already patched (lpFwBufcnt between 'White line' and next '}else')
+        if awk '/White line/{f=1} f && /lpFwBufcnt/{found=1; exit} f && /\}else/{exit} END{exit !found}' "$scanner_c" 2>/dev/null; then
+            log_debug "White line patch already applied"
         else
-            log_debug "White line patch not applied (pattern not found or already patched)"
+            awk '
+            /White line/ && !patched { in_white=1 }
+            in_white && /lpFwBuf \+=.*ScanAreaByte/ && !patched {
+                print
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, RSTART, RLENGTH)
+                print indent "*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth;"
+                patched=1; in_white=0; next
+            }
+            { print }
+            ' "$scanner_c" > "${scanner_c}.patched" && mv "${scanner_c}.patched" "$scanner_c"
+            after_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
+            local added=$((after_count - before_count))
+            if [[ "$added" -eq 1 ]]; then
+                log_debug "Patched brother_scanner.c: white lines now counted in FwTempBuffLength (1 location)"
+            elif [[ "$added" -gt 1 ]]; then
+                log_warn "Patch applied to $added locations — expected 1, review brother_scanner.c"
+            else
+                log_debug "White line patch not applied (pattern not found)"
+            fi
         fi
     fi
 
