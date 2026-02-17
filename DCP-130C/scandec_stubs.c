@@ -19,6 +19,26 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+
+/* SIGSEGV handler: write crash info to stderr before dying */
+static void scandec_segfault_handler(int sig) {
+    const char msg[] = "\n[SCANDEC] FATAL: Segmentation fault (SIGSEGV) in scan backend!\n"
+                       "[SCANDEC] The crash occurred during scanning. Check BrMfc32.log for details.\n";
+    /* Use write() not fprintf() — signal-safe */
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    /* Re-raise to get the default core dump behavior */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Install signal handler on library load */
+__attribute__((constructor))
+static void scandec_init(void) {
+    signal(SIGSEGV, scandec_segfault_handler);
+    fprintf(stderr, "[SCANDEC] Library loaded (ARM native stub)\n");
+}
 
 typedef int            BOOL;
 typedef int            INT;

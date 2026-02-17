@@ -463,59 +463,33 @@ compile_arm_backend() {
     fi
     log_debug "Source extracted to: $brscan_src"
 
-    # Patch brother_scanner.c to:
-    # 1. Increase FwTempBuff to hold entire page (was only 12 lines)
-    # 2. Add debug WriteLog calls at key buffer management points
+    # Strip dead BRSANESUFFIX==1 code paths from brother_scanner.c.
+    # The source has #if BRSANESUFFIX==2 / #elif BRSANESUFFIX==1 blocks
+    # with duplicate functions (PageScan, ProcessMain, etc). We compile
+    # with -DBRSANESUFFIX=2 so the ==1 code never compiles, but removing
+    # it eliminates confusion and ensures only one code path exists.
     local scanner_c="$brscan_src/backend_src/brother_scanner.c"
     if [[ -f "$scanner_c" ]]; then
-        local patch_count=0
-
-        # Patch 1: Increase dwFwTempBuffMaxSize to hold the full page.
-        # Original: dwFwTempBuffMaxSize = ScanAreaByte.lWidth * 6  (only 12 lines after *2)
-        # Changed:  dwFwTempBuffMaxSize = ScanAreaByte.lWidth * ScanAreaByte.lHeight
-        # This prevents buffer overflow when white lines consume space.
-        if grep -q 'ScanAreaByte\.lWidth \* 6' "$scanner_c"; then
-            sed -i 's/ScanAreaByte\.lWidth \* 6/ScanAreaByte.lWidth * this->scanInfo.ScanAreaByte.lHeight/g' "$scanner_c"
-            log_debug "Patch: increased FwTempBuff to full page size"
-            patch_count=$((patch_count + 1))
-        fi
-
-        # Patch 2: Count white line bytes in FwTempBuffLength.
-        # White lines advance lpFwBuf but don't increment *lpFwBufcnt,
-        # causing memmove to miss the actual data. Now safe because
-        # the buffer is large enough to hold the entire page.
-        if ! grep -q 'lpFwBufcnt.*ScanAreaByte.*White line fix' "$scanner_c"; then
-            awk '
-            /White line/ && !patched { in_white=1 }
-            in_white && /lpFwBuf \+=.*ScanAreaByte/ && !patched {
-                print
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, RSTART, RLENGTH)
-                print indent "*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth; // White line fix"
-                patched=1; in_white=0; next
-            }
-            { print }
-            ' "$scanner_c" > "${scanner_c}.patched"
-            if [[ $? -eq 0 ]] && [[ -s "${scanner_c}.patched" ]]; then
-                mv "${scanner_c}.patched" "$scanner_c"
-                log_debug "Patch: white lines now counted in FwTempBuffLength"
-                patch_count=$((patch_count + 1))
-            fi
+        # Use the C preprocessor to resolve the #if/#elif blocks
+        # This strips the BRSANESUFFIX==1 sections completely
+        local line_count_before
+        line_count_before=$(wc -l < "$scanner_c")
+        awk '
+        /^#elif.*BRSANESUFFIX == 1/ { skip=1; next }
+        /^#else.*BRSANESUFFIX/      { skip=1; next }
+        /^#endif.*BRSANESUFFIX/     { skip=0; next }
+        /^#if.*BRSANESUFFIX == 2/   { next }
+        !skip { print }
+        ' "$scanner_c" > "${scanner_c}.stripped"
+        if [[ -s "${scanner_c}.stripped" ]]; then
+            mv "${scanner_c}.stripped" "$scanner_c"
+            local line_count_after
+            line_count_after=$(wc -l < "$scanner_c")
+            log_debug "Stripped BRSANESUFFIX==1 dead code: $line_count_before → $line_count_after lines"
         else
-            log_debug "White line patch already applied"
+            rm -f "${scanner_c}.stripped"
+            log_debug "Strip failed, compiling with original source"
         fi
-
-        # Patch 3: Add debug WriteLog calls at key points in PageScan.
-        # Insert after "PageScan FwTempBuffLength" log to show lpFwLen.
-        if ! grep -q 'ARMFIX_DEBUG' "$scanner_c"; then
-            sed -i '/PageScan FwTempBuffLength/a\\tWriteLog( "ARMFIX_DEBUG lpFwLen=%d FwTempBuffLength=%d dwFwTempBuffMaxSize=%d", *lpFwLen, FwTempBuffLength, dwFwTempBuffMaxSize );' "$scanner_c"
-            # Also add debug after ProcessMain call to show the result
-            sed -i '/ProcessMain End dwRxTempBuffLength/a\\tWriteLog( "ARMFIX_DEBUG post-ProcessMain FwTempBuffLength=%d lRealY=%ld", FwTempBuffLength, lRealY );' "$scanner_c"
-            log_debug "Patch: added ARMFIX_DEBUG WriteLog calls"
-            patch_count=$((patch_count + 1))
-        fi
-
-        log_debug "Applied $patch_count source patches to brother_scanner.c"
     fi
 
     # Check for required headers
@@ -909,7 +883,8 @@ test_scan() {
 
             log_info "Performing test scan with device '$try_device'..."
             log_debug "Scan command: $scan_cmd ${scan_args[*]}"
-            if timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
+            # SANE_DEBUG_DLL=1 shows backend loading; stderr captures SCANDEC debug
+            if SANE_DEBUG_DLL=1 timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
                     log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
@@ -982,8 +957,8 @@ test_scan() {
                     fi
                     # Show ALL stderr on segfault (not just filtered lines)
                     if [[ $exit_code -eq 139 ]]; then
-                        log_info "Full stderr from segfaulted scan:"
-                        head -30 "$test_stderr" | while IFS= read -r line; do log_info "  $line"; done
+                        log_info "Full stderr from segfaulted scan (last 50 lines):"
+                        tail -50 "$test_stderr" | while IFS= read -r line; do log_info "  $line"; done
                     else
                         # Show only the scanimage error, not SANE debug noise
                         local scan_err
