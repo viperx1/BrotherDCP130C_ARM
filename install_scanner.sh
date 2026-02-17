@@ -426,15 +426,8 @@ compile_arm_backend() {
     local src_dir="$TMP_DIR/brscan2-src"
     local build_dir="$TMP_DIR/arm_build"
 
-    # Check if native backend already works
-    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]]; then
-        local arch
-        arch=$(file -b /usr/lib/sane/libsane-brother2.so.1.0.7 2>/dev/null || true)
-        if echo "$arch" | grep -qi "ARM\|aarch64"; then
-            log_debug "Native ARM SANE backend already installed"
-            return 0
-        fi
-    fi
+    # Always recompile to pick up stub fixes (compilation is fast)
+    log_debug "Will compile/recompile native ARM SANE backend"
 
     # Check for compiler
     if ! command -v gcc &>/dev/null; then
@@ -596,26 +589,28 @@ void ScanDecSetTblHandle(HANDLE h1, HANDLE h2) { (void)h1; (void)h2; }
 BOOL ScanDecPageStart(void) { return TRUE; }
 DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
     if (!w || !w->pLineData || !w->pWriteBuff) { if(st) *st=-1; return 0; }
-    DWORD n = 0;
+    DWORD outLine = g_open.dwOutLineByte;
+    if (outLine == 0 || outLine > w->dwWriteBuffSize) { if(st) *st=0; return 0; }
+    /* Always output exactly one line of dwOutLineByte bytes */
+    memset(w->pWriteBuff, 0, outLine);  /* zero-fill first */
+    DWORD src = 0;
     switch (w->nInDataComp) {
         case SCIDC_WHITE:
-            n = g_open.dwOutLineByte;
-            if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
-            memset(w->pWriteBuff, 0xFF, n); break;
+            memset(w->pWriteBuff, 0xFF, outLine); break;
         case SCIDC_NONCOMP:
-            n = w->dwLineDataSize;
-            if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
-            memcpy(w->pWriteBuff, w->pLineData, n); break;
+            src = w->dwLineDataSize;
+            if (src > outLine) src = outLine;
+            memcpy(w->pWriteBuff, w->pLineData, src); break;
         case SCIDC_PACK:
-            n = decode_packbits(w->pLineData, w->dwLineDataSize,
-                                w->pWriteBuff, w->dwWriteBuffSize); break;
+            decode_packbits(w->pLineData, w->dwLineDataSize,
+                            w->pWriteBuff, outLine); break;
         default:
-            n = w->dwLineDataSize;
-            if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
-            memcpy(w->pWriteBuff, w->pLineData, n); break;
+            src = w->dwLineDataSize;
+            if (src > outLine) src = outLine;
+            memcpy(w->pWriteBuff, w->pLineData, src); break;
     }
-    if (st) *st = (n > 0) ? 1 : 0;
-    return n;
+    if (st) *st = 1;
+    return outLine;
 }
 DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) { (void)w; if(st) *st=0; return 0; }
 BOOL ScanDecClose(void) { memset(&g_open, 0, sizeof(g_open)); return TRUE; }
