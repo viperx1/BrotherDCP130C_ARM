@@ -475,8 +475,8 @@ compile_arm_backend() {
         # lpFwBuf += line. Use awk for reliable multi-line matching.
         local before_count after_count
         before_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
-        # Check if already patched (lpFwBufcnt between 'White line' and next '}else')
-        if awk '/White line/{f=1} f && /lpFwBufcnt/{found=1; exit} f && /\}else/{exit} END{exit !found}' "$scanner_c" 2>/dev/null; then
+        # Check if already patched (exact lpFwBufcnt line between 'White line' and '}else')
+        if awk '/White line/{f=1} f && /\*lpFwBufcnt \+= this->scanInfo\.ScanAreaByte\.lWidth/{found=1; exit} f && /\}else/{exit} END{exit !found}' "$scanner_c" 2>/dev/null; then
             log_debug "White line patch already applied"
         else
             awk '
@@ -489,7 +489,13 @@ compile_arm_backend() {
                 patched=1; in_white=0; next
             }
             { print }
-            ' "$scanner_c" > "${scanner_c}.patched" && mv "${scanner_c}.patched" "$scanner_c"
+            ' "$scanner_c" > "${scanner_c}.patched"
+            if [[ $? -eq 0 ]] && [[ -s "${scanner_c}.patched" ]]; then
+                mv "${scanner_c}.patched" "$scanner_c"
+            else
+                log_warn "White line patch: awk or mv failed"
+                rm -f "${scanner_c}.patched"
+            fi
             after_count=$(grep -c 'lpFwBufcnt' "$scanner_c" 2>/dev/null || echo 0)
             local added=$((after_count - before_count))
             if [[ "$added" -eq 1 ]]; then
