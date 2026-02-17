@@ -99,3 +99,7 @@ teardown() {
     done
     [[ "$DEBUG" == "1" ]]
 }
+
+@test "scanner: SCRIPT_DIR is an absolute path" {
+    [[ "$SCRIPT_DIR" == /* ]]
+}

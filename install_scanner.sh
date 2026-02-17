@@ -42,6 +42,7 @@ log_debug() {
 }
 
 # Variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCANNER_MODEL="DCP-130C"
 SCANNER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_scanner_install"
@@ -462,6 +463,27 @@ compile_arm_backend() {
     fi
     log_debug "Source extracted to: $brscan_src"
 
+    # Patch brother_scanner.c: white lines in ProcessMain advance lpFwBuf
+    # but don't increment *lpFwBufcnt (FwTempBuffLength). This causes the
+    # output buffer to have data at high offsets but memmove only copies
+    # FwTempBuffLength bytes (all zeros from leading white lines).
+    # Fix: count white line bytes in *lpFwBufcnt so memmove copies them.
+    local scanner_c="$brscan_src/backend_src/brother_scanner.c"
+    if [[ -f "$scanner_c" ]]; then
+        # The white line pattern: advance lpFwBuf but don't update lpFwBufcnt
+        # Original:   lRealY++; lpFwBuf += this->scanInfo.ScanAreaByte.lWidth;
+        # Patched:    lRealY++; *lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth; lpFwBuf += ...
+        local patch_count
+        patch_count=$(grep -c 'lRealY++;' "$scanner_c" 2>/dev/null || echo 0)
+        if [[ "$patch_count" -gt 0 ]]; then
+            sed -i '/if( lpFwBuf ){/{
+                N
+                s/lRealY++;/lRealY++;\n\t\t\t\t\t*lpFwBufcnt += this->scanInfo.ScanAreaByte.lWidth;/
+            }' "$scanner_c"
+            log_debug "Patched brother_scanner.c: white lines now counted in FwTempBuffLength"
+        fi
+    fi
+
     # Check for required headers
     local sane_header=""
     for hdr_path in /usr/include/sane/sane.h "$brscan_src/include/sane/sane.h"; do
@@ -530,9 +552,7 @@ compile_arm_backend() {
 
     # Compile ARM stub for libbrscandec2 (scan data decode)
     log_info "Creating ARM scan decoder library..."
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local stub_src="$script_dir/DCP-130C/scandec_stubs.c"
+    local stub_src="$SCRIPT_DIR/DCP-130C/scandec_stubs.c"
     if [[ ! -f "$stub_src" ]]; then
         log_warn "Source file not found: $stub_src"
         return 1
@@ -546,7 +566,7 @@ compile_arm_backend() {
 
     # Compile ARM stub for libbrcolm2 (color matching — pass-through)
     log_info "Creating ARM color matching library..."
-    local colm_src="$script_dir/DCP-130C/brcolor_stubs.c"
+    local colm_src="$SCRIPT_DIR/DCP-130C/brcolor_stubs.c"
     if [[ ! -f "$colm_src" ]]; then
         log_warn "Source file not found: $colm_src"
         return 1
