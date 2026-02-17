@@ -23,6 +23,7 @@ static void backend_segfault_handler(int sig) {
                        "[BROTHER2] to trace library loading.\n";
     write(STDERR_FILENO, msg, sizeof(msg) - 1);
     struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;

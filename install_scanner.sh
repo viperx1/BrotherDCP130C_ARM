@@ -420,6 +420,34 @@ install_drivers() {
     log_info "Scanner driver config installed successfully."
 }
 
+# Check library dependencies with ldd, logging any missing libraries.
+# Usage: check_lib_deps lib1 lib2 ...
+# Returns 0 if all deps OK, 1 if any missing.
+check_lib_deps() {
+    if ! command -v ldd &>/dev/null; then
+        return 0
+    fi
+    local has_errors=0
+    for lib in "$@"; do
+        if [[ ! -f "$lib" ]]; then
+            log_warn "  $lib NOT found"
+            has_errors=1
+            continue
+        fi
+        local ldd_out
+        ldd_out=$(ldd "$lib" 2>&1 || true)
+        local missing
+        missing=$(echo "$ldd_out" | grep "not found" || true)
+        if [[ -n "$missing" ]]; then
+            log_warn "  $(basename "$lib"): MISSING deps: $missing"
+            has_errors=1
+        else
+            log_debug "  $(basename "$lib"): all dependencies OK"
+        fi
+    done
+    return "$has_errors"
+}
+
 # Compile the Brother SANE backend natively for ARM from source.
 # This produces a native ARM libsane-brother2.so that can use the real
 # USB stack directly.
@@ -667,28 +695,12 @@ compile_arm_backend() {
     log_debug "  $(file /usr/lib/libbrcolm2.so.1.0.0)"
 
     # Verify library dependencies are resolvable
-    if command -v ldd &>/dev/null; then
-        log_debug "Checking library dependencies..."
-        local ldd_errors=""
-        for lib in /usr/lib/sane/libsane-brother2.so.1.0.7 \
-                   /usr/lib/libbrscandec2.so.1.0.0 \
-                   /usr/lib/libbrcolm2.so.1.0.0; do
-            local ldd_out
-            ldd_out=$(ldd "$lib" 2>&1)
-            local missing
-            missing=$(echo "$ldd_out" | grep "not found" || true)
-            if [[ -n "$missing" ]]; then
-                log_warn "Missing dependencies for $(basename "$lib"):"
-                log_warn "  $missing"
-                ldd_errors="$ldd_errors $missing"
-            else
-                log_debug "  $(basename "$lib"): all dependencies OK"
-            fi
-        done
-        if [[ -n "$ldd_errors" ]]; then
-            log_warn "Some library dependencies are missing. The scanner backend may crash."
-            log_warn "Try: sudo apt-get install libusb-0.1-4 libsane1"
-        fi
+    log_debug "Checking library dependencies..."
+    if ! check_lib_deps /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                        /usr/lib/libbrscandec2.so.1.0.0 \
+                        /usr/lib/libbrcolm2.so.1.0.0; then
+        log_warn "Some library dependencies are missing. The scanner backend may crash."
+        log_warn "Try: sudo apt-get install libusb-0.1-4 libsane1"
     fi
 
     # Verify exported symbols in stub libraries
@@ -1050,25 +1062,13 @@ except OSError as e:
 
                         # Run library dependency check on the backend
                         log_info "Checking library dependencies for crash diagnosis..."
-                        for lib in /usr/lib/sane/libsane-brother2.so.1.0.7 \
-                                   /usr/lib/libbrscandec2.so.1.0.0 \
-                                   /usr/lib/libbrcolm2.so.1.0.0; do
-                            if [[ -f "$lib" ]]; then
-                                local ldd_out
-                                ldd_out=$(ldd "$lib" 2>&1 || true)
-                                local missing
-                                missing=$(echo "$ldd_out" | grep "not found" || true)
-                                if [[ -n "$missing" ]]; then
-                                    log_warn "  $(basename "$lib"): MISSING deps: $missing"
-                                else
-                                    log_debug "  $(basename "$lib"): all deps OK"
-                                fi
-                            else
-                                log_warn "  $lib NOT found"
-                            fi
-                        done
+                        check_lib_deps /usr/lib/sane/libsane-brother2.so.1.0.7 \
+                                       /usr/lib/libbrscandec2.so.1.0.0 \
+                                       /usr/lib/libbrcolm2.so.1.0.0 || true
 
                         # Retry with LD_DEBUG to trace library loading
+                        # Retry with higher debug levels to capture more detail
+                        # (the actual scan uses DLL=1/BROTHER2=3 to reduce noise)
                         log_info "Re-running with LD_DEBUG to trace crash..."
                         local ld_debug_stderr="/tmp/brother_ld_debug.err"
                         LD_DEBUG=libs SANE_DEBUG_DLL=3 SANE_DEBUG_BROTHER2=5 \
