@@ -525,6 +525,7 @@ compile_arm_backend() {
     # (ltime%1000) is 64-bit but sprintf's %ld reads only 32 bits. This
     # misaligns the subsequent %s argument, causing strlen() to SIGSEGV
     # on a garbage pointer. Cast to (long) to match the %ld format.
+    # There is exactly one occurrence of (ltime%1000) in brother_log.c.
     local brother_log_c="$brscan_src/backend_src/brother_log.c"
     if [[ -f "$brother_log_c" ]]; then
         sed -i 's/(ltime%1000)/(long)(ltime%1000)/' "$brother_log_c"
