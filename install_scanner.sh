@@ -264,7 +264,6 @@ install_dependencies() {
         sane-utils
         "$LIBSANE"
         "$LIBUSB"
-        patchelf
         gcc
         libsane-dev
         libusb-dev
@@ -332,324 +331,92 @@ download_drivers() {
     log_info "Scanner driver downloaded successfully."
 }
 
-# Extract and modify driver for ARM architecture
-extract_and_modify_drivers() {
-    log_info "Extracting and preparing scanner driver for ARM architecture..."
-    
-    # Create working directory
-    mkdir -p brscan2_extract
-    
-    # Extract brscan2 driver
-    log_info "Extracting brscan2 driver..."
-    dpkg-deb -x brscan2.deb brscan2_extract/
-    dpkg-deb -e brscan2.deb brscan2_extract/DEBIAN
-    log_debug "brscan2 control before modification:"
-    log_debug "$(cat brscan2_extract/DEBIAN/control)"
-    
-    # Modify control file to remove architecture restrictions
-    sed -i 's/Architecture: .*/Architecture: all/' brscan2_extract/DEBIAN/control
-    
-    # Ensure maintainer scripts are executable
-    for script in preinst postinst prerm postrm; do
-        if [[ -f "brscan2_extract/DEBIAN/$script" ]]; then
-            chmod 755 "brscan2_extract/DEBIAN/$script"
-        fi
-    done
-    
-    log_debug "brscan2 control after modification:"
-    log_debug "$(cat brscan2_extract/DEBIAN/control)"
-    
-    log_info "Scanner driver prepared for ARM installation."
-}
-
-# Repackage driver
-repackage_drivers() {
-    log_info "Repackaging scanner driver for ARM architecture..."
-    
-    dpkg-deb -b brscan2_extract brscan2_arm.deb
-    
-    log_info "Scanner driver repackaged successfully."
-}
-
-# Install scanner driver
+# Install scanner driver config and set up brsaneconfig2
 install_drivers() {
-    log_info "Installing scanner driver..."
-    
-    # Clean up any broken dpkg state from previous failed installs
-    if dpkg -s brscan2 &>/dev/null && dpkg -s brscan2 2>/dev/null | grep -q "needs to be reinstalled\|half-installed\|half-configured"; then
-        log_warn "Cleaning up broken brscan2 package state from previous install..."
-        sudo dpkg --remove --force-remove-reinstreq brscan2 2>/dev/null || true
-    fi
-    
-    # Install brscan2 driver
-    log_info "Installing brscan2 driver..."
-    log_debug "brscan2 package: $(ls -lh brscan2_arm.deb)"
-    if ! sudo dpkg -i --force-all brscan2_arm.deb; then
-        log_warn "brscan2 driver installation reported errors, attempting to fix dependencies..."
-    fi
-    
-    # Fix any dependency issues
-    log_debug "Running apt-get install -f to fix dependencies..."
-    sudo apt-get install -f -y || true
+    log_info "Installing scanner driver config files..."
 
-    # Create SONAME symlinks for Brother SANE shared libraries.
-    # The brscan2 package installs versioned libraries like
-    #   libsane-brother2.so.1.0.7
-    #   libbrscandec2.so.1.0.0
-    #   libbrcolm2.so.1.0.0
-    # but SANE's dlopen() looks for the SONAME (e.g. libsane-brother2.so.1).
-    # Without these symlinks, SANE cannot load the brother2 backend.
-    log_info "Creating SANE backend symlinks..."
-    local symlinks_created=0
-    for lib_dir in /usr/lib/sane /usr/lib; do
-        if [[ -d "$lib_dir" ]]; then
-            while IFS= read -r -d '' lib_file; do
-                local lib_base
-                lib_base=$(basename "$lib_file")
-                # Extract SONAME: e.g. libsane-brother2.so.1.0.7 → libsane-brother2.so.1
-                local soname
-                soname=$(echo "$lib_base" | sed -n 's/^\(lib[^.]*\.so\.[0-9]*\)\..*/\1/p')
-                if [[ -n "$soname" && "$soname" != "$lib_base" ]]; then
-                    local symlink_path="${lib_dir}/${soname}"
-                    if [[ ! -e "$symlink_path" ]]; then
-                        sudo ln -sf "$lib_base" "$symlink_path"
-                        symlinks_created=$((symlinks_created + 1))
-                        log_debug "Created symlink: $symlink_path -> $lib_base"
-                    else
-                        log_debug "Symlink already exists: $symlink_path"
-                    fi
-                fi
-            done < <(find "$lib_dir" -maxdepth 1 -type f \
-                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
-                         -print0 2>/dev/null)
+    # Extract only config files and brsaneconfig2 from the deb.
+    # We compile the SANE backend natively for ARM, so the i386 .so
+    # files from the deb are not needed.
+    local extract_dir="$TMP_DIR/brscan2_files"
+    mkdir -p "$extract_dir"
+    dpkg-deb -x brscan2.deb "$extract_dir"
+
+    # Install config files and brsaneconfig2
+    if [[ -d "$extract_dir/usr/local/Brother/sane" ]]; then
+        sudo mkdir -p /usr/local/Brother/sane
+        # Copy config files, calibration data, model info, brsaneconfig2
+        sudo cp -a "$extract_dir/usr/local/Brother/sane/"* /usr/local/Brother/sane/
+        log_info "Installed Brother scanner config files to /usr/local/Brother/sane/"
+        log_debug "Contents: $(ls /usr/local/Brother/sane/ 2>/dev/null)"
+    else
+        log_error "Brother config files not found in deb package"
+        return 1
+    fi
+
+    # Create brsaneconfig2 symlink in PATH
+    if [[ -x /usr/local/Brother/sane/brsaneconfig2 ]]; then
+        sudo ln -sf /usr/local/Brother/sane/brsaneconfig2 /usr/bin/brsaneconfig2
+        log_debug "Created symlink: /usr/bin/brsaneconfig2"
+    fi
+
+    # Set up i386 support for brsaneconfig2 (the only i386 binary we need)
+    if file -b /usr/local/Brother/sane/brsaneconfig2 2>/dev/null | grep -qi "Intel 80386\|i386"; then
+        log_info "Setting up i386 support for brsaneconfig2..."
+
+        if ! dpkg -s qemu-user-static &>/dev/null; then
+            log_info "Installing qemu-user-static..."
+            sudo apt-get install -y qemu-user-static 2>&1 | tail -3
         fi
-    done
-    if [[ $symlinks_created -gt 0 ]]; then
-        log_info "Created $symlinks_created SANE backend symlinks."
-        sudo ldconfig 2>/dev/null || true
-    else
-        log_debug "All SANE backend symlinks already in place."
-    fi
 
-    # Clear the executable stack flag from Brother shared libraries.
-    # The Brother brscan2 .so files have PT_GNU_STACK with execute permission,
-    # which modern kernels (6.12+) block via dlopen() with:
-    #   "cannot enable executable stack as shared object requires: Invalid argument"
-    # Clearing this flag is safe — the libraries don't actually need executable stack.
-    if command -v patchelf &>/dev/null; then
-        log_info "Clearing executable stack flag from Brother scanner libraries..."
-        for lib_dir in /usr/lib/sane /usr/lib; do
-            while IFS= read -r -d '' lib_file; do
-                if patchelf --print-execstack "$lib_file" 2>/dev/null | grep -q "X"; then
-                    sudo patchelf --clear-execstack "$lib_file"
-                    log_debug "Cleared execstack: $lib_file"
-                fi
-            done < <(find "$lib_dir" -maxdepth 1 -type f \
-                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
-                         -print0 2>/dev/null)
-        done
-    else
-        log_warn "patchelf not found — cannot clear executable stack flag from Brother libraries."
-        log_warn "On kernels 6.12+, SANE may fail to load the Brother backend."
-    fi
+        # Provide i386 dynamic linker if missing
+        if [[ ! -f /lib/ld-linux.so.2 ]] || [[ ! -f /lib/i386-linux-gnu/libc.so.6 ]]; then
+            log_info "Downloading i386 libc for brsaneconfig2..."
+            local i386_tmp
+            i386_tmp=$(mktemp -d)
+            local libc6_url="https://deb.debian.org/debian/pool/main/g/glibc/"
+            local libc6_filename
+            libc6_filename=$(wget -q -O - "$libc6_url" 2>/dev/null \
+                | grep -oP 'libc6_[0-9][0-9.~+-]*_i386\.deb' \
+                | sort -V | tail -1)
 
-    # Check if the Brother SANE binaries can execute on this architecture.
-    # The driver is compiled for i386 — brsaneconfig2 and the SANE shared
-    # libraries are i386 ELF binaries that need binfmt_misc/qemu-user-static
-    # to run on ARM.
-    #
-    # can_execute_binary: test if a single executable can run on this system.
-    # Uses a timeout to prevent hangs from binaries that block.
-    # NOTE: Only use on actual executables, NOT on shared libraries (.so).
-    can_execute_binary() {
-        local f="$1"
-        timeout 5 "$f" --version &>/dev/null || timeout 5 "$f" --help &>/dev/null || timeout 5 "$f" &>/dev/null
-    }
-
-    log_debug "Scanning for Brother scanner i386 binaries..."
-    local i386_binaries_found=0
-    local i386_binaries_failed=0
-    local i386_libs_found=0
-    # Only search Brother-specific directories and files — avoid scanning
-    # broad system directories like /usr/lib/ which contain thousands of
-    # unrelated files and would cause the script to hang for minutes.
-    while IFS= read -r -d '' bin_file; do
-        local bin_type
-        bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
-        if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
-            # Shared libraries (.so) cannot be executed directly — only test
-            # actual executables. Shared libraries are loaded by SANE at runtime.
-            if echo "$bin_type" | grep -qi "shared object"; then
-                i386_libs_found=$((i386_libs_found + 1))
-                log_debug "i386 shared library: $bin_file (skipping execution test)"
-            else
-                i386_binaries_found=$((i386_binaries_found + 1))
-                log_debug "i386 executable: $bin_file"
-                if ! can_execute_binary "$bin_file"; then
-                    i386_binaries_failed=$((i386_binaries_failed + 1))
-                    log_debug "  -> FAILED to execute"
-                else
-                    log_debug "  -> executes OK"
+            if [[ -n "$libc6_filename" ]]; then
+                if wget -q --timeout=30 -O "$i386_tmp/libc6.deb" "${libc6_url}${libc6_filename}" 2>/dev/null; then
+                    dpkg-deb -x "$i386_tmp/libc6.deb" "$i386_tmp/extract/" 2>/dev/null
+                    local ld_linux
+                    ld_linux=$(find "$i386_tmp/extract/" \( -name 'ld-linux.so.2' -o -name 'ld-linux*.so*' \) 2>/dev/null | head -1)
+                    [[ -n "$ld_linux" ]] && sudo cp "$ld_linux" /lib/ld-linux.so.2 && sudo chmod 755 /lib/ld-linux.so.2
+                    local i386_lib_dir
+                    i386_lib_dir=$(find "$i386_tmp/extract/" -type d -name 'i386-linux-gnu' 2>/dev/null | head -1)
+                    if [[ -n "$i386_lib_dir" ]]; then
+                        sudo mkdir -p /lib/i386-linux-gnu
+                        sudo cp -a "${i386_lib_dir}/"* /lib/i386-linux-gnu/ 2>/dev/null || true
+                    fi
+                    if ! grep -qsF 'i386-linux-gnu' /etc/ld.so.conf.d/i386-linux-gnu.conf 2>/dev/null; then
+                        printf "/lib/i386-linux-gnu\n/usr/lib/i386-linux-gnu\n" | sudo tee /etc/ld.so.conf.d/i386-linux-gnu.conf > /dev/null
+                    fi
+                    sudo ldconfig 2>/dev/null || true
+                    log_info "Installed i386 libraries for brsaneconfig2."
                 fi
             fi
+            rm -rf "$i386_tmp"
         fi
-    done < <(find /usr/local/Brother/sane/ -type f -print0 2>/dev/null
-             find /usr/lib/sane/ /usr/lib/ -maxdepth 1 -type f \
-                 \( -name '*brsane*' -o -name '*brcolm*' -o -name '*brscandec*' -o -name '*brother*' \) \
-                 -print0 2>/dev/null)
-    log_debug "Binary scan complete: $i386_binaries_found executables ($i386_binaries_failed failed), $i386_libs_found shared libraries"
 
-    # i386 support is needed if any executables failed OR if there are i386
-    # shared libraries (which SANE dynamically loads and need qemu + i386 libc)
-    local need_i386_support=0
-    if [[ $i386_binaries_found -gt 0 || $i386_libs_found -gt 0 ]]; then
-        if [[ $i386_binaries_failed -gt 0 ]]; then
-            log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 executables cannot run on this ARM system."
-            need_i386_support=1
-        elif [[ $i386_libs_found -gt 0 ]]; then
-            log_debug "Found $i386_libs_found i386 shared libraries that need i386 runtime support"
-            need_i386_support=1
+        # Fix Raspberry Pi /etc/ld.so.preload for i386 compatibility
+        if [[ -f /etc/ld.so.preload ]] && grep -q 'libarmmem' /etc/ld.so.preload 2>/dev/null; then
+            sudo sed -i 's|^[[:space:]]*/usr/lib/arm-linux-gnueabihf/libarmmem|# Commented for i386 compat: /usr/lib/arm-linux-gnueabihf/libarmmem|' /etc/ld.so.preload
+            log_debug "Commented out libarmmem preload for i386 compatibility"
+        fi
+
+        # Verify brsaneconfig2 can execute
+        if timeout 5 /usr/local/Brother/sane/brsaneconfig2 -q &>/dev/null; then
+            log_info "brsaneconfig2 executes successfully."
         else
-            log_info "All Brother i386 executables run successfully on this ARM system."
+            log_warn "brsaneconfig2 cannot execute. Scanner configuration may fail."
         fi
-
-        if [[ $need_i386_support -eq 1 ]]; then
-            log_info "Setting up i386 binary support..."
-
-            # Step 1: Ensure qemu-user-static is installed for binfmt_misc i386 emulation
-            if ! dpkg -s qemu-user-static &>/dev/null; then
-                log_info "Installing qemu-user-static..."
-                sudo apt-get install -y qemu-user-static 2>&1 | tail -3
-            else
-                log_debug "qemu-user-static is already installed"
-            fi
-
-            # Step 2: Provide the i386 dynamic linker (/lib/ld-linux.so.2)
-            # On Raspberry Pi OS (armhf), libc6:i386 is not available via apt
-            # because i386 repos don't exist. We download it directly from
-            # Debian mirrors and extract the needed files.
-            if [[ ! -f /lib/ld-linux.so.2 ]] || [[ ! -f /lib/i386-linux-gnu/libc.so.6 ]]; then
-                log_info "i386 libraries missing. Downloading from Debian mirrors..."
-                log_debug "ld-linux.so.2 exists: $(test -f /lib/ld-linux.so.2 && echo yes || echo no)"
-                log_debug "libc.so.6 exists: $(test -f /lib/i386-linux-gnu/libc.so.6 && echo yes || echo no)"
-                local i386_tmp
-                i386_tmp=$(mktemp -d)
-                local libc6_deb="${i386_tmp}/libc6_i386.deb"
-                local libc6_url="https://deb.debian.org/debian/pool/main/g/glibc/"
-
-                # Find the latest libc6 i386 deb from Debian pool
-                local libc6_filename
-                libc6_filename=$(wget -q -O - "$libc6_url" 2>/dev/null \
-                    | grep -oP 'libc6_[0-9][0-9.~+-]*_i386\.deb' \
-                    | sort -V | tail -1)
-
-                if [[ -n "$libc6_filename" ]]; then
-                    log_debug "Downloading: ${libc6_url}${libc6_filename}"
-                    if wget -q --timeout=30 -O "$libc6_deb" "${libc6_url}${libc6_filename}" 2>/dev/null; then
-                        log_debug "Extracting i386 libraries..."
-                        dpkg-deb -x "$libc6_deb" "${i386_tmp}/extract/" 2>/dev/null
-                        if [[ "$DEBUG" == "1" ]]; then
-                            log_debug "Extracted directories: $(find "${i386_tmp}/extract/" -maxdepth 4 -type d 2>/dev/null | head -20)"
-                        fi
-                        # Copy ld-linux.so.2 to /lib/
-                        local ld_linux
-                        ld_linux=$(find "${i386_tmp}/extract/" \( -name 'ld-linux.so.2' -o -name 'ld-linux*.so*' \) 2>/dev/null | head -1)
-                        if [[ -n "$ld_linux" ]]; then
-                            sudo cp "$ld_linux" /lib/ld-linux.so.2
-                            sudo chmod 755 /lib/ld-linux.so.2
-                            log_info "Installed i386 dynamic linker: /lib/ld-linux.so.2"
-                        fi
-                        # Find and copy i386 libs
-                        local i386_lib_dir
-                        i386_lib_dir=$(find "${i386_tmp}/extract/" -type d -name 'i386-linux-gnu' 2>/dev/null | head -1)
-                        if [[ -n "$i386_lib_dir" ]]; then
-                            log_debug "Found i386 lib directory: $i386_lib_dir"
-                            sudo mkdir -p /lib/i386-linux-gnu
-                            sudo cp -a "${i386_lib_dir}/"* /lib/i386-linux-gnu/ 2>/dev/null || true
-                            log_debug "Copied i386 libs to /lib/i386-linux-gnu/"
-                        else
-                            log_debug "No i386-linux-gnu directory found, searching for libc.so.6 directly..."
-                            local libc_so
-                            libc_so=$(find "${i386_tmp}/extract/" \( -name 'libc.so.6' -o -name 'libc-*.so' \) 2>/dev/null | head -1)
-                            if [[ -n "$libc_so" ]]; then
-                                local libc_dir
-                                libc_dir=$(dirname "$libc_so")
-                                log_debug "Found libc.so.6 at: $libc_so (dir: $libc_dir)"
-                                sudo mkdir -p /lib/i386-linux-gnu
-                                sudo cp -a "${libc_dir}/"*.so* /lib/i386-linux-gnu/ 2>/dev/null || true
-                                log_debug "Copied i386 libs from $libc_dir to /lib/i386-linux-gnu/"
-                            else
-                                log_warn "Could not find libc.so.6 anywhere in extracted package"
-                            fi
-                        fi
-                        # Verify libc.so.6 was installed
-                        if [[ -f /lib/i386-linux-gnu/libc.so.6 ]]; then
-                            log_info "Installed i386 libc: /lib/i386-linux-gnu/libc.so.6"
-                        else
-                            log_warn "libc.so.6 not found at /lib/i386-linux-gnu/libc.so.6 after extraction"
-                        fi
-                        # Register i386 library paths with the dynamic linker
-                        if ! grep -qsF 'i386-linux-gnu' /etc/ld.so.conf.d/i386-linux-gnu.conf 2>/dev/null; then
-                            printf "/lib/i386-linux-gnu\n/usr/lib/i386-linux-gnu\n" | sudo tee /etc/ld.so.conf.d/i386-linux-gnu.conf > /dev/null
-                            log_debug "Registered i386 library paths in ld.so.conf.d"
-                        fi
-                        sudo ldconfig 2>/dev/null || true
-                        log_debug "Ran ldconfig to update library cache"
-                    else
-                        log_warn "Could not download libc6 i386 from Debian mirrors."
-                    fi
-                else
-                    log_warn "Could not find libc6 i386 package in Debian pool."
-                fi
-                rm -rf "$i386_tmp"
-            else
-                log_debug "i386 libraries already present: /lib/ld-linux.so.2 and /lib/i386-linux-gnu/libc.so.6"
-            fi
-
-            # Fix Raspberry Pi /etc/ld.so.preload that causes errors under qemu-user-static.
-            if [[ -f /etc/ld.so.preload ]] && grep -q 'libarmmem' /etc/ld.so.preload 2>/dev/null; then
-                log_info "Fixing /etc/ld.so.preload for i386 compatibility..."
-                sudo sed -i 's|^[[:space:]]*/usr/lib/arm-linux-gnueabihf/libarmmem|# Commented for i386 compat: /usr/lib/arm-linux-gnueabihf/libarmmem|' /etc/ld.so.preload
-                log_debug "Commented out libarmmem preload to prevent i386 binary errors"
-            fi
-
-            # Re-check executables after installing i386 support
-            log_info "Re-checking executables..."
-            local recheck_failed=0
-            while IFS= read -r -d '' bin_file; do
-                local bin_type
-                bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
-                if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
-                    # Skip shared libraries — only test executables
-                    if echo "$bin_type" | grep -qi "shared object"; then
-                        continue
-                    fi
-                    if ! can_execute_binary "$bin_file"; then
-                        recheck_failed=$((recheck_failed + 1))
-                        local run_err
-                        run_err=$(timeout 5 "$bin_file" 2>&1 || true)
-                        log_debug "Still fails: $bin_file"
-                        log_debug "  Error: ${run_err:-<no output>}"
-                    fi
-                fi
-            done < <(find /usr/local/Brother/sane/ -type f -print0 2>/dev/null
-                     find /usr/lib/sane/ /usr/lib/ -maxdepth 1 -type f \
-                         \( -name '*brsane*' -o -name '*brcolm*' -o -name '*brscandec*' -o -name '*brother*' \) \
-                         -print0 2>/dev/null)
-            if [[ $recheck_failed -gt 0 ]]; then
-                log_warn "$recheck_failed executables still can't run. Scanning may not work."
-                log_warn "The Brother i386 binaries need additional i386 libraries."
-                log_warn "Check: file /usr/local/Brother/sane/brsaneconfig2"
-                log_warn "Then run the binary directly to see what libraries are missing."
-            else
-                log_info "All Brother executables now run successfully."
-            fi
-        fi
-    else
-        log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
     fi
 
-    log_info "Scanner driver installed successfully."
+    log_info "Scanner driver config installed successfully."
 }
 
 # Compile the Brother SANE backend natively for ARM from source.
@@ -814,7 +581,11 @@ static DWORD decode_packbits(const BYTE *in, DWORD inLen, BYTE *out, DWORD outMa
 BOOL ScanDecOpen(SCANDEC_OPEN *p) {
     if (!p) return FALSE;
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
-    int bpp = (p->nColorType & 0x0400) ? 3 : 1;
+    /* Determine bytes per pixel based on nColorType bit depth flags */
+    DWORD bpp;
+    if (p->nColorType & 0x0400)       bpp = 3;  /* SC_24BIT: RGB */
+    else if (p->nColorType & 0x0200)  bpp = 1;  /* SC_8BIT: gray */
+    else                              bpp = 1;  /* SC_2BIT: B&W — decode expands to 8-bit */
     p->dwOutLineByte = p->dwOutLinePixCnt * bpp;
     if (p->bLongBoundary) p->dwOutLineByte = (p->dwOutLineByte + 3) & ~3UL;
     p->dwOutWriteMaxSize = p->dwOutLineByte * 16;
@@ -1200,6 +971,10 @@ test_scan() {
                     all_invalid_arg=false
                 else
                     log_warn "Test scan with '$try_device' failed (exit code: $exit_code)."
+                    if [[ $exit_code -eq 139 ]]; then
+                        log_warn "Segmentation fault detected in scan backend."
+                        log_warn "Check /usr/local/Brother/sane/BrMfc32.log for details."
+                    fi
                 fi
                 if [[ -s "$test_stderr" ]]; then
                     local err_text
@@ -1214,10 +989,9 @@ test_scan() {
                         log_debug "Device '$try_device' returned 'Invalid argument'"
                         # Try the next device
                         continue
-                    else
-                        all_invalid_arg=false
                     fi
                 fi
+                all_invalid_arg=false
             fi
             # Non-"Invalid argument" failure — stop trying
             break
@@ -1227,6 +1001,16 @@ test_scan() {
             if $all_invalid_arg; then
                 log_warn "All scan devices returned 'Invalid argument'."
             fi
+
+            # Show Brother backend debug log if available
+            local brother_log="/usr/local/Brother/sane/BrMfc32.log"
+            if [[ -f "$brother_log" ]]; then
+                log_info "Brother backend log (last 30 lines):"
+                tail -30 "$brother_log" | while IFS= read -r line; do
+                    log_info "  $line"
+                done
+            fi
+
             log_info "Try manually: sudo $scan_cmd -d '${scan_devices[0]:-brother2:bus1;dev1}' --format=pnm > scan.pnm"
         fi
         rm -f "$test_stderr"
@@ -1290,8 +1074,6 @@ main() {
     install_dependencies
     create_temp_dir
     download_drivers
-    extract_and_modify_drivers
-    repackage_drivers
     install_drivers
 
     # Compile native ARM SANE backend (direct USB access).
