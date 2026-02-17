@@ -26,18 +26,28 @@
 static void scandec_segfault_handler(int sig) {
     const char msg[] = "\n[SCANDEC] FATAL: Segmentation fault (SIGSEGV) in scan backend!\n"
                        "[SCANDEC] The crash occurred during scanning. Check BrMfc32.log for details.\n";
-    /* Use write() not fprintf() — signal-safe */
+    /* Use write() not fprintf() — async-signal-safe */
     write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    /* Re-raise to get the default core dump behavior */
-    signal(sig, SIG_DFL);
+    /* Restore default handler and re-raise for core dump */
+    struct sigaction sa;
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(sig, &sa, NULL);
     raise(sig);
 }
 
 /* Install signal handler on library load */
 __attribute__((constructor))
 static void scandec_init(void) {
-    signal(SIGSEGV, scandec_segfault_handler);
-    fprintf(stderr, "[SCANDEC] Library loaded (ARM native stub)\n");
+    struct sigaction sa;
+    sa.sa_handler = scandec_segfault_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, NULL);
+    /* Use write() for signal-safe consistency */
+    const char msg[] = "[SCANDEC] Library loaded (ARM native stub)\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
 }
 
 typedef int            BOOL;
