@@ -531,9 +531,10 @@ compile_arm_backend() {
     # Create ARM stub for libbrscandec2 (scan data decompression)
     log_info "Creating ARM scan decoder library..."
     cat > "$build_dir/libbrscandec2_stub.c" << 'SCANDEC_EOF'
-/* ARM stub for libbrscandec2 — scan data decompression (PackBits etc.) */
+/* ARM stub for libbrscandec2 — scan data decode (PackBits decompression) */
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 typedef int BOOL; typedef unsigned char BYTE; typedef unsigned long DWORD;
 typedef int INT; typedef void *HANDLE;
 #define TRUE 1
@@ -552,6 +553,8 @@ typedef struct {
     BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
 } SCANDEC_WRITE;
 static SCANDEC_OPEN g_open;
+static int g_write_count = 0;
+static int g_nonzero_lines = 0;
 static DWORD decode_packbits(const BYTE *in, DWORD inLen, BYTE *out, DWORD outMax) {
     DWORD iP=0, oP=0;
     while (iP < inLen && oP < outMax) {
@@ -572,48 +575,73 @@ static DWORD decode_packbits(const BYTE *in, DWORD inLen, BYTE *out, DWORD outMa
     return oP;
 }
 BOOL ScanDecOpen(SCANDEC_OPEN *p) {
-    if (!p) return FALSE;
+    if (!p) { fprintf(stderr, "SCANDEC: ScanDecOpen called with NULL\n"); return FALSE; }
+    g_write_count = 0;
+    g_nonzero_lines = 0;
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
-    /* Determine bytes per pixel based on nColorType bit depth flags */
     DWORD bpp;
     if (p->nColorType & 0x0400)       bpp = 3;  /* SC_24BIT: RGB */
     else if (p->nColorType & 0x0200)  bpp = 1;  /* SC_8BIT: gray */
-    else                              bpp = 1;  /* SC_2BIT: B&W — decode expands to 8-bit */
+    else                              bpp = 1;  /* SC_2BIT: B&W → 8-bit */
     p->dwOutLineByte = p->dwOutLinePixCnt * bpp;
     if (p->bLongBoundary) p->dwOutLineByte = (p->dwOutLineByte + 3) & ~3UL;
     p->dwOutWriteMaxSize = p->dwOutLineByte * 16;
     memcpy(&g_open, p, sizeof(*p));
+    fprintf(stderr, "SCANDEC: ScanDecOpen nColorType=0x%x dwInLinePixCnt=%lu bpp=%lu dwOutLineByte=%lu dwOutWriteMaxSize=%lu bLongBoundary=%d\n",
+            p->nColorType, p->dwInLinePixCnt, bpp, p->dwOutLineByte, p->dwOutWriteMaxSize, p->bLongBoundary);
     return TRUE;
 }
 void ScanDecSetTblHandle(HANDLE h1, HANDLE h2) { (void)h1; (void)h2; }
-BOOL ScanDecPageStart(void) { return TRUE; }
+BOOL ScanDecPageStart(void) { fprintf(stderr, "SCANDEC: ScanDecPageStart\n"); return TRUE; }
 DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
-    if (!w || !w->pLineData || !w->pWriteBuff) { if(st) *st=-1; return 0; }
+    if (!w || !w->pLineData || !w->pWriteBuff) {
+        fprintf(stderr, "SCANDEC: ScanDecWrite NULL ptrs w=%p pLineData=%p pWriteBuff=%p\n",
+                (void*)w, w ? (void*)w->pLineData : NULL, w ? (void*)w->pWriteBuff : NULL);
+        if(st) *st=-1; return 0;
+    }
     DWORD outLine = g_open.dwOutLineByte;
-    if (outLine == 0 || outLine > w->dwWriteBuffSize) { if(st) *st=0; return 0; }
-    /* Always output exactly one line of dwOutLineByte bytes */
-    memset(w->pWriteBuff, 0, outLine);  /* zero-fill first */
-    DWORD src = 0;
+    if (outLine == 0 || outLine > w->dwWriteBuffSize) {
+        fprintf(stderr, "SCANDEC: ScanDecWrite bad outLine=%lu dwWriteBuffSize=%lu\n", outLine, w->dwWriteBuffSize);
+        if(st) *st=0; return 0;
+    }
+    g_write_count++;
+    memset(w->pWriteBuff, 0, outLine);
+    DWORD decoded = 0;
     switch (w->nInDataComp) {
         case SCIDC_WHITE:
-            memset(w->pWriteBuff, 0xFF, outLine); break;
+            memset(w->pWriteBuff, 0xFF, outLine); decoded = outLine; break;
         case SCIDC_NONCOMP:
-            src = w->dwLineDataSize;
-            if (src > outLine) src = outLine;
-            memcpy(w->pWriteBuff, w->pLineData, src); break;
+            decoded = w->dwLineDataSize;
+            if (decoded > outLine) decoded = outLine;
+            memcpy(w->pWriteBuff, w->pLineData, decoded); break;
         case SCIDC_PACK:
-            decode_packbits(w->pLineData, w->dwLineDataSize,
+            decoded = decode_packbits(w->pLineData, w->dwLineDataSize,
                             w->pWriteBuff, outLine); break;
         default:
-            src = w->dwLineDataSize;
-            if (src > outLine) src = outLine;
-            memcpy(w->pWriteBuff, w->pLineData, src); break;
+            decoded = w->dwLineDataSize;
+            if (decoded > outLine) decoded = outLine;
+            memcpy(w->pWriteBuff, w->pLineData, decoded); break;
     }
+    /* Check if output has any non-zero bytes */
+    int has_data = 0;
+    for (DWORD i = 0; i < outLine && !has_data; i++)
+        if (w->pWriteBuff[i] != 0) has_data = 1;
+    if (has_data) g_nonzero_lines++;
+    /* Log first 5 calls and every 100th, plus summary at end */
+    if (g_write_count <= 5 || g_write_count % 100 == 0)
+        fprintf(stderr, "SCANDEC: ScanDecWrite #%d comp=%d kind=%d inLen=%lu decoded=%lu outLine=%lu hasData=%d pWriteBuff=%p\n",
+                g_write_count, w->nInDataComp, w->nInDataKind, w->dwLineDataSize, decoded, outLine, has_data, (void*)w->pWriteBuff);
     if (st) *st = 1;
     return outLine;
 }
-DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) { (void)w; if(st) *st=0; return 0; }
-BOOL ScanDecClose(void) { memset(&g_open, 0, sizeof(g_open)); return TRUE; }
+DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) {
+    fprintf(stderr, "SCANDEC: ScanDecPageEnd total_writes=%d nonzero_lines=%d\n", g_write_count, g_nonzero_lines);
+    (void)w; if(st) *st=0; return 0;
+}
+BOOL ScanDecClose(void) {
+    fprintf(stderr, "SCANDEC: ScanDecClose total_writes=%d nonzero_lines=%d\n", g_write_count, g_nonzero_lines);
+    memset(&g_open, 0, sizeof(g_open)); return TRUE;
+}
 SCANDEC_EOF
     gcc -shared -fPIC -O2 -w -o "$build_dir/libbrscandec2.so.1.0.0" \
         "$build_dir/libbrscandec2_stub.c" || {
@@ -951,14 +979,41 @@ test_scan() {
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
                     log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
+                    # Show SCANDEC summary on success too
+                    if [[ -s "$test_stderr" ]]; then
+                        local scandec_summary
+                        scandec_summary=$(grep "^SCANDEC:.*ScanDecClose\|^SCANDEC:.*ScanDecPageEnd" "$test_stderr" | head -2)
+                        if [[ -n "$scandec_summary" ]]; then
+                            log_debug "SCANDEC summary: $scandec_summary"
+                        fi
+                    fi
                     scan_ok=true
                     break
                 else
-                    log_warn "Test scan produced an empty file."
+                    log_warn "Test scan produced an empty file (0 bytes)."
                     all_invalid_arg=false
                     if [[ -s "$test_stderr" ]]; then
-                        log_debug "Scan stderr: $(cat "$test_stderr")"
+                        log_info "SCANDEC debug output:"
+                        grep "^SCANDEC:" "$test_stderr" | while IFS= read -r line; do
+                            log_info "  $line"
+                        done
+                        local other_err
+                        other_err=$(grep -v "^SCANDEC:" "$test_stderr" | grep -i "error\|fail\|warn\|invalid\|fault" | head -5)
+                        if [[ -n "$other_err" ]]; then
+                            log_info "Other scan errors:"
+                            echo "$other_err" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
                     fi
+                    # Show Brother backend log for diagnostics
+                    local brother_log="/usr/local/Brother/sane/BrMfc32.log"
+                    if [[ -f "$brother_log" ]]; then
+                        log_info "Brother backend log (last 30 lines):"
+                        tail -30 "$brother_log" | while IFS= read -r line; do
+                            log_info "  $line"
+                        done
+                    fi
+                    # Continue trying next device for empty output
+                    continue
                 fi
             else
                 local exit_code=$?
@@ -975,9 +1030,16 @@ test_scan() {
                 if [[ -s "$test_stderr" ]]; then
                     local err_text
                     err_text=$(cat "$test_stderr")
+                    # Show SCANDEC debug output
+                    local scandec_out
+                    scandec_out=$(echo "$err_text" | grep "^SCANDEC:" | head -20)
+                    if [[ -n "$scandec_out" ]]; then
+                        log_info "SCANDEC debug output:"
+                        echo "$scandec_out" | while IFS= read -r line; do log_info "  $line"; done
+                    fi
                     # Show only the scanimage error, not SANE debug noise
                     local scan_err
-                    scan_err=$(echo "$err_text" | grep -i "scanimage\|failed\|error\|Invalid" | head -3)
+                    scan_err=$(echo "$err_text" | grep -v "^SCANDEC:" | grep -i "scanimage\|failed\|error\|Invalid" | head -3)
                     if [[ -n "$scan_err" ]]; then
                         log_info "  $scan_err"
                     fi
