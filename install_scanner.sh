@@ -652,430 +652,9 @@ install_drivers() {
     log_info "Scanner driver installed successfully."
 }
 
-# Set up an i386 SANE environment for running scanimage on ARM.
-# The ARM SANE process cannot dlopen() i386 shared libraries (architecture
-# mismatch). The solution is to run an i386 scanimage binary via
-# qemu-i386-static, which CAN natively load the i386 Brother SANE backend.
-setup_i386_scanner() {
-    local i386_root="/opt/brother/i386"
-    local wrapper="/usr/local/bin/brother-scanimage"
-
-    # Skip only if wrapper already exists AND can run successfully, including
-    # the brother2 SANE backend loading properly via dlopen(). We must enable
-    # SANE_DEBUG_DLL=1 to make dlopen() failures visible — without it, SANE
-    # silently skips failed backends and reports "No scanners were identified"
-    # which looks like "working" when the backend actually fails to load.
-    # Also check execstack on the i386 Brother libraries — even if the wrapper
-    # binary runs fine, the backend .so may have executable stack flag set which
-    # causes dlopen() to fail on modern kernels.
-    if [[ -x "$wrapper" ]]; then
-        local needs_reinstall=false
-
-        # Check if any i386 Brother .so still has executable stack flag
-        if command -v patchelf &>/dev/null; then
-            while IFS= read -r -d '' lib_file; do
-                if patchelf --print-execstack "$lib_file" 2>/dev/null | grep -q "X"; then
-                    log_info "i386 Brother library still has executable stack: $lib_file"
-                    needs_reinstall=true
-                    break
-                fi
-            done < <(find "$i386_root/usr/lib/sane" "$i386_root/usr/lib" -maxdepth 1 -type f \
-                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
-                         -print0 2>/dev/null)
-        fi
-
-        if [[ "$needs_reinstall" != "true" ]]; then
-            # Test wrapper with SANE debug to catch dlopen failures
-            local wrapper_test
-            wrapper_test=$(SANE_DEBUG_DLL=1 "$wrapper" -L 2>&1 || true)
-            if echo "$wrapper_test" | grep -qi "error while loading shared libraries\|cannot enable executable stack\|dlopen() failed"; then
-                needs_reinstall=true
-                log_debug "Wrapper test found errors: $(echo "$wrapper_test" | grep -i 'error\|cannot\|failed')"
-            fi
-        fi
-
-        if [[ "$needs_reinstall" != "true" ]]; then
-            log_debug "brother-scanimage wrapper already exists and works: $wrapper"
-            return 0
-        fi
-        log_info "brother-scanimage wrapper exists but has issues — re-running setup..."
-    fi
-
-    log_info "Setting up i386 scanner environment for ARM..."
-    log_info "ARM SANE cannot load i386 backend libraries via dlopen()."
-    log_info "Installing i386 scanimage to run through qemu-i386-static..."
-
-    # Ensure qemu-i386-static is available
-    local qemu_bin
-    qemu_bin=$(command -v qemu-i386-static 2>/dev/null || true)
-    if [[ -z "$qemu_bin" ]]; then
-        qemu_bin=$(find /usr/libexec/qemu-binfmt/ /usr/bin/ /usr/local/bin/ -name 'qemu-i386*' -type f -executable 2>/dev/null | head -1)
-    fi
-    if [[ -z "$qemu_bin" ]]; then
-        log_warn "qemu-i386-static not found. Cannot set up i386 scanner environment."
-        log_warn "Install qemu-user-static and re-run this script."
-        return 1
-    fi
-    log_debug "qemu binary: $qemu_bin"
-
-    # Create i386 root
-    sudo mkdir -p "$i386_root"
-
-    # Download i386 sane-utils from Debian pool
-    local i386_tmp
-    i386_tmp=$(mktemp -d)
-    local pool_url="https://deb.debian.org/debian/pool/main"
-
-    # Download i386 sane-utils (contains scanimage)
-    log_info "Downloading i386 sane-utils..."
-    local sane_utils_filename
-    sane_utils_filename=$(wget -q -O - "${pool_url}/s/sane-backends/" 2>/dev/null \
-        | grep -oP 'sane-utils_[0-9][0-9.~+-]*_i386\.deb' \
-        | sort -V | tail -1)
-    if [[ -z "$sane_utils_filename" ]]; then
-        log_warn "Could not find i386 sane-utils in Debian pool."
-        rm -rf "$i386_tmp"
-        return 1
-    fi
-    log_debug "Found: $sane_utils_filename"
-    if ! wget -q --timeout=30 -O "${i386_tmp}/sane-utils.deb" "${pool_url}/s/sane-backends/${sane_utils_filename}" 2>/dev/null; then
-        log_warn "Could not download i386 sane-utils."
-        rm -rf "$i386_tmp"
-        return 1
-    fi
-
-    # Download i386 libsane1 (SANE backend framework)
-    log_info "Downloading i386 libsane1..."
-    local libsane_filename
-    libsane_filename=$(wget -q -O - "${pool_url}/s/sane-backends/" 2>/dev/null \
-        | grep -oP 'libsane1_[0-9][0-9.~+-]*_i386\.deb' \
-        | sort -V | tail -1)
-    if [[ -z "$libsane_filename" ]]; then
-        log_warn "Could not find i386 libsane1 in Debian pool."
-        rm -rf "$i386_tmp"
-        return 1
-    fi
-    log_debug "Found: $libsane_filename"
-    if ! wget -q --timeout=30 -O "${i386_tmp}/libsane1.deb" "${pool_url}/s/sane-backends/${libsane_filename}" 2>/dev/null; then
-        log_warn "Could not download i386 libsane1."
-        rm -rf "$i386_tmp"
-        return 1
-    fi
-
-    # Download i386 libusb-0.1-4 (needed by Brother backend)
-    log_info "Downloading i386 libusb-0.1-4..."
-    local libusb_filename
-    libusb_filename=$(wget -q -O - "${pool_url}/libu/libusb/" 2>/dev/null \
-        | grep -oP 'libusb-0\.1-4_[0-9][0-9.~+-]*_i386\.deb' \
-        | sort -V | tail -1)
-    if [[ -n "$libusb_filename" ]]; then
-        log_debug "Found: $libusb_filename"
-        wget -q --timeout=30 -O "${i386_tmp}/libusb.deb" "${pool_url}/libu/libusb/${libusb_filename}" 2>/dev/null || true
-    fi
-
-    # Download i386 runtime dependencies for scanimage.
-    # scanimage links against several libraries beyond libc and libsane.
-    # Without these, it fails with "error while loading shared libraries".
-    log_info "Downloading i386 scanimage runtime dependencies..."
-    # Each entry: "package_name  pool_path  filename_pattern"
-    # NOTE: Debian pool paths use the SOURCE package name, not the binary
-    # package name. Packages whose source name starts with "lib" go under
-    # lib<first-letter>/<source>, others under <first-letter>/<source>.
-    local -a dep_specs=(
-        "libpng16-16     libp/libpng1.6     libpng16-16_"
-        "libjpeg62-turbo libj/libjpeg-turbo  libjpeg62-turbo_"
-        "libtiff6        t/tiff              libtiff6_"
-        "libdeflate0     libd/libdeflate     libdeflate0_"
-        "libwebp7        libw/libwebp        libwebp7_"
-        "zlib1g          z/zlib              zlib1g_"
-        "libgcc-s1       g/gcc-14            libgcc-s1_"
-        "libstdc++6      g/gcc-14            libstdc\\+\\+6_"
-        "libgomp1        g/gcc-14            libgomp1_"
-        "liblzma5        x/xz-utils          liblzma5_"
-        "libzstd1        libz/libzstd        libzstd1_"
-        "liblerc4        l/lerc              liblerc4_"
-        "libjbig0        j/jbigkit           libjbig0_"
-        "libusb-1.0-0    libu/libusb-1.0     libusb-1.0-0_"
-        "libxml2         libx/libxml2        libxml2_"
-        "libicu72        i/icu               libicu72_"
-        "libudev1        s/systemd           libudev1_"
-        "libcap2         libc/libcap2        libcap2_"
-    )
-    for dep_spec in "${dep_specs[@]}"; do
-        read -r dep_name dep_pool dep_pattern <<< "$dep_spec"
-        local dep_candidates dep_downloaded
-        dep_downloaded=false
-        # Get all matching versions, sorted newest-first
-        dep_candidates=$(wget -q -O - "${pool_url}/${dep_pool}/" 2>/dev/null \
-            | grep -oP "${dep_pattern}[0-9][0-9a-z.~+:_-]*_i386\\.deb" \
-            | sort -V -r)
-        if [[ -z "$dep_candidates" ]]; then
-            log_debug "Dependency $dep_name not found in pool (may not be needed)"
-            continue
-        fi
-        # Try each version from newest to oldest until one downloads successfully
-        while IFS= read -r dep_filename; do
-            [[ -z "$dep_filename" ]] && continue
-            log_debug "Downloading dep: $dep_filename"
-            if wget -q --timeout=30 -O "${i386_tmp}/${dep_name}.deb" \
-                "${pool_url}/${dep_pool}/${dep_filename}" 2>/dev/null; then
-                # Verify the download is a real deb, not an HTML error page
-                if file "${i386_tmp}/${dep_name}.deb" 2>/dev/null | grep -q "Debian binary package"; then
-                    dep_downloaded=true
-                    break
-                else
-                    log_debug "Download of $dep_filename is not a valid .deb (may be 404 HTML), trying older version..."
-                    rm -f "${i386_tmp}/${dep_name}.deb"
-                fi
-            else
-                log_debug "Failed to download $dep_filename, trying older version..."
-            fi
-        done <<< "$dep_candidates"
-        if [[ "$dep_downloaded" != true ]]; then
-            log_warn "Could not download any version of $dep_name from Debian pool"
-        fi
-    done
-
-    # Extract all packages into the i386 root
-    log_info "Extracting i386 SANE environment..."
-    for deb in "${i386_tmp}"/*.deb; do
-        if [[ -f "$deb" ]]; then
-            log_debug "Extracting: $(basename "$deb")"
-            sudo dpkg-deb -x "$deb" "$i386_root/" 2>/dev/null || true
-        fi
-    done
-    rm -rf "$i386_tmp"
-
-    # Copy the Brother scanner backend .so files into the i386 SANE environment
-    # NOTE: cp -a preserves symlinks as-is, which may have absolute targets
-    # (e.g. libbrscandec2.so -> /usr/lib/libbrscandec2.so.1). These absolute
-    # symlinks get double-prefixed by qemu -L, so we must fix them to be
-    # relative after copying.
-    local i386_sane_dir="$i386_root/usr/lib/sane"
-    sudo mkdir -p "$i386_sane_dir"
-    for brother_so in /usr/lib/sane/libsane-brother2*; do
-        if [[ -f "$brother_so" ]] || [[ -L "$brother_so" ]]; then
-            sudo cp -a "$brother_so" "$i386_sane_dir/" 2>/dev/null || true
-            log_debug "Copied to i386 env: $(basename "$brother_so")"
-        fi
-    done
-    # Copy Brother support libraries
-    for brother_lib in /usr/lib/libbrscandec2* /usr/lib/libbrcolm2*; do
-        if [[ -f "$brother_lib" ]] || [[ -L "$brother_lib" ]]; then
-            sudo cp -a "$brother_lib" "$i386_root/usr/lib/" 2>/dev/null || true
-            log_debug "Copied to i386 env: $(basename "$brother_lib")"
-        fi
-    done
-
-    # Fix absolute symlinks in the i386 environment — cp -a preserves the
-    # original symlink targets which may be absolute host paths like
-    # /usr/lib/libbrscandec2.so.1. Under qemu -L, these get double-prefixed
-    # to /opt/brother/i386/usr/lib/libbrscandec2.so.1 which doesn't exist.
-    # Convert them to relative symlinks that work correctly under qemu -L.
-    for check_dir in "$i386_root/usr/lib/sane" "$i386_root/usr/lib"; do
-        while IFS= read -r -d '' symlink; do
-            local target
-            target=$(readlink "$symlink")
-            if [[ "$target" == /* ]]; then
-                local base_target
-                base_target=$(basename "$target")
-                log_debug "Fixing absolute symlink: $(basename "$symlink") -> $target (changing to $base_target)"
-                sudo ln -sf "$base_target" "$symlink"
-            fi
-        done < <(find "$check_dir" -maxdepth 1 -type l -print0 2>/dev/null)
-    done
-
-    # Clear the executable stack flag from Brother libraries in the i386 env.
-    # Same issue as on host — modern kernels block dlopen() of .so files with
-    # PT_GNU_STACK execute permission. Must be done on actual files, not symlinks.
-    if command -v patchelf &>/dev/null; then
-        log_info "Clearing executable stack flag from i386 Brother libraries..."
-        for clear_dir in "$i386_root/usr/lib/sane" "$i386_root/usr/lib"; do
-            while IFS= read -r -d '' lib_file; do
-                if patchelf --print-execstack "$lib_file" 2>/dev/null | grep -q "X"; then
-                    sudo patchelf --clear-execstack "$lib_file"
-                    log_debug "Cleared execstack (i386): $lib_file"
-                fi
-            done < <(find "$clear_dir" -maxdepth 1 -type f \
-                         \( -name 'libsane-brother*' -o -name 'libbrscandec*' -o -name 'libbrcolm*' \) \
-                         -print0 2>/dev/null)
-        done
-    fi
-
-    # Copy Brother configuration files
-    if [[ -d /usr/local/Brother/sane ]]; then
-        sudo mkdir -p "$i386_root/usr/local/Brother"
-        sudo cp -a /usr/local/Brother/sane "$i386_root/usr/local/Brother/" 2>/dev/null || true
-        log_debug "Copied Brother sane config to i386 env"
-    fi
-
-    # Ensure SANE config is available in the i386 environment
-    sudo mkdir -p "$i386_root/etc/sane.d"
-    if [[ -f /etc/sane.d/dll.conf ]]; then
-        sudo cp /etc/sane.d/dll.conf "$i386_root/etc/sane.d/" 2>/dev/null || true
-    fi
-    # Copy all SANE .conf files
-    sudo cp /etc/sane.d/*.conf "$i386_root/etc/sane.d/" 2>/dev/null || true
-
-    # Make sure i386 libc is available in the i386 root
-    if [[ -d /lib/i386-linux-gnu ]]; then
-        sudo mkdir -p "$i386_root/lib/i386-linux-gnu"
-        sudo cp -a /lib/i386-linux-gnu/* "$i386_root/lib/i386-linux-gnu/" 2>/dev/null || true
-    fi
-    if [[ -f /lib/ld-linux.so.2 ]]; then
-        sudo cp -a /lib/ld-linux.so.2 "$i386_root/lib/" 2>/dev/null || true
-    fi
-
-    # Find the i386 scanimage binary
-    local i386_scanimage
-    i386_scanimage=$(find "$i386_root" -name 'scanimage' -type f 2>/dev/null | head -1)
-    if [[ -z "$i386_scanimage" ]]; then
-        log_warn "i386 scanimage not found after extraction."
-        return 1
-    fi
-    log_debug "i386 scanimage: $i386_scanimage"
-
-    # Consolidate i386 library paths — the extracted packages may place
-    # libraries in various subdirectories. Copy them into /usr/lib/ so the
-    # dynamic linker can find everything in a single search path.
-    # NOTE: We use cp instead of symlinks because qemu-user-static -L
-    # remaps guest paths. Absolute symlinks (e.g. pointing to
-    # /opt/brother/i386/usr/lib/i386-linux-gnu/foo.so) get double-prefixed
-    # by qemu to /opt/brother/i386/opt/brother/i386/..., which doesn't exist.
-    # NOTE: We must remove dangling symlinks before copying because GNU cp
-    # refuses to write through a dangling symlink ("cp: not writing through
-    # dangling symlink"). Old runs may have left dangling absolute symlinks.
-    for lib_subdir in "$i386_root"/usr/lib/i386-linux-gnu "$i386_root"/lib/i386-linux-gnu; do
-        if [[ -d "$lib_subdir" ]]; then
-            while IFS= read -r -d '' so_file; do
-                if [[ -f "$so_file" || -L "$so_file" ]]; then
-                    local base_name dest_path
-                    base_name=$(basename "$so_file")
-                    dest_path="$i386_root/usr/lib/$base_name"
-                    if [[ ! -e "$dest_path" ]]; then
-                        # Remove dangling symlinks left by previous installs
-                        [[ -L "$dest_path" ]] && sudo rm -f "$dest_path"
-                        sudo cp -a "$so_file" "$dest_path" 2>/dev/null || true
-                    fi
-                fi
-            done < <(find "$lib_subdir" -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) -print0 2>/dev/null)
-        fi
-    done
-
-    # Debug: show key library files in the i386 environment
-    log_debug "Key libraries in i386 env:"
-    for check_lib in libxml2 libsane-brother2 libbrscandec2 libbrcolm2 libusb; do
-        log_debug "  $(ls -la "$i386_root"/usr/lib/${check_lib}* 2>/dev/null | head -3 || echo "$check_lib: not found")"
-    done
-
-    # Check for missing shared libraries using qemu + ldd before creating wrapper
-    # Use the guest-root-relative path for scanimage so ld-linux can find it
-    # correctly under qemu's -L path remapping.
-    log_info "Checking i386 scanimage dependencies..."
-    local guest_scanimage="${i386_scanimage#"$i386_root"}"  # Strip i386_root prefix for guest path
-    local missing_libs
-    missing_libs=$("$qemu_bin" -L "$i386_root" "$i386_root/lib/ld-linux.so.2" --list "$guest_scanimage" 2>&1 || true)
-    log_debug "ld-linux --list output: $(echo "$missing_libs" | head -20)"
-    local still_missing
-    still_missing=$(echo "$missing_libs" | grep -E "not found|cannot open shared object file" || true)
-    if [[ -n "$still_missing" ]]; then
-        log_warn "i386 scanimage has missing library dependencies:"
-        while IFS= read -r line; do
-            log_warn "  $line"
-        done <<< "$still_missing"
-        log_info "Attempting to download missing i386 libraries..."
-
-        # Try to resolve each missing library from the Debian pool
-        while IFS= read -r missing_line; do
-            local missing_lib
-            missing_lib=$(echo "$missing_line" | sed 's/.*\(lib[^ ]*\.so[^ ]*\).*/\1/' | tr -d '[:space:]')
-            if [[ -z "$missing_lib" ]]; then
-                continue
-            fi
-            # Map .so name to Debian package name (strip .so.* suffix, replace ++ with pp)
-            local pkg_base
-            pkg_base=$(echo "$missing_lib" | sed 's/\.so\..*//')
-            log_debug "Searching for i386 package providing: $missing_lib (base: $pkg_base)"
-
-            # Search the package index via packages.debian.org
-            local search_result
-            search_result=$(wget -q -O - "https://packages.debian.org/search?searchon=contents&keywords=${missing_lib}&mode=filename&suite=stable&arch=i386" 2>/dev/null \
-                | grep -oP 'packages/[^/]+/[^"]+' | head -1 || true)
-            if [[ -n "$search_result" ]]; then
-                local found_pkg
-                found_pkg=$(echo "$search_result" | sed 's|packages/[^/]*/||')
-                log_debug "Found package: $found_pkg for $missing_lib"
-            fi
-        done <<< "$still_missing"
-    else
-        log_debug "All i386 scanimage dependencies are satisfied."
-    fi
-
-    # Create the wrapper script
-    log_info "Creating brother-scanimage wrapper..."
-    # NOTE: qemu-user-static -L sets the guest root for the i386 process.
-    # The i386 dynamic linker resolves ALL paths (including LD_LIBRARY_PATH
-    # and SANE_CONFIG_DIR) relative to this guest root. So we must use
-    # guest-relative paths (e.g. /usr/lib), NOT host-absolute paths
-    # (e.g. /opt/brother/i386/usr/lib) — the latter would be doubled to
-    # /opt/brother/i386/opt/brother/i386/usr/lib which doesn't exist.
-    sudo tee "$wrapper" > /dev/null << WRAPPER_EOF
-#!/bin/bash
-# Brother scanner wrapper — runs i386 scanimage via qemu-i386-static.
-# ARM SANE cannot dlopen() i386 backend libraries, so we use an i386
-# scanimage binary that can natively load the Brother SANE backend.
-#
-# Usage: brother-scanimage [scanimage arguments...]
-# Example: brother-scanimage --format=png --resolution=300 > scan.png
-#          brother-scanimage -L
-#
-# Debug flags (pass as first argument):
-#   --strace   : Enable qemu syscall tracing (shows all system calls)
-#   --debug-usb: Enable LIBUSB_DEBUG=4 and SANE_DEBUG_BROTHER2=5
-
-QEMU_ARGS=()
-# Check for debug flags
-while [[ "\$1" == --strace || "\$1" == --debug-usb ]]; do
-    case "\$1" in
-        --strace)    QEMU_ARGS+=("-strace"); shift ;;
-        --debug-usb) export LIBUSB_DEBUG=4; export SANE_DEBUG_BROTHER2=5; export SANE_DEBUG_DLL=3; shift ;;
-    esac
-done
-
-# Paths are guest-relative (resolved under the qemu -L guest root)
-export SANE_CONFIG_DIR="/etc/sane.d"
-export LD_LIBRARY_PATH="/usr/lib:/usr/lib/sane:/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu:/usr/local/lib"
-
-exec "$qemu_bin" "\${QEMU_ARGS[@]}" -L "$i386_root" "$i386_scanimage" "\$@"
-WRAPPER_EOF
-    sudo chmod 755 "$wrapper"
-    log_info "Created: $wrapper"
-
-    # Verify the wrapper can list backends
-    log_info "Verifying i386 scanner environment..."
-    local verify_output
-    verify_output=$("$wrapper" -L 2>&1 || true)
-    # Check for shared library errors first — these indicate missing deps
-    if echo "$verify_output" | grep -qi "error while loading shared libraries\|cannot enable executable stack"; then
-        local missing_so
-        missing_so=$(echo "$verify_output" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
-        log_warn "brother-scanimage failed: missing i386 library: ${missing_so:-unknown}"
-        log_debug "Full output: $verify_output"
-        log_info "You may need to manually install the missing i386 library."
-    elif echo "$verify_output" | grep -qi "device.*brother\|DCP-130C"; then
-        log_info "i386 scanner environment works! Scanner detected."
-    else
-        log_debug "brother-scanimage -L output: ${verify_output:-<empty>}"
-        log_info "i386 scanner environment installed. Scanner may be detected after USB reconnect."
-    fi
-
-    log_info "i386 scanner environment setup complete."
-    log_info "Use 'brother-scanimage' instead of 'scanimage' for scanning."
-}
-
 # Compile the Brother SANE backend natively for ARM from source.
 # This produces a native ARM libsane-brother2.so that can use the real
-# USB stack directly, bypassing qemu entirely.
+# USB stack directly.
 compile_arm_backend() {
     local src_dir="$TMP_DIR/brscan2-src"
     local build_dir="$TMP_DIR/arm_build"
@@ -1097,7 +676,6 @@ compile_arm_backend() {
     fi
 
     log_info "Compiling native ARM SANE backend from source..."
-    log_info "This bypasses qemu to access USB directly from ARM."
 
     # Download source
     log_info "Downloading brscan2 source code..."
@@ -1265,7 +843,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
             if (n > w->dwWriteBuffSize) n = w->dwWriteBuffSize;
             memcpy(w->pWriteBuff, w->pLineData, n); break;
     }
-    if (st) *st = 0;
+    if (st) *st = (n > 0) ? 1 : 0;
     return n;
 }
 DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st) { (void)w; if(st) *st=0; return 0; }
@@ -1397,7 +975,7 @@ configure_scanner() {
         exit 1
     fi
 
-    # Use the symlink if available (it may work via qemu on ARM)
+    # Use the symlink if available
     if command -v brsaneconfig2 &>/dev/null; then
         brsaneconfig="brsaneconfig2"
     fi
@@ -1437,29 +1015,14 @@ configure_scanner() {
 
     log_info "Scanner configured successfully."
 
-    # Sync updated config to i386 environment — setup_i386_scanner() copies
-    # configs BEFORE this function registers the scanner device, so the i386
-    # env has stale config without the registered device. Re-copy now.
-    local i386_root="/opt/brother/i386"
-    if [[ -d "$i386_root" ]]; then
-        log_debug "Syncing updated SANE config to i386 environment..."
-        if [[ -d /usr/local/Brother/sane ]]; then
-            sudo mkdir -p "$i386_root/usr/local/Brother"
-            sudo cp -a /usr/local/Brother/sane "$i386_root/usr/local/Brother/" 2>/dev/null || true
-            log_debug "Synced Brother sane config to i386 env"
-        fi
-        sudo mkdir -p "$i386_root/etc/sane.d"
-        sudo cp /etc/sane.d/*.conf "$i386_root/etc/sane.d/" 2>/dev/null || true
-        # Ensure brother2 is in the i386 env's dll.conf too
-        local i386_dll_conf="$i386_root/etc/sane.d/dll.conf"
-        if [[ -f "$i386_dll_conf" ]]; then
-            if ! grep -q '^brother2$' "$i386_dll_conf"; then
-                echo "brother2" | sudo tee -a "$i386_dll_conf" > /dev/null
-                log_debug "Added brother2 to i386 dll.conf"
+    # Enable Brother debug logging for diagnostics
+    local ini_file="/usr/local/Brother/sane/Brsane2.ini"
+    if [[ -f "$ini_file" ]]; then
+        if ! grep -q "^LogFile=" "$ini_file"; then
+            if grep -q "^\[Driver\]" "$ini_file"; then
+                sudo sed -i '/^\[Driver\]/a LogFile=1' "$ini_file"
+                log_debug "Enabled Brother debug logging in Brsane2.ini"
             fi
-        else
-            echo "brother2" | sudo tee "$i386_dll_conf" > /dev/null
-            log_debug "Created i386 dll.conf with brother2"
         fi
     fi
 }
@@ -1468,24 +1031,8 @@ configure_scanner() {
 test_scan() {
     log_info "Testing scanner..."
 
-    # Determine the best scanimage command to use.
-    # If we have a native ARM backend, use native scanimage (direct USB access).
-    # Otherwise fall back to the i386 qemu wrapper.
     local scan_cmd=""
-    local using_native=false
-    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]] && \
-       file -b /usr/lib/sane/libsane-brother2.so.1.0.7 2>/dev/null | grep -qi "ARM\|aarch64"; then
-        # Native ARM backend — use native scanimage for direct USB access
-        if command -v scanimage &>/dev/null; then
-            scan_cmd="scanimage"
-            using_native=true
-            log_debug "Using native ARM scanimage (direct USB access)"
-        fi
-    fi
-    if [[ -z "$scan_cmd" ]] && [[ -x /usr/local/bin/brother-scanimage ]]; then
-        scan_cmd="/usr/local/bin/brother-scanimage"
-        log_debug "Using i386 wrapper: $scan_cmd"
-    elif [[ -z "$scan_cmd" ]] && command -v scanimage &>/dev/null; then
+    if command -v scanimage &>/dev/null; then
         scan_cmd="scanimage"
         log_debug "Using native scanimage"
     fi
@@ -1502,7 +1049,7 @@ test_scan() {
     if echo "$scanners" | grep -q "error while loading shared libraries\|cannot enable executable stack"; then
         local missing_so
         missing_so=$(echo "$scanners" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
-        log_warn "Scanner command failed: missing i386 library: ${missing_so:-unknown}"
+        log_warn "Scanner command failed: missing library: ${missing_so:-unknown}"
         log_debug "$scan_cmd -L output: $scanners"
     elif echo "$scanners" | grep -qi "device.*brother\|DCP-130C.*scanner"; then
         log_info "Scanner detected: $scanners"
@@ -1599,9 +1146,7 @@ test_scan() {
         fi
     fi
 
-    # Collect available devices.
-    # With native ARM backend: prefer USB device (direct access works).
-    # With qemu wrapper: prefer network device (USB ioctls don't work under qemu).
+    # Collect available devices — prefer USB (direct hardware access).
     local -a scan_devices=()
     local net_device="" usb_device=""
     if echo "$scanners" | grep -q "brother2:net"; then
@@ -1611,22 +1156,7 @@ test_scan() {
         usb_device=$(echo "$scanners" | grep -oP "brother2:bus[^'\"]*" | head -1)
     fi
 
-    if $using_native; then
-        # Native ARM backend — prefer USB device (direct hardware access)
-        if [[ -n "$usb_device" ]]; then
-            scan_devices=("$usb_device")
-            [[ -n "$net_device" ]] && scan_devices+=("$net_device")
-            log_info "Selected USB scanner device: $usb_device (native ARM backend)"
-        elif [[ -n "$net_device" ]]; then
-            scan_devices=("$net_device")
-            log_info "Selected network scanner device: $net_device"
-        fi
-    elif [[ "$scan_cmd" == *"brother-scanimage"* ]] && [[ -n "$net_device" ]]; then
-        # Qemu wrapper — prefer network device (USB ioctls don't work under qemu)
-        scan_devices=("$net_device")
-        [[ -n "$usb_device" ]] && scan_devices+=("$usb_device")
-        log_info "Selected network scanner device: $net_device (preferred under qemu)"
-    elif [[ -n "$usb_device" ]]; then
+    if [[ -n "$usb_device" ]]; then
         scan_devices=("$usb_device")
         [[ -n "$net_device" ]] && scan_devices+=("$net_device")
         log_info "Selected USB scanner device: $usb_device"
@@ -1694,75 +1224,10 @@ test_scan() {
         done
 
         if ! $scan_ok; then
-            if $all_invalid_arg && [[ "$scan_cmd" == *"brother-scanimage"* ]]; then
+            if $all_invalid_arg; then
                 log_warn "All scan devices returned 'Invalid argument'."
-                log_info "Running qemu strace to diagnose the failing syscall..."
-
-                # Run with qemu -strace to capture the exact syscall that fails
-                local strace_device="${scan_devices[0]:-brother2:net1;dev0}"
-                local strace_output="/tmp/brother_strace_diag.log"
-                timeout 15 "$scan_cmd" --strace -d "$strace_device" --format=pnm --resolution=150 \
-                    > /dev/null 2>"$strace_output" || true
-
-                if [[ -s "$strace_output" ]]; then
-                    # Show the failing ioctl/syscall lines
-                    local ioctl_fails
-                    ioctl_fails=$(grep --text -i "ioctl\|EINVAL\|Invalid\|= -1 errno" "$strace_output" | tail -20)
-                    if [[ -n "$ioctl_fails" ]]; then
-                        log_debug "Failing syscalls from qemu strace:"
-                        while IFS= read -r line; do
-                            log_debug "  $line"
-                        done <<< "$ioctl_fails"
-                    fi
-
-                    # Show USB-related syscalls
-                    local usb_calls
-                    usb_calls=$(grep --text -i "usb\|/dev/bus\|usbdev\|usbfs" "$strace_output" | head -10)
-                    if [[ -n "$usb_calls" ]]; then
-                        log_debug "USB-related syscalls:"
-                        while IFS= read -r line; do
-                            log_debug "  $line"
-                        done <<< "$usb_calls"
-                    fi
-
-                    # Show open() calls that fail
-                    local open_fails
-                    open_fails=$(grep --text "open.*= -1\|openat.*= -1" "$strace_output" | head -10)
-                    if [[ -n "$open_fails" ]]; then
-                        log_debug "Failed open() calls:"
-                        while IFS= read -r line; do
-                            log_debug "  $line"
-                        done <<< "$open_fails"
-                    fi
-                fi
-                rm -f "$strace_output"
-
-                # Also run with LIBUSB_DEBUG for libusb-level diagnostics
-                log_info "Running with LIBUSB_DEBUG for USB diagnostics..."
-                local libusb_output
-                libusb_output=$(timeout 15 "$scan_cmd" --debug-usb -d "$strace_device" --format=pnm --resolution=150 \
-                    2>&1 >/dev/null || true)
-                if [[ -n "$libusb_output" ]]; then
-                    local libusb_info
-                    libusb_info=$(echo "$libusb_output" | grep -i "libusb\|usb\|open.*device\|claim\|interface\|ioctl\|error\|brother" | head -20)
-                    if [[ -n "$libusb_info" ]]; then
-                        log_debug "USB/SANE debug output:"
-                        while IFS= read -r line; do
-                            log_debug "  $line"
-                        done <<< "$libusb_info"
-                    fi
-                fi
-
-                log_warn "Scan failed with 'Invalid argument' on all devices."
-                log_info "The scanner IS detected and configured correctly."
-                log_info "The failure occurs during USB device access under qemu emulation."
-                log_info ""
-                log_info "To run diagnostics manually:"
-                log_info "  sudo brother-scanimage --strace -L 2>&1 | grep -i ioctl"
-                log_info "  sudo brother-scanimage --debug-usb -L"
-            else
-                log_info "Try manually: $scan_cmd -d '${scan_devices[0]:-brother2:net1;dev0}' --format=pnm > scan.pnm"
             fi
+            log_info "Try manually: sudo $scan_cmd -d '${scan_devices[0]:-brother2:bus1;dev1}' --format=pnm > scan.pnm"
         fi
         rm -f "$test_stderr"
     else
@@ -1791,44 +1256,17 @@ display_info() {
     echo
     log_info "Scanner Name: $SCANNER_NAME"
     echo
-    # Check if we have a native ARM backend
-    local has_native_backend=false
-    if [[ -f /usr/lib/sane/libsane-brother2.so.1.0.7 ]] && \
-       file -b /usr/lib/sane/libsane-brother2.so.1.0.7 2>/dev/null | grep -qi "ARM\|aarch64"; then
-        has_native_backend=true
-    fi
-
-    if $has_native_backend; then
-        log_info "Backend: Native ARM (compiled from source — direct USB access)"
-        log_info "To scan a document:"
-        log_info "  scanimage -d 'brother2:bus1;dev1' --format=png --resolution=300 > scan.png"
-        log_info "To list available scanners:"
-        log_info "  scanimage -L"
-    elif [[ -x /usr/local/bin/brother-scanimage ]]; then
-        log_info "Backend: i386 via qemu (brother-scanimage wrapper)"
-        log_info "To scan a document (use brother-scanimage on ARM):"
-        log_info "  brother-scanimage -d 'brother2:net1;dev0' --format=png --resolution=300 > scan.png"
-        log_info "To list available scanners:"
-        log_info "  brother-scanimage -L"
-        log_info "Debug flags (pass before other arguments):"
-        log_info "  brother-scanimage --strace -L          # Show all syscalls (for diagnosing USB issues)"
-        log_info "  brother-scanimage --debug-usb -L       # Show USB/SANE debug output"
-    else
-        log_info "To scan a document:"
-        log_info "  scanimage -d 'brother2:bus1;dev0' --format=png --resolution=300 > scan.png"
-        log_info "To list available scanners:"
-        log_info "  scanimage -L"
-    fi
+    log_info "Backend: Native ARM (compiled from source — direct USB access)"
+    log_info "To scan a document:"
+    log_info "  scanimage -d 'brother2:bus1;dev1' --format=png --resolution=300 > scan.png"
+    log_info "To list available scanners:"
+    log_info "  scanimage -L"
     log_info "To check SANE configuration:"
     log_info "  brsaneconfig2 -q"
     echo
     log_info "If the scanner is not detected, try:"
     log_info "  1. Disconnect and reconnect the USB cable"
-    if [[ -x /usr/local/bin/brother-scanimage ]]; then
-        log_info "  2. Run: sudo brother-scanimage -L"
-    else
-        log_info "  2. Run: sudo scanimage -L"
-    fi
+    log_info "  2. Run: sudo scanimage -L"
     log_info "  3. Check SANE backend: grep brother2 /etc/sane.d/dll.conf"
     echo
     log_info "If you were added to the scanner group, you may need to log out and back in."
@@ -1856,14 +1294,13 @@ main() {
     repackage_drivers
     install_drivers
 
-    # Try native ARM compilation first (best approach — direct USB access).
-    # Falls back to i386/qemu approach if compilation fails.
-    if compile_arm_backend; then
-        log_info "Using native ARM SANE backend (direct USB access)."
-    else
-        log_info "Native ARM compilation failed — falling back to i386/qemu approach."
-        setup_i386_scanner
+    # Compile native ARM SANE backend (direct USB access).
+    if ! compile_arm_backend; then
+        log_error "Native ARM compilation failed. Cannot install scanner backend."
+        log_error "Please ensure gcc, libsane-dev, libusb-dev, and libncurses-dev are installed."
+        exit 1
     fi
+    log_info "Using native ARM SANE backend (direct USB access)."
 
     detect_scanner
     configure_scanner
