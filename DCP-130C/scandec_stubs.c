@@ -302,7 +302,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         if (w->pWriteBuff[i] != 0) has_data = 1;
     if (has_data) g_nonzero_lines++;
 
-    /* Log first 50 calls, then every 50th, for scan progress visibility */
+    /* Log first 50 calls and then every 50th call thereafter */
     if (g_write_count <= 50 || g_write_count % 50 == 0)
         fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
                 "inLen=%lu outLine=%lu hasData=%d bpp=%d "
