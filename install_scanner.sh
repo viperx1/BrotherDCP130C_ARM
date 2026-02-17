@@ -594,9 +594,10 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p) {
 void ScanDecSetTblHandle(HANDLE h1, HANDLE h2) { (void)h1; (void)h2; }
 BOOL ScanDecPageStart(void) { fprintf(stderr, "SCANDEC: ScanDecPageStart\n"); return TRUE; }
 DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st) {
-    if (!w || !w->pLineData || !w->pWriteBuff) {
-        fprintf(stderr, "SCANDEC: ScanDecWrite NULL ptrs w=%p pLineData=%p pWriteBuff=%p\n",
-                (void*)w, w ? (void*)w->pLineData : NULL, w ? (void*)w->pWriteBuff : NULL);
+    if (!w) { fprintf(stderr, "SCANDEC: ScanDecWrite w=NULL\n"); if(st) *st=-1; return 0; }
+    if (!w->pLineData || !w->pWriteBuff) {
+        fprintf(stderr, "SCANDEC: ScanDecWrite NULL ptrs pLineData=%p pWriteBuff=%p\n",
+                (void*)w->pLineData, (void*)w->pWriteBuff);
         if(st) *st=-1; return 0;
     }
     DWORD outLine = g_open.dwOutLineByte;
