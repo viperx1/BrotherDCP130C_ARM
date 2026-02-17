@@ -613,6 +613,44 @@ i\\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: calling usb_claim_interface\\n")
         log_debug "Injected OpenDevice debug instrumentation into brother_devaccs.c"
     fi
 
+    # Add scan-progress debug instrumentation into brother2.c and
+    # brother_scanner.c so the scan process emits stderr traces during
+    # sane_start, sane_read, and PageScan. This lets us diagnose hangs
+    # where the scan times out without any visible progress.
+    if [[ -f "$brother2_c" ]]; then
+        # Trace sane_start
+        sed -i '/WriteLog.*sane_start start/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_start: starting scan\\n"); fflush(stderr);' "$brother2_c"
+
+        # Trace sane_read entry (shows maxlen — how many bytes scanimage wants)
+        sed -i '/WriteLog.*sane_read start.*maxlen/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_read: maxlen=%d\\n", maxlen); fflush(stderr);' "$brother2_c"
+
+        # Trace sane_read exit (shows how many bytes are returned)
+        sed -i '/WriteLog.*sane_read End.*rc.*len/a\
+  fprintf(stderr, "[BROTHER2-DBG] sane_read: rc=%d len=%d\\n", rc, *len); fflush(stderr);' "$brother2_c"
+
+        log_debug "Injected sane_start/sane_read debug instrumentation into brother2.c"
+    fi
+
+    local scanner_c="$brscan_src/backend_src/brother_scanner.c"
+    if [[ -f "$scanner_c" ]]; then
+        # Trace PageScan entry (shows buffer sizes and page count)
+        sed -i '/WriteLog.*PageScan Start.*cnt=%d.*nMaxLen/a\
+\tfprintf(stderr, "[BROTHER2-DBG] PageScan: cnt=%d nMaxLen=%d bReadbufEnd=%d iProcessEnd=%d\\n", nPageScanCnt, nMaxLen, this->scanState.bReadbufEnd, this->scanState.iProcessEnd); fflush(stderr);' "$scanner_c"
+
+        # Trace ReadNonFixedData result inside PageScan
+        # (the if/else block after rc = ReadNonFixedData)
+        sed -i '/WriteLog.*bReadbufEnd =TRUE/i\
+\t\t\t\tfprintf(stderr, "[BROTHER2-DBG] PageScan: ReadNonFixedData rc=%d wData=%d\\n", rc, wData); fflush(stderr);' "$scanner_c"
+
+        # Trace ProcessMain exit with FwTempBuffLength
+        sed -i '/WriteLog.*ProcessMain End dwRxTempBuffLength/a\
+\tfprintf(stderr, "[BROTHER2-DBG] PageScan: ProcessMain done FwTemp=%d lRealY=%ld iProcessEnd=%d\\n", FwTempBuffLength, lRealY, this->scanState.iProcessEnd); fflush(stderr);' "$scanner_c"
+
+        log_debug "Injected PageScan debug instrumentation into brother_scanner.c"
+    fi
+
     # Check for required headers
     local sane_header=""
     for hdr_path in /usr/include/sane/sane.h "$brscan_src/include/sane/sane.h"; do
@@ -1132,7 +1170,7 @@ except OSError as e:
             fi
             # Enable core dumps so we can get a backtrace if the scan crashes
             ulimit -c unlimited 2>/dev/null || true
-            if env "${scan_env[@]}" timeout 60 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
+            if env "${scan_env[@]}" timeout 120 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
                     log_info "File size: $(ls -lh "$test_output" | awk '{print $5}')"
@@ -1175,8 +1213,18 @@ except OSError as e:
             else
                 local exit_code=$?
                 if [[ $exit_code -eq 124 ]]; then
-                    log_warn "Test scan with '$try_device' timed out after 60 seconds."
+                    log_warn "Test scan with '$try_device' timed out after 120 seconds."
                     all_invalid_arg=false
+                    # Show BrMfc32.log on timeout for diagnosis
+                    local brother_log_timeout="/usr/local/Brother/sane/BrMfc32.log"
+                    if [[ -f "$brother_log_timeout" ]] && [[ -s "$brother_log_timeout" ]]; then
+                        log_info "Brother backend log (last 50 lines):"
+                        tail -50 "$brother_log_timeout" | while IFS= read -r bline; do
+                            log_info "  $bline"
+                        done
+                    else
+                        log_warn "BrMfc32.log is empty or missing"
+                    fi
                 else
                     log_warn "Test scan with '$try_device' failed (exit code: $exit_code)."
                     if [[ $exit_code -eq 139 ]]; then
