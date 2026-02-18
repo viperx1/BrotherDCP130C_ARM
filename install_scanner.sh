@@ -280,7 +280,7 @@ setup_scanner_sharing() {
     if [[ -f "$saned_conf" ]]; then
         sudo cp "$saned_conf" "${saned_conf}.bak"
     fi
-    # Allow all hosts on the local network (link-local ranges) to connect.
+    # Allow all hosts on the local network (RFC 1918 private ranges) to connect.
     # saned accepts CIDR notation for access control.
     local -a acl_entries=("192.168.0.0/16" "10.0.0.0/8" "172.16.0.0/12")
     for entry in "${acl_entries[@]}"; do

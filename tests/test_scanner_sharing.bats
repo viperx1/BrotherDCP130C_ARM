@@ -132,8 +132,15 @@ AVAHI_EOF
 
 @test "scanner sharing: SCANNER_SHARED=false skips sharing setup" {
     SCANNER_SHARED=false
+    # Create a saned.conf that should NOT be modified
+    cat > "$TEST_TMPDIR/saned.conf" << 'EOF'
+localhost
+EOF
+    local before
+    before=$(cat "$TEST_TMPDIR/saned.conf")
     # setup_scanner_sharing should return early without errors
-    # (it requires sudo for real operations, but the guard clause exits first)
     run setup_scanner_sharing
     [[ "$status" -eq 0 ]]
+    # Verify no output was produced (no log messages about configuring sharing)
+    [[ -z "$output" ]]
 }
