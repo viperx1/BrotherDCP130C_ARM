@@ -212,6 +212,13 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
         g_red_plane   = (BYTE *)calloc(g_plane_pixels, 1);
         g_green_plane = (BYTE *)calloc(g_plane_pixels, 1);
         g_blue_plane  = (BYTE *)calloc(g_plane_pixels, 1);
+        if (!g_red_plane || !g_green_plane || !g_blue_plane) {
+            fprintf(stderr, "[SCANDEC] ScanDecOpen: plane buffer allocation failed\n");
+            free(g_red_plane);   g_red_plane = NULL;
+            free(g_green_plane); g_green_plane = NULL;
+            free(g_blue_plane);  g_blue_plane = NULL;
+            return FALSE;
+        }
     }
 
     fprintf(stderr, "[SCANDEC] ScanDecOpen: nColorType=0x%x pixels=%lu "
@@ -334,8 +341,10 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         }
 
         /* All three planes received — interleave R,G,B into pixel RGB */
+        DWORD safe_pixels = g_plane_pixels;
+        if (safe_pixels > outLine / 3) safe_pixels = outLine / 3;
         memset(w->pWriteBuff, 0, outLine);
-        for (DWORD i = 0; i < g_plane_pixels && (i * 3 + 2) < outLine; i++) {
+        for (DWORD i = 0; i < safe_pixels; i++) {
             w->pWriteBuff[i * 3 + 0] = g_red_plane[i];
             w->pWriteBuff[i * 3 + 1] = g_green_plane[i];
             w->pWriteBuff[i * 3 + 2] = g_blue_plane[i];
