@@ -58,14 +58,6 @@ patch_lpadmin_calls() {
         # variable-assigned invocations like result=`lpadmin ...`).
         # Lines that already start with # are left alone.
         $prefix sed -i '/^[[:space:]]*#/!{/lpadmin/s|^\([[:space:]]*\)\(.*\)|\1# [patched] \2|}' "$file"
-        # Log any remaining unpatched lpadmin references for debugging
-        local remaining
-        remaining=$($prefix grep -n 'lpadmin' "$file" | grep -v '^[0-9]*:[[:space:]]*#' || true)
-        if [[ -n "$remaining" ]]; then
-            :
-        else
-            :
-        fi
     fi
 }
 
@@ -240,8 +232,6 @@ fix_broken_packages() {
                             !skip { print }
                         ' /var/lib/dpkg/status.bak | sudo tee /var/lib/dpkg/status > /dev/null
                     fi
-                else
-                    :
                 fi
 
                 packages_fixed=1
@@ -317,8 +307,6 @@ setup_cups_service() {
     if ! groups "$USER" | grep -q lpadmin; then
         sudo usermod -a -G lpadmin "$USER"
         log_info "Added $USER to lpadmin group. You may need to log out and back in for this to take effect."
-    else
-        :
     fi
 
     if [[ "$PRINTER_SHARED" == true ]]; then
@@ -385,8 +373,6 @@ setup_cups_service() {
         if ! dpkg -s avahi-daemon &>/dev/null; then
             log_info "Installing Avahi daemon for network printer discovery..."
             sudo apt-get install -y avahi-daemon 2>&1 | tail -3
-        else
-            :
         fi
         sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
         sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
@@ -423,8 +409,6 @@ try_download() {
                 return 0
             fi
             rm -f "$output_file"
-        else
-            :
         fi
     done
     
@@ -526,8 +510,6 @@ extract_and_modify_drivers() {
             patch_lpadmin_calls "$wrapper_script"
         fi
         chmod 755 "$wrapper_script"
-    else
-        :
     fi
     
     
@@ -619,8 +601,6 @@ remove_duplicate_printers() {
 
     if [[ $removed -gt 0 ]]; then
         log_info "Removed $removed duplicate DCP-130C printer(s)."
-    else
-        :
     fi
 }
 
@@ -664,8 +644,6 @@ install_drivers() {
         fi
         if grep -q 'lpadmin' "$installed_wrapper"; then
             patch_lpadmin_calls "$installed_wrapper" sudo
-        else
-            :
         fi
     fi
 
@@ -676,7 +654,7 @@ install_drivers() {
     if [[ -f "$installed_wrapper" ]]; then
         log_info "Re-running cupswrapper setup to ensure filter pipeline is configured..."
         sudo "$installed_wrapper" 2>&1 | while IFS= read -r line; do
-            :
+            true
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
 
@@ -691,15 +669,11 @@ install_drivers() {
 
     # Verify the filter binary/script exists
     local filter_path="/usr/lib/cups/filter/brlpdwrapperdcp130c"
-    if [[ -f "$filter_path" ]] || [[ -L "$filter_path" ]]; then
-        :
-    else
+    if [[ ! -f "$filter_path" ]] && [[ ! -L "$filter_path" ]]; then
         # Check alternative locations
         local alt_filter
         alt_filter=$(find /usr/lib/cups/filter/ /usr/libexec/cups/filter/ -iname '*dcp130c*' 2>/dev/null | head -n 1)
-        if [[ -n "$alt_filter" ]]; then
-            :
-        else
+        if [[ -z "$alt_filter" ]]; then
             log_warn "Brother filter not found in CUPS filter directory!"
         fi
     fi
@@ -725,8 +699,6 @@ install_drivers() {
             i386_binaries_found=$((i386_binaries_found + 1))
             if ! can_execute_binary "$bin_file"; then
                 i386_binaries_failed=$((i386_binaries_failed + 1))
-            else
-                :
             fi
         fi
     done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
@@ -740,8 +712,6 @@ install_drivers() {
             if ! dpkg -s qemu-user-static &>/dev/null; then
                 log_info "Installing qemu-user-static..."
                 sudo apt-get install -y qemu-user-static 2>&1 | tail -3
-            else
-                :
             fi
 
             # Step 2: Provide the i386 dynamic linker (/lib/ld-linux.so.2)
@@ -809,8 +779,6 @@ install_drivers() {
                     log_warn "Could not find libc6 i386 package in Debian pool."
                 fi
                 rm -rf "$i386_tmp"
-            else
-                :
             fi
 
             # Fix Raspberry Pi /etc/ld.so.preload that causes errors under qemu-user-static.
@@ -846,8 +814,6 @@ install_drivers() {
         else
             log_info "All Brother i386 binaries execute successfully on this ARM system."
         fi
-    else
-        :
     fi
 
     # Restore original Brother filter if it was previously wrapped.
@@ -882,8 +848,6 @@ case "$5" in\
     ;;\
 esac\
 # --- End grayscale patch ---' "$brother_filter"
-        else
-            :
         fi
     fi
 
@@ -1202,15 +1166,6 @@ EOF
             local new_log_entries
             new_log_entries=$(tail -n +"$((log_lines_before + 1))" /var/log/cups/error_log 2>/dev/null || true)
             if [[ -n "$new_log_entries" ]]; then
-                # Filter to show only important lines (errors, warnings, job/filter activity)
-                # Skip verbose IPP client chatter (Client N, HTTP, Content-Length, etc.)
-                local important_entries
-                important_entries=$(echo "$new_log_entries" \
-                    | grep -iE "^\w \[.*\] \[Job [0-9]|^E \[|filter|backend|Started |PID [0-9]+ .* exited|ld-linux|Could not open|Sent [0-9]+ bytes" \
-                    | grep -viE "envp\[|argv\[" || true)
-                if [[ -n "$important_entries" ]]; then
-                    :
-                fi
                 # Check for actual filter/backend errors (NOT normal client disconnects)
                 if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error|ld-linux|Could not open|cannot open shared object|libarmmem)" \
                     || echo "$new_log_entries" | grep -qP "\[Job [0-9]+\].*Sent 0 bytes"; then
@@ -1226,8 +1181,6 @@ EOF
                         log_warn "This usually means the Brother i386 binary can't run on ARM."
                     fi
                 fi
-            else
-                :
             fi
         fi
 
