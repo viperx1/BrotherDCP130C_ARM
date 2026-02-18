@@ -1117,8 +1117,10 @@ display_info() {
     log_info "  brsaneconfig2 -q"
     echo
     log_info "Performance notes:"
-    log_info "  The DCP-130C uses USB 1.1 (12 Mbit/s), which limits scan throughput"
-    log_info "  to ~70 KB/s. A full-page 150 DPI color scan takes ~90 seconds."
+    log_info "  The DCP-130C is a USB 2.0 Full-Speed device (12 Mbit/s)."
+    log_info "  'Full-Speed' means 12 Mbit/s — NOT High-Speed (480 Mbit/s)."
+    log_info "  This limits scan throughput to ~70 KB/s by design."
+    log_info "  A full-page 150 DPI color scan takes ~90 seconds."
     log_info "  This is a hardware limit — the scanner itself is the bottleneck."
     log_info "  Tips for faster scans:"
     log_info "    - Use grayscale mode (3x less data than color)"

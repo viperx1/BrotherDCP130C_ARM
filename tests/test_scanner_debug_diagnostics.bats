@@ -274,6 +274,14 @@ CEOF
     [[ "$stderr_out" == *"[BROTHER2] usb:"* ]]
 }
 
+@test "backend_init: reads USB version sysfs attribute" {
+    # Verify the code reads the 'version' sysfs attribute by checking
+    # that the source contains the version reading logic
+    grep -q 'version' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'USB 2.0 Full-Speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'USB 2.0 compliant' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
 # --- scandec RGB mode compression tracking ---
 
 @test "scandec: RGB mode tracks compression stats per-plane" {
@@ -495,7 +503,7 @@ CEOF
 }
 
 @test "scanner: display_info includes performance notes" {
-    grep -q 'USB 1.1' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Full-Speed' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'hardware limit' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'BROTHER_DEBUG=1' "$PROJECT_ROOT/install_scanner.sh"
 }
@@ -537,5 +545,5 @@ CEOF
     stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
         "$TEST_TMPDIR/test_advice" 2>&1 >/dev/null)
     [[ "$stderr_out" == *"advice:"* ]]
-    [[ "$stderr_out" == *"hardware limit"* ]]
+    [[ "$stderr_out" == *"Full-Speed USB"* ]]
 }

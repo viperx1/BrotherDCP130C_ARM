@@ -87,24 +87,52 @@ static void probe_usb_environment(void) {
         snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name);
         read_sysfs(path, product, sizeof(product));
 
-        /* Read USB speed */
+        /* Read USB speed (link rate in Mbit/s) */
         char speed[16] = "?";
         snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/speed", ent->d_name);
         read_sysfs(path, speed, sizeof(speed));
 
+        /* Read USB spec version from device descriptor (e.g. "2.00", "1.10") */
+        char version[16] = "";
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/version", ent->d_name);
+        read_sysfs(path, version, sizeof(version));
+        /* Trim leading whitespace (sysfs pads with spaces) */
+        const char *ver = version;
+        while (*ver == ' ') ver++;
+
         const char *speed_label = "unknown";
         int speed_mbit = atoi(speed);
-        if (speed_mbit == 12)       speed_label = "USB 1.1 Full-Speed (12 Mbit/s)";
+        int usb_ver_major = atoi(ver);  /* "2.00" → 2, "1.10" → 1 */
+
+        if (speed_mbit == 12) {
+            /*
+             * 12 Mbit/s = Full-Speed. The DCP-130C is a "USB 2.0 Full-Speed"
+             * device — it's USB 2.0 compliant but only supports Full-Speed
+             * (same 12 Mbit/s as USB 1.1), NOT High-Speed (480 Mbit/s).
+             * The sysfs 'version' tells us the USB spec the device claims.
+             */
+            if (usb_ver_major >= 2)
+                speed_label = "USB 2.0 Full-Speed (12 Mbit/s)";
+            else
+                speed_label = "USB 1.1 Full-Speed (12 Mbit/s)";
+        }
         else if (speed_mbit == 480)  speed_label = "USB 2.0 High-Speed (480 Mbit/s)";
         else if (speed_mbit == 5000) speed_label = "USB 3.0 SuperSpeed (5 Gbit/s)";
         else if (strcmp(speed, "1.5") == 0) { speed_mbit = 1; speed_label = "USB 1.0 Low-Speed (1.5 Mbit/s)"; }
 
         fprintf(stderr, "[BROTHER2] usb: found %s (04f9:%s) at %s, speed: %s\n",
                 product[0] ? product : "Brother device", pid, ent->d_name, speed_label);
+        if (ver[0])
+            fprintf(stderr, "[BROTHER2] usb: device descriptor version: USB %s\n", ver);
 
         if (speed_mbit == 12) {
-            fprintf(stderr, "[BROTHER2] usb: NOTE — USB 1.1 limits throughput to ~70 KB/s. "
-                    "This is a hardware limit, not a software bottleneck.\n");
+            fprintf(stderr, "[BROTHER2] usb: NOTE — Full-Speed (12 Mbit/s) limits throughput to ~70 KB/s.\n");
+            if (usb_ver_major >= 2) {
+                fprintf(stderr, "[BROTHER2] usb: The DCP-130C is \"USB 2.0 Full-Speed\" — it is USB 2.0 compliant\n"
+                        "[BROTHER2] usb: but only supports Full-Speed (12 Mbit/s), NOT High-Speed (480 Mbit/s).\n"
+                        "[BROTHER2] usb: This is BY DESIGN — the scanner hardware has no High-Speed capability.\n"
+                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput for this device.\n");
+            }
         }
 
         /* Check if usblp is bound to any interface */
