@@ -847,3 +847,34 @@ CEOF
     grep -q 'C=RLENGTH.*Brsane2.ini' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
     grep -q 'Forcing compression is NOT possible' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
 }
+
+# --- mode-aware compression diagnostics ---
+
+@test "scandec: summary header includes scan mode name" {
+    grep -q 'scan session summary (%s mode)' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'mode_name' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: stores scan mode in g_stats for summary" {
+    grep -q 'mode_name.*24-bit RGB' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q '"8-bit gray"' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q '"1-bit B&W"' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: uncompressed message includes scan mode" {
+    grep -q 'ALL data uncompressed in %s mode' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: suggests grayscale test when color is uncompressed" {
+    grep -q 'True Gray.*mode to test' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'Grayscale transfers 3x less' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: compressed message includes mode name" {
+    grep -q 'compression in %s mode' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scanner: display_info tips suggest True Gray mode with timing" {
+    grep -q "True Gray.*3x less data" "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '30 sec.*88 sec' "$PROJECT_ROOT/install_scanner.sh"
+}

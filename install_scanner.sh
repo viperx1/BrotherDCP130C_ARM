@@ -1301,7 +1301,8 @@ display_info() {
     log_info "  is the 12 Mbit/s USB link, not the host CPU."
     echo
     log_info "Tips for faster scans:"
-    log_info "    - Use grayscale mode (3x less data than color)"
+    log_info "    - Use 'True Gray' mode (3x less data than color, ~30 sec vs ~88 sec)"
+    log_info "      scanimage -d 'brother2:bus1;dev1' --mode 'True Gray' --resolution=150 --format=pnm > scan.pnm"
     log_info "    - Use 150 DPI instead of 300 DPI (4x less data)"
     log_info "    - Ensure usblp is unbound: echo '<intf>' | sudo tee /sys/bus/usb/drivers/usblp/unbind"
     log_info "  For debug diagnostics, scan with: sudo BROTHER_DEBUG=1 scanimage ..."

@@ -88,6 +88,8 @@ static struct {
     unsigned long gaps_over_100; /* gaps > 100 ms */
     unsigned long gaps_over_1s;  /* gaps > 1 second */
     unsigned long gaps_over_5s;  /* gaps > 5 seconds */
+    const char   *mode_name;    /* scan mode for summary (e.g. "24-bit RGB") */
+    int           mode_bpp;     /* bytes per pixel (3=color, 1=gray, 0=bw) */
 } g_stats;
 
 __attribute__((constructor))
@@ -241,6 +243,11 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
         p->dwOutLineByte = (p->dwOutLinePixCnt + 7) / 8;
     }
 
+    /* Store mode info for summary diagnostics */
+    g_stats.mode_bpp = g_bpp;
+    g_stats.mode_name = (g_bpp == 3) ? "24-bit RGB" :
+                        (g_bpp == 1) ? "8-bit gray" : "1-bit B&W";
+
     if (p->bLongBoundary)
         p->dwOutLineByte = (p->dwOutLineByte + 3) & ~3UL;
 
@@ -268,8 +275,6 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
     }
 
     if (g_debug) {
-        const char *mode = (g_bpp == 3) ? "24-bit RGB" :
-                           (g_bpp == 1) ? "8-bit gray" : "1-bit B&W";
         fprintf(stderr, "%s [SCANDEC] ScanDecOpen: %lux%lu px, reso %dx%d→%dx%d, "
                 "mode=%s, outLine=%lu bytes\n",
                 debug_ts(),
@@ -277,7 +282,7 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
                 (unsigned long)p->dwOutLinePixCnt,
                 p->nInResoX, p->nInResoY,
                 p->nOutResoX, p->nOutResoY,
-                mode, (unsigned long)p->dwOutLineByte);
+                g_stats.mode_name, (unsigned long)p->dwOutLineByte);
     }
 
     return TRUE;
@@ -559,7 +564,7 @@ BOOL ScanDecClose(void)
         double min_xfer_wire_sec = g_stats.bytes_in > 0
             ? g_stats.bytes_in / (70.0 * 1024.0) : 0;
         fprintf(stderr,
-                "%s [SCANDEC] === scan session summary ===\n"
+                "%s [SCANDEC] === scan session summary (%s mode) ===\n"
                 "[SCANDEC]   total time:    %.1f ms (%.1f sec)\n"
                 "[SCANDEC]   lines:         %lu (white=%lu noncomp=%lu pack=%lu unknown=%lu)\n"
                 "[SCANDEC]   RGB planes:    %lu\n"
@@ -576,6 +581,7 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   throughput:    %.1f KB/s (output), %.1f KB/s (USB wire)\n"
                 "[SCANDEC]   min USB xfer:  %.1f sec for %.1f MB at ~70 KB/s Full-Speed\n",
                 debug_ts(),
+                g_stats.mode_name ? g_stats.mode_name : "unknown",
                 total_ms, total_ms / 1000.0,
                 g_stats.lines_total,
                 g_stats.lines_white, g_stats.lines_noncomp,
@@ -610,23 +616,32 @@ BOOL ScanDecClose(void)
             double pct_compressed = total_lines > 0
                 ? (compressed_lines * 100.0) / total_lines : 0;
             fprintf(stderr,
-                "[SCANDEC] compression: %.0f%% of lines used compression (PackBits=%lu, White=%lu, Raw=%lu)\n"
-                "[SCANDEC]   Scanner used PackBits run-length encoding for this scan mode.\n"
+                "[SCANDEC] compression: %.0f%% of lines used compression in %s mode (PackBits=%lu, White=%lu, Raw=%lu)\n"
+                "[SCANDEC]   Scanner used PackBits run-length encoding for %s mode.\n"
                 "[SCANDEC]   Compression ratio: %.1fx — %.1f MB sent over USB for %.1f MB of pixel data.\n",
                 pct_compressed,
+                g_stats.mode_name ? g_stats.mode_name : "this",
                 g_stats.lines_pack, g_stats.lines_white, g_stats.lines_noncomp,
+                g_stats.mode_name ? g_stats.mode_name : "this",
                 compress_ratio,
                 g_stats.bytes_in / (1024.0 * 1024.0),
                 g_stats.bytes_out / (1024.0 * 1024.0));
         } else if (g_stats.lines_noncomp > 0) {
+            const char *mode = g_stats.mode_name ? g_stats.mode_name : "this";
             fprintf(stderr,
-                "[SCANDEC] compression: scanner sent ALL data uncompressed (no PackBits or White lines).\n"
+                "[SCANDEC] compression: scanner sent ALL data uncompressed in %s mode.\n"
                 "[SCANDEC]   Compression ratio: %.1fx — no compression benefit for this scan.\n"
                 "[SCANDEC]   The backend requested PackBits (C=RLENGTH via Brsane2.ini compression=1)\n"
-                "[SCANDEC]   but the DCP-130C firmware ignores this for 24-bit Color mode.\n"
+                "[SCANDEC]   but the DCP-130C firmware ignores this for %s mode.\n"
                 "[SCANDEC]   Forcing compression is NOT possible — this is a scanner firmware decision.\n"
                 "[SCANDEC]   All %lu bytes were raw uncompressed pixel data over USB.\n",
-                compress_ratio, g_stats.bytes_in);
+                mode, compress_ratio, mode, g_stats.bytes_in);
+            /* Suggest testing other modes when color is uncompressed */
+            if (g_stats.mode_bpp == 3)
+                fprintf(stderr,
+                    "[SCANDEC] next step: try 'True Gray' mode to test if the scanner compresses grayscale data:\n"
+                    "[SCANDEC]   sudo BROTHER_DEBUG=1 scanimage -d 'brother2:bus1;dev1' --mode 'True Gray' --resolution=150 --format=pnm > gray_test.pnm\n"
+                    "[SCANDEC]   Grayscale transfers 3x less data (1 plane vs 3) — ~30 sec vs ~88 sec.\n");
         }
         if (decode_pct < 1.0 && g_stats.lines_total > 0) {
             fprintf(stderr,
