@@ -56,7 +56,7 @@ create_brother_udev_rule() {
     local rule_file="$1"
     cat > "$rule_file" << 'UDEV_EOF'
 # Brother DCP-130C scanner — allow scanner group access for saned/AirSane
-ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0666", GROUP="scanner", ENV{libsane_matched}="yes"
+ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0660", GROUP="scanner", ENV{libsane_matched}="yes"
 UDEV_EOF
 }
 

@@ -436,7 +436,7 @@ install_airsane() {
     if [[ ! -f "$udev_rule" ]]; then
         sudo tee "$udev_rule" > /dev/null << 'UDEV_EOF'
 # Brother DCP-130C scanner — allow scanner group access for saned/AirSane
-ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0666", GROUP="scanner", ENV{libsane_matched}="yes"
+ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0660", GROUP="scanner", ENV{libsane_matched}="yes"
 UDEV_EOF
         sudo udevadm control --reload-rules 2>/dev/null || true
         sudo udevadm trigger 2>/dev/null || true
