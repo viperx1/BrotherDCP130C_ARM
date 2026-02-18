@@ -46,6 +46,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCANNER_MODEL="DCP-130C"
 SCANNER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_scanner_install"
+SCANNER_SHARED=false
+AIRSANE_INSTALLED=false
+
+# AirSane eSCL/AirScan server — exposes SANE scanners to Windows, macOS, iOS, Android
+AIRSANE_VERSION="0.4.9"
+AIRSANE_URLS=(
+    "https://github.com/SimulPiscator/AirSane/archive/refs/tags/v${AIRSANE_VERSION}.tar.gz"
+    "https://github.com/SimulPiscator/AirSane/archive/v${AIRSANE_VERSION}.tar.gz"
+)
 
 # Driver filename
 DRIVER_BRSCAN2_FILE="brscan2-0.2.5-1.i386.deb"
@@ -244,6 +253,207 @@ fix_broken_packages() {
         fi
         log_info "Cleaned up broken package state. apt-get is working."
     fi
+}
+
+# Ask user whether to enable scanner sharing on the local network.
+# When enabled, the scanner will be shared via saned (SANE network daemon)
+# and discoverable on the LAN through Avahi/Bonjour (mDNS).
+ask_scanner_sharing() {
+    echo
+    log_info "Scanner sharing allows other devices on your local network to discover and use this scanner."
+    read -p "Do you want to enable scanner sharing on the local network? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        SCANNER_SHARED=true
+        log_info "Scanner sharing will be enabled."
+    else
+        SCANNER_SHARED=false
+        log_info "Scanner sharing will not be enabled. The scanner will only be available locally."
+    fi
+}
+
+# Configure scanner sharing on the local network via saned and Avahi.
+# saned provides network access to the scanner; Avahi advertises the
+# service via mDNS/DNS-SD so other devices can discover it automatically.
+setup_scanner_sharing() {
+    if [[ "$SCANNER_SHARED" != true ]]; then
+        return
+    fi
+
+    log_info "Configuring scanner sharing on the local network..."
+
+    # --- saned configuration ---
+    # saned.conf controls which hosts may access the scanner over the network.
+    local saned_conf="/etc/sane.d/saned.conf"
+    if [[ -f "$saned_conf" ]]; then
+        sudo cp "$saned_conf" "${saned_conf}.bak"
+    fi
+    # Allow all hosts on the local network (RFC 1918 private ranges) to connect.
+    # saned accepts CIDR notation for access control.
+    local -a acl_entries=("192.168.0.0/16" "10.0.0.0/8" "172.16.0.0/12")
+    for entry in "${acl_entries[@]}"; do
+        if ! grep -q "^${entry}$" "$saned_conf" 2>/dev/null; then
+            echo "$entry" | sudo tee -a "$saned_conf" > /dev/null
+            log_debug "Added $entry to saned.conf"
+        else
+            log_debug "$entry already in saned.conf"
+        fi
+    done
+
+    # Enable and start saned via systemd socket activation.
+    # saned.socket listens on port 6566 and spawns saned on demand.
+    if systemctl list-unit-files saned.socket &>/dev/null; then
+        sudo systemctl enable saned.socket || log_warn "Failed to enable saned.socket"
+        sudo systemctl start saned.socket || log_warn "Failed to start saned.socket"
+        log_debug "saned.socket status: $(systemctl is-active saned.socket 2>/dev/null || echo 'unknown')"
+    else
+        log_warn "saned.socket unit not found. saned may need manual configuration."
+    fi
+
+    # --- Avahi/mDNS advertisement ---
+    # Install Avahi daemon if not already present
+    if ! dpkg -s avahi-daemon &>/dev/null; then
+        log_info "Installing Avahi daemon for network scanner discovery..."
+        sudo apt-get install -y avahi-daemon 2>&1 | tail -3
+    else
+        log_debug "Avahi daemon is already installed"
+    fi
+    sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
+    sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
+    log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
+
+    # Publish a SANE scanner service via Avahi so that other devices on the
+    # network can automatically discover this scanner using DNS-SD / mDNS.
+    # The standard service type for SANE is _sane-port._tcp on port 6566.
+    local avahi_service_dir="/etc/avahi/services"
+    local avahi_service_file="${avahi_service_dir}/sane.service"
+    sudo mkdir -p "$avahi_service_dir"
+    sudo tee "$avahi_service_file" > /dev/null << 'AVAHI_EOF'
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">SANE scanner on %h</name>
+  <service>
+    <type>_sane-port._tcp</type>
+    <port>6566</port>
+  </service>
+</service-group>
+AVAHI_EOF
+    log_debug "Created Avahi service file: $avahi_service_file"
+
+    # Reload Avahi so it picks up the new service file
+    sudo systemctl reload avahi-daemon 2>/dev/null \
+        || sudo systemctl restart avahi-daemon 2>/dev/null \
+        || log_warn "Failed to reload avahi-daemon"
+
+    log_info "Scanner sharing configured. Other devices on the network can discover this scanner."
+
+    # --- AirSane eSCL server ---
+    # Install AirSane to expose the scanner via eSCL/AirScan protocol.
+    # This enables automatic discovery by Windows 10/11, macOS, iOS, and Android.
+    # saned alone only serves Linux SANE clients; AirSane adds cross-platform support.
+    install_airsane || log_warn "AirSane installation failed. Windows/macOS/iOS will not discover the scanner automatically."
+}
+
+# Build and install AirSane — an eSCL/AirScan server that wraps SANE scanners.
+# AirSane advertises via Avahi using _uscan._tcp (eSCL), making the scanner
+# discoverable by Windows 10/11, macOS, iOS, and Android out of the box.
+# Returns 0 on success, 1 on failure (non-fatal — saned still works for Linux).
+install_airsane() {
+    log_info "Installing AirSane eSCL server for Windows/macOS/iOS scanner discovery..."
+
+    # Install build dependencies
+    local airsane_deps=(cmake g++ libjpeg-dev libpng-dev libavahi-client-dev libusb-1.0-0-dev)
+    log_debug "Installing AirSane build dependencies: ${airsane_deps[*]}"
+    if ! sudo apt-get install -y "${airsane_deps[@]}" 2>&1 | tail -3; then
+        log_warn "Failed to install AirSane build dependencies."
+        return 1
+    fi
+
+    # Download AirSane source tarball
+    local airsane_tarball="$TMP_DIR/airsane-${AIRSANE_VERSION}.tar.gz"
+    log_debug "AirSane source URLs to try: ${AIRSANE_URLS[*]}"
+    if ! try_download "$airsane_tarball" "${AIRSANE_URLS[@]}"; then
+        log_warn "Failed to download AirSane source code."
+        return 1
+    fi
+
+    # Extract source
+    local airsane_src_dir="$TMP_DIR/AirSane-${AIRSANE_VERSION}"
+    if ! tar -xzf "$airsane_tarball" -C "$TMP_DIR" 2>&1; then
+        log_warn "Failed to extract AirSane source tarball."
+        return 1
+    fi
+    if [[ ! -d "$airsane_src_dir" ]]; then
+        # GitHub tarballs sometimes use different directory names
+        airsane_src_dir=$(find "$TMP_DIR" -maxdepth 1 -type d -name 'AirSane*' | head -1)
+        if [[ -z "$airsane_src_dir" || ! -d "$airsane_src_dir" ]]; then
+            log_warn "AirSane source directory not found after extraction."
+            return 1
+        fi
+    fi
+    log_debug "AirSane source directory: $airsane_src_dir"
+
+    # Build with cmake
+    local airsane_build_dir="$TMP_DIR/AirSane-build"
+    mkdir -p "$airsane_build_dir"
+    cd "$airsane_build_dir"
+
+    log_info "Building AirSane (this may take a few minutes)..."
+    if ! cmake "$airsane_src_dir" 2>&1 | tail -5; then
+        log_warn "AirSane cmake configuration failed."
+        cd "$TMP_DIR"
+        return 1
+    fi
+
+    if ! make -j"$(nproc)" 2>&1 | tail -5; then
+        log_warn "AirSane compilation failed."
+        cd "$TMP_DIR"
+        return 1
+    fi
+    log_info "AirSane built successfully."
+
+    # Install (creates binary, systemd service, config files)
+    if ! sudo make install 2>&1 | tail -5; then
+        log_warn "AirSane installation failed."
+        cd "$TMP_DIR"
+        return 1
+    fi
+    cd "$TMP_DIR"
+    log_debug "AirSane installed to $(command -v airsaned 2>/dev/null || echo '/usr/local/bin/airsaned')"
+
+    # Ensure the saned user (which AirSane runs as) can access the Brother USB scanner.
+    # The sane-utils package creates the saned user; we add it to the scanner group
+    # and create a udev rule granting the scanner group access to the device.
+    if id saned &>/dev/null; then
+        sudo usermod -a -G scanner saned 2>/dev/null || true
+        sudo usermod -a -G lp saned 2>/dev/null || true
+        log_debug "Added saned user to scanner and lp groups"
+    fi
+
+    # Create udev rule so the Brother scanner is accessible by the scanner group
+    local udev_rule="/etc/udev/rules.d/60-brother-scanner.rules"
+    if [[ ! -f "$udev_rule" ]]; then
+        sudo tee "$udev_rule" > /dev/null << 'UDEV_EOF'
+# Brother DCP-130C scanner — allow scanner group access for saned/AirSane
+ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0660", GROUP="scanner", ENV{libsane_matched}="yes"
+UDEV_EOF
+        sudo udevadm control --reload-rules 2>/dev/null || true
+        sudo udevadm trigger 2>/dev/null || true
+        log_debug "Created udev rule: $udev_rule"
+    else
+        log_debug "udev rule already exists: $udev_rule"
+    fi
+
+    # Enable and start AirSane service
+    sudo systemctl daemon-reload
+    sudo systemctl enable airsaned 2>/dev/null || log_warn "Failed to enable airsaned"
+    sudo systemctl start airsaned 2>/dev/null || log_warn "Failed to start airsaned"
+    log_debug "airsaned status: $(systemctl is-active airsaned 2>/dev/null || echo 'unknown')"
+
+    AIRSANE_INSTALLED=true
+    log_info "AirSane installed. Scanner is now discoverable by Windows, macOS, iOS, and Android."
+    return 0
 }
 
 # Install required dependencies
@@ -1313,6 +1523,33 @@ display_info() {
     log_info "  2. Run: sudo scanimage -L"
     log_info "  3. Check SANE backend: grep brother2 /etc/sane.d/dll.conf"
     echo
+    if [[ "$SCANNER_SHARED" == true ]]; then
+        local ip_addr
+        ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+        log_info "Scanner sharing: ENABLED"
+        log_info "Other devices on the network can discover and use this scanner."
+        log_info "  - Linux clients: Install sane-utils, then run 'scanimage -L' to discover"
+        log_info "  - The scanner is advertised via Avahi/mDNS (service: _sane-port._tcp)"
+        log_info "  - saned is listening on port 6566 (via systemd socket activation)"
+        if [[ -n "$ip_addr" ]]; then
+            log_info "  - Remote clients can add '$ip_addr' to /etc/sane.d/net.conf"
+        fi
+        if [[ "$AIRSANE_INSTALLED" == true ]]; then
+            log_info "  - AirSane eSCL server: RUNNING (port 8090)"
+            log_info "  - Windows 10/11: Go to Settings > Bluetooth & devices > Printers & Scanners > Add Device"
+            log_info "  - macOS / iOS: The scanner appears in Image Capture and other scanning apps"
+            log_info "  - Android: Use the Mopria Scan app to discover and scan"
+            if [[ -n "$ip_addr" ]]; then
+                log_info "  - AirSane web interface: http://${ip_addr}:8090/"
+            fi
+        else
+            log_info "  - AirSane: NOT INSTALLED (Windows/macOS/iOS will not discover the scanner)"
+            log_info "    Only Linux SANE clients can use the shared scanner."
+        fi
+    else
+        log_info "Scanner sharing: DISABLED (local only)"
+    fi
+    echo
     log_info "If you were added to the scanner group, you may need to log out and back in."
 }
 
@@ -1330,6 +1567,7 @@ main() {
     
     check_root
     check_architecture
+    ask_scanner_sharing
     fix_broken_packages
     install_dependencies
     create_temp_dir
@@ -1346,6 +1584,7 @@ main() {
 
     detect_scanner
     configure_scanner
+    setup_scanner_sharing
     test_scan
     cleanup
     display_info

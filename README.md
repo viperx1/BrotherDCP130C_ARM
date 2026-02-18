@@ -31,8 +31,9 @@ This repository contains automated installation scripts for the Brother DCP-130C
 2. **Downloads Drivers**: Fetches official Brother brscan2 scanner driver from Brother's website
 3. **ARM Compatibility**: Modifies i386 driver to work on ARM architecture
 4. **Automatic Configuration**: Configures the scanner in SANE with brsaneconfig2
-5. **Test Scan**: Offers optional test scan to verify installation
-6. **Error Handling**: Includes robust error checking and logging
+5. **Scanner Sharing**: Optional LAN sharing with saned, Avahi/Bonjour discovery, and AirSane (eSCL) server so other devices on the network — including **Windows**, **macOS**, **iOS**, and **Android** — can find and use the scanner
+6. **Test Scan**: Offers optional test scan to verify installation
+7. **Error Handling**: Includes robust error checking and logging
 
 ## Installation
 
@@ -79,13 +80,15 @@ The printer script will:
 
 The scanner script will:
 - Check system architecture
-- Install SANE, build tools, and dependencies
+- Ask whether to enable scanner sharing on the local network
+- Install SANE, build tools, and dependencies (plus saned and Avahi if sharing is enabled)
 - Download and prepare the brscan2 driver for ARM
 - Install the scanner driver and create SANE backend symlinks
 - **Compile a native ARM SANE backend from source** — this allows direct USB access without qemu emulation
 - Create ARM-native stub libraries for scan data decoding and color matching
 - Fall back to an i386 SANE environment with `qemu-i386-static` if native compilation fails
 - Configure the scanner with brsaneconfig2
+- If sharing was enabled, configure saned for network access, Avahi/Bonjour discovery, and build/install AirSane (eSCL server) for Windows/macOS/iOS/Android support
 - Optionally perform a test scan
 
 ## Usage
@@ -154,6 +157,26 @@ Other devices on the same network can then discover and use the printer automati
 - **Windows**: It can be added via the CUPS IPP URL (e.g. `http://<raspberry-pi-ip>:631/printers/Brother_DCP_130C`).
 
 If you chose **no** during installation, the printer is only available locally on the Raspberry Pi.
+
+### Scanner Sharing
+
+During installation, the scanner script asks whether you want to share the scanner on your local network. If you choose **yes**:
+
+- `saned` (SANE network daemon) is configured to accept connections from local network subnets via `/etc/sane.d/saned.conf`
+- `saned.socket` is enabled for systemd socket-activated access on port 6566
+- Avahi (mDNS/Bonjour) is installed and enabled, advertising the scanner as a `_sane-port._tcp` service so Linux SANE clients can discover it
+- [AirSane](https://github.com/SimulPiscator/AirSane) eSCL server is built from source and installed — this exposes the scanner via the **eSCL/AirScan protocol** (`_uscan._tcp`), enabling discovery by **Windows 10/11, macOS, iOS, and Android**
+- A udev rule is created so the `saned` user (which AirSane runs as) can access the Brother USB scanner
+
+Other devices on the same network can then discover and use the scanner automatically:
+
+- **Windows 10/11**: Go to **Settings > Bluetooth & devices > Printers & Scanners > Add Device**. The scanner will appear as an eSCL device. Click "Add" and use the Windows Scan app.
+- **macOS / iOS**: The scanner appears in **Image Capture** and other scanning apps as a Bonjour scanner.
+- **Android**: Install the [Mopria Scan](https://play.google.com/store/apps/details?id=org.mopria.scan.application) app to discover and scan.
+- **Linux**: Install `sane-utils`, then run `scanimage -L` to discover the shared scanner. You may also need to add the Raspberry Pi's IP to `/etc/sane.d/net.conf` on the client.
+- **Web interface**: Open `http://<raspberry-pi-ip>:8090/` in a browser to access AirSane's web interface for scanning.
+
+If you chose **no** during installation, the scanner is only available locally on the Raspberry Pi.
 
 ## Verification
 
