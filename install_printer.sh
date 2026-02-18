@@ -42,7 +42,6 @@ log_debug() {
 }
 
 # Variables
-PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
 PRINTER_SHARED=false
@@ -54,21 +53,11 @@ patch_lpadmin_calls() {
     local file="$1"
     local prefix="${2:-}"
     if grep -q 'lpadmin' "$file"; then
-        log_debug "Patching $file: commenting out lpadmin calls to prevent duplicate printer"
         # Comment out any non-comment line containing lpadmin (covers bare
         # "lpadmin", "/usr/sbin/lpadmin", backtick/subshell calls, and
         # variable-assigned invocations like result=`lpadmin ...`).
         # Lines that already start with # are left alone.
         $prefix sed -i '/^[[:space:]]*#/!{/lpadmin/s|^\([[:space:]]*\)\(.*\)|\1# [patched] \2|}' "$file"
-        # Log any remaining unpatched lpadmin references for debugging
-        local remaining
-        remaining=$($prefix grep -n 'lpadmin' "$file" | grep -v '^[0-9]*:[[:space:]]*#' || true)
-        if [[ -n "$remaining" ]]; then
-            log_debug "Remaining lpadmin references in $file after patching:"
-            log_debug "$remaining"
-        else
-            log_debug "All lpadmin calls in $file have been patched"
-        fi
     fi
 }
 
@@ -95,7 +84,6 @@ DRIVER_CUPS_URLS=(
 
 # Check if running as root
 check_root() {
-    log_debug "EUID=$EUID, USER=$USER"
     if [[ $EUID -eq 0 ]]; then
         log_warn "Running as root. This is recommended for installation."
     else
@@ -108,8 +96,6 @@ check_architecture() {
     log_info "Checking system architecture..."
     ARCH=$(uname -m)
     log_info "Detected architecture: $ARCH"
-    log_debug "Kernel: $(uname -r)"
-    log_debug "OS: $(grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null | tr '\n' ' ')"
     
     if [[ "$ARCH" != "armv7l" && "$ARCH" != "armv6l" && "$ARCH" != "aarch64" ]]; then
         log_warn "This script is designed for ARM architecture (Raspberry Pi). Detected: $ARCH"
@@ -143,17 +129,14 @@ ask_printer_sharing() {
 is_package_installed() {
     local pkg="$1"
     if dpkg -s "$pkg" &>/dev/null; then
-        log_debug "is_package_installed: '$pkg' is installed"
         echo "$pkg"
         return 0
     fi
     local t64_pkg="${pkg}t64"
     if dpkg -s "$t64_pkg" &>/dev/null; then
-        log_debug "is_package_installed: '$t64_pkg' is installed (t64 variant of '$pkg')"
         echo "$t64_pkg"
         return 0
     fi
-    log_debug "is_package_installed: '$pkg' is NOT installed"
     return 1
 }
 
@@ -166,35 +149,27 @@ resolve_package() {
     local installed
     # Check if already installed (original or t64 variant)
     if installed=$(is_package_installed "$pkg"); then
-        log_debug "resolve_package: '$pkg' already installed as '$installed'"
         echo "$installed"
         return
     fi
     # Not installed - check which variant is available in apt
     local policy
     local candidate
-    log_debug "resolve_package: checking apt for '$pkg'"
     policy=$(apt-cache policy "$pkg" 2>/dev/null)
     candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
-    log_debug "resolve_package: '$pkg' candidate='$candidate'"
     if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
-        log_debug "resolve_package: resolved '$pkg' -> '$pkg'"
         echo "$pkg"
         return
     fi
     # Try the t64 variant
     local t64_pkg="${pkg}t64"
-    log_debug "resolve_package: trying t64 variant '$t64_pkg'"
     policy=$(apt-cache policy "$t64_pkg" 2>/dev/null)
     candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
-    log_debug "resolve_package: '$t64_pkg' candidate='$candidate'"
     if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
-        log_debug "resolve_package: resolved '$pkg' -> '$t64_pkg'"
         echo "$t64_pkg"
         return
     fi
     # Fall back to the original name and let apt-get report the error
-    log_debug "resolve_package: no candidate found, falling back to '$pkg'"
     echo "$pkg"
 }
 
@@ -209,7 +184,6 @@ fix_broken_packages() {
         if dpkg -s "$pkg" &>/dev/null; then
             local status
             status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
-            log_debug "fix_broken_packages: $pkg status='$status'"
             if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured" || \
                echo "$status" | grep -qw "unpacked"; then
                 log_warn "Fixing broken package state: $pkg ($status)"
@@ -227,7 +201,6 @@ fix_broken_packages() {
                     for sp in "/var/lib/dpkg/info/${pkg_base}.${script}" \
                               "/var/lib/dpkg/info/${pkg}.${script}"; do
                         if [[ -f "$sp" ]]; then
-                            log_debug "Neutralizing broken maintainer script: $sp"
                             sudo cp "$sp" "${sp}.bak" 2>/dev/null || true
                             echo '#!/bin/sh' | sudo tee "$sp" > /dev/null
                             echo 'exit 0' | sudo tee -a "$sp" > /dev/null
@@ -237,14 +210,12 @@ fix_broken_packages() {
                 done
 
                 # Now try aggressive removal with all forces enabled
-                log_debug "Attempting dpkg --purge --force-all $pkg"
                 sudo dpkg --purge --force-all "$pkg" 2>/dev/null || true
 
                 # Verify removal succeeded
                 if dpkg -s "$pkg" &>/dev/null; then
                     local new_status
                     new_status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
-                    log_debug "Package $pkg still present after purge: $new_status"
 
                     # Last resort: directly clean the dpkg database
                     log_warn "Standard removal failed for $pkg, cleaning dpkg database directly..."
@@ -260,10 +231,7 @@ fix_broken_packages() {
                             /^$/ { if (skip) { skip=0; next } }
                             !skip { print }
                         ' /var/lib/dpkg/status.bak | sudo tee /var/lib/dpkg/status > /dev/null
-                        log_debug "Removed $pkg_base entry from dpkg status database"
                     fi
-                else
-                    log_debug "Package $pkg successfully removed"
                 fi
 
                 packages_fixed=1
@@ -274,11 +242,9 @@ fix_broken_packages() {
     if [[ $packages_fixed -eq 1 ]]; then
         # Run apt-get install -f to resolve any remaining dependency issues
         # left over after purging broken packages
-        log_debug "Running apt-get install -f to fix remaining dependency issues..."
         sudo apt-get install -f -y 2>/dev/null || true
 
         # Verify apt-get works now
-        log_debug "Verifying apt-get works after cleanup..."
         local check_output
         check_output=$(sudo apt-get check 2>&1 || true)
         if echo "$check_output" | grep -qi "reinst-required\|needs to be reinstalled"; then
@@ -296,13 +262,11 @@ fix_broken_packages() {
 install_dependencies() {
     log_info "Installing required dependencies..."
     
-    log_debug "Running apt-get update..."
     sudo apt-get update
     
     # Detect CUPS status
     if command -v systemctl &>/dev/null && systemctl is-active cups &>/dev/null; then
         log_info "CUPS is already running on this system."
-        log_debug "CUPS version: $(cups-config --version 2>/dev/null || dpkg -s cups 2>/dev/null | awk '/^Version:/ {print $2}' || echo 'unknown')"
     fi
     
     # Resolve library package names that may differ across Debian/Raspbian versions
@@ -325,7 +289,6 @@ install_dependencies() {
         a2ps
     )
 
-    log_debug "Final package list: ${packages[*]}"
 
     # Install CUPS and required tools
     sudo apt-get install -y "${packages[@]}"
@@ -339,14 +302,11 @@ setup_cups_service() {
     
     sudo systemctl enable cups
     sudo systemctl start cups
-    log_debug "CUPS service status: $(systemctl is-active cups 2>/dev/null || echo 'unknown')"
     
     # Add user to lpadmin group if not already
     if ! groups "$USER" | grep -q lpadmin; then
         sudo usermod -a -G lpadmin "$USER"
         log_info "Added $USER to lpadmin group. You may need to log out and back in for this to take effect."
-    else
-        log_debug "User $USER is already in lpadmin group"
     fi
 
     if [[ "$PRINTER_SHARED" == true ]]; then
@@ -360,10 +320,8 @@ setup_cups_service() {
 
             # Replace "Listen localhost:631" with "Port 631" so CUPS listens on all interfaces
             if grep -q '^Listen localhost:631' "$cupsd_conf"; then
-                log_debug "Changing CUPS to listen on all interfaces (Port 631)..."
                 sudo sed -i 's/^Listen localhost:631/Port 631/' "$cupsd_conf"
             elif ! grep -q '^Port 631' "$cupsd_conf"; then
-                log_debug "Adding Port 631 directive to cupsd.conf..."
                 echo 'Port 631' | sudo tee -a "$cupsd_conf" > /dev/null
             fi
 
@@ -372,7 +330,6 @@ setup_cups_service() {
             # CUPS' ServerName, causing a "printing service is not enabled"
             # error on the client even though the job prints.
             if ! grep -q '^ServerAlias' "$cupsd_conf"; then
-                log_debug "Adding ServerAlias * to cupsd.conf..."
                 sudo sed -i '/^Port 631/a ServerAlias *' "$cupsd_conf" 2>/dev/null \
                     || echo 'ServerAlias *' | sudo tee -a "$cupsd_conf" > /dev/null
             fi
@@ -396,7 +353,6 @@ setup_cups_service() {
             # Allow remote access to the printer in the <Location /> block
             # Add "Allow @LOCAL" if not already present so LAN clients can print
             if ! grep -q 'Allow @LOCAL' "$cupsd_conf"; then
-                log_debug "Adding 'Allow @LOCAL' to CUPS access control..."
                 sudo sed -i '/<Location \/>/,/<\/Location>/ {
                     /Order allow,deny/a\  Allow @LOCAL
                 }' "$cupsd_conf"
@@ -411,19 +367,15 @@ setup_cups_service() {
                 fi
             fi
 
-            log_debug "Updated cupsd.conf for network sharing"
         fi
 
         # Install and enable Avahi for mDNS/Bonjour printer discovery on LAN
         if ! dpkg -s avahi-daemon &>/dev/null; then
             log_info "Installing Avahi daemon for network printer discovery..."
             sudo apt-get install -y avahi-daemon 2>&1 | tail -3
-        else
-            log_debug "Avahi daemon is already installed"
         fi
         sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
         sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
-        log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
 
         # Restart CUPS to apply configuration changes
         log_info "Restarting CUPS to apply sharing configuration..."
@@ -450,17 +402,13 @@ try_download() {
     local urls=("$@")
     
     for url in "${urls[@]}"; do
-        log_debug "Trying download: $url"
         if wget -q --timeout=30 --tries=2 -O "$output_file" "$url" 2>/dev/null; then
             # Verify we got an actual file (not an HTML error page)
             if [[ -s "$output_file" ]] && file "$output_file" | grep -qi "debian\|archive\|data"; then
                 log_info "Downloaded successfully from: $url"
                 return 0
             fi
-            log_debug "Download from $url succeeded but file appears invalid, trying next..."
             rm -f "$output_file"
-        else
-            log_debug "Download failed from: $url"
         fi
     done
     
@@ -473,7 +421,6 @@ download_drivers() {
     
     # Download LPR driver
     log_info "Downloading LPR driver (${DRIVER_LPR_FILE})..."
-    log_debug "LPR driver URLs to try: ${DRIVER_LPR_URLS[*]}"
     if ! try_download dcp130clpr.deb "${DRIVER_LPR_URLS[@]}"; then
         log_error "Failed to download LPR driver from all sources."
         log_error "URLs tried:"
@@ -483,11 +430,9 @@ download_drivers() {
         log_error "Please download ${DRIVER_LPR_FILE} manually and place it in ${TMP_DIR}/"
         exit 1
     fi
-    log_debug "LPR driver downloaded: $(ls -lh dcp130clpr.deb)"
     
     # Download CUPS wrapper driver
     log_info "Downloading CUPS wrapper driver (${DRIVER_CUPS_FILE})..."
-    log_debug "CUPS wrapper URLs to try: ${DRIVER_CUPS_URLS[*]}"
     if ! try_download dcp130ccupswrapper.deb "${DRIVER_CUPS_URLS[@]}"; then
         log_error "Failed to download CUPS wrapper driver from all sources."
         log_error "URLs tried:"
@@ -497,7 +442,6 @@ download_drivers() {
         log_error "Please download ${DRIVER_CUPS_FILE} manually and place it in ${TMP_DIR}/"
         exit 1
     fi
-    log_debug "CUPS wrapper downloaded: $(ls -lh dcp130ccupswrapper.deb)"
     
     log_info "Drivers downloaded successfully."
 }
@@ -513,15 +457,11 @@ extract_and_modify_drivers() {
     log_info "Extracting LPR driver..."
     dpkg-deb -x dcp130clpr.deb lpr_extract/
     dpkg-deb -e dcp130clpr.deb lpr_extract/DEBIAN
-    log_debug "LPR control before modification:"
-    log_debug "$(cat lpr_extract/DEBIAN/control)"
     
     # Extract CUPS wrapper driver
     log_info "Extracting CUPS wrapper driver..."
     dpkg-deb -x dcp130ccupswrapper.deb cups_extract/
     dpkg-deb -e dcp130ccupswrapper.deb cups_extract/DEBIAN
-    log_debug "CUPS wrapper control before modification:"
-    log_debug "$(cat cups_extract/DEBIAN/control)"
     
     # Modify control files to remove architecture restrictions
     sed -i 's/Architecture: .*/Architecture: all/' lpr_extract/DEBIAN/control
@@ -540,7 +480,6 @@ extract_and_modify_drivers() {
         for script in preinst postinst prerm postrm; do
             if [[ -f "$script_dir/$script" ]]; then
                 if grep -q '/etc/init.d/lpd' "$script_dir/$script"; then
-                    log_debug "Patching $script_dir/$script: removing /etc/init.d/lpd references"
                     sed -i 's|/etc/init.d/lpd|/bin/true|g' "$script_dir/$script"
                 fi
                 if [[ "$script_dir" == "cups_extract/DEBIAN" ]]; then
@@ -565,21 +504,14 @@ extract_and_modify_drivers() {
     wrapper_script=$(find cups_extract/ -name 'cupswrapper*dcp130c*' -type f 2>/dev/null | head -n 1)
     if [[ -n "$wrapper_script" ]]; then
         if grep -qF '/etc/init.d/lpd' "$wrapper_script"; then
-            log_debug "Patching cupswrapper script: $wrapper_script (removing /etc/init.d/lpd references)"
             sed -i 's|/etc/init.d/lpd|/bin/true|g' "$wrapper_script"
         fi
         if grep -q 'lpadmin' "$wrapper_script"; then
             patch_lpadmin_calls "$wrapper_script"
         fi
         chmod 755 "$wrapper_script"
-    else
-        log_debug "No cupswrapper script found in cups_extract to patch"
     fi
     
-    log_debug "LPR control after modification:"
-    log_debug "$(cat lpr_extract/DEBIAN/control)"
-    log_debug "CUPS wrapper control after modification:"
-    log_debug "$(cat cups_extract/DEBIAN/control)"
     
     log_info "Drivers prepared for ARM installation."
 }
@@ -605,12 +537,10 @@ repackage_drivers() {
 # DCP-130C printers and removes any that are not $PRINTER_NAME, so only
 # one properly-configured printer remains.
 remove_duplicate_printers() {
-    log_debug "Checking for duplicate DCP-130C printers in CUPS..."
 
     # List all CUPS printer names
     local all_printers
     all_printers=$(lpstat -e 2>/dev/null || true)
-    log_debug "All CUPS printers: ${all_printers:-<none>}"
 
     # Known auto-created names from Brother's cupswrapper scripts,
     # plus common variations from manual/repeated installs.
@@ -665,15 +595,12 @@ remove_duplicate_printers() {
         [[ "$ppd_base" == "$PRINTER_NAME" ]] && continue
         # Remove any PPD matching DCP-130C variants (case-insensitive)
         if echo "$ppd_base" | grep -qi "dcp[-_.]130c\|dcp130c"; then
-            log_debug "Removing orphan PPD: $ppd"
             sudo rm -f "$ppd"
         fi
     done
 
     if [[ $removed -gt 0 ]]; then
         log_info "Removed $removed duplicate DCP-130C printer(s)."
-    else
-        log_debug "No duplicate DCP-130C printers found."
     fi
 }
 
@@ -693,23 +620,19 @@ install_drivers() {
     
     # Install LPR driver
     log_info "Installing LPR driver..."
-    log_debug "LPR package: $(ls -lh dcp130clpr_arm.deb)"
     if ! sudo dpkg -i --force-all dcp130clpr_arm.deb; then
         log_warn "LPR driver installation reported errors, attempting to fix dependencies..."
     fi
     
     # Install CUPS wrapper driver
     log_info "Installing CUPS wrapper driver..."
-    log_debug "CUPS wrapper package: $(ls -lh dcp130ccupswrapper_arm.deb)"
     if ! sudo dpkg -i --force-all dcp130ccupswrapper_arm.deb; then
         log_warn "CUPS wrapper driver installation reported errors, attempting to fix dependencies..."
     fi
 
     # Debug: show what printers dpkg postinst created
-    log_debug "CUPS printers after dpkg -i cupswrapper: $(lpstat -e 2>/dev/null || echo '<none>')"
     
     # Fix any dependency issues
-    log_debug "Running apt-get install -f to fix dependencies..."
     sudo apt-get install -f -y || true
 
     # Patch the installed cupswrapper script if it still has /etc/init.d/lpd references
@@ -717,13 +640,10 @@ install_drivers() {
     local installed_wrapper="/usr/local/Brother/Printer/dcp130c/cupswrapper/cupswrapperdcp130c"
     if [[ -f "$installed_wrapper" ]]; then
         if grep -qF '/etc/init.d/lpd' "$installed_wrapper"; then
-            log_debug "Patching installed cupswrapper script: $installed_wrapper (removing /etc/init.d/lpd)"
             sudo sed -i 's|/etc/init.d/lpd|/bin/true|g' "$installed_wrapper"
         fi
         if grep -q 'lpadmin' "$installed_wrapper"; then
             patch_lpadmin_calls "$installed_wrapper" sudo
-        else
-            log_debug "No lpadmin calls found in installed cupswrapper (already patched by package)"
         fi
     fi
 
@@ -734,12 +654,11 @@ install_drivers() {
     if [[ -f "$installed_wrapper" ]]; then
         log_info "Re-running cupswrapper setup to ensure filter pipeline is configured..."
         sudo "$installed_wrapper" 2>&1 | while IFS= read -r line; do
-            log_debug "cupswrapper: $line"
+            true
         done || log_warn "cupswrapper script returned non-zero exit code"
     fi
 
     # Debug: show printer state after cupswrapper re-run
-    log_debug "CUPS printers after cupswrapper re-run: $(lpstat -e 2>/dev/null || echo '<none>')"
 
     # Remove any auto-created DCP-130C printers. The cupswrapper postinst
     # (before our patches took effect) or a previous installation may have
@@ -749,21 +668,13 @@ install_drivers() {
     remove_duplicate_printers
 
     # Verify the filter binary/script exists
-    log_debug "Checking Brother filter pipeline..."
     local filter_path="/usr/lib/cups/filter/brlpdwrapperdcp130c"
-    if [[ -f "$filter_path" ]] || [[ -L "$filter_path" ]]; then
-        log_debug "Filter found: $(ls -lh "$filter_path")"
-        log_debug "Filter type: $(file "$filter_path" 2>/dev/null || echo 'unknown')"
-    else
+    if [[ ! -f "$filter_path" ]] && [[ ! -L "$filter_path" ]]; then
         # Check alternative locations
         local alt_filter
         alt_filter=$(find /usr/lib/cups/filter/ /usr/libexec/cups/filter/ -iname '*dcp130c*' 2>/dev/null | head -n 1)
-        if [[ -n "$alt_filter" ]]; then
-            log_debug "Filter found at alternate location: $(ls -lh "$alt_filter")"
-        else
+        if [[ -z "$alt_filter" ]]; then
             log_warn "Brother filter not found in CUPS filter directory!"
-            log_debug "Available Brother filters: $(find /usr/lib/cups/filter/ /usr/libexec/cups/filter/ -iname '*brother*' -o -iname '*brlpd*' 2>/dev/null || echo 'none')"
-            log_debug "Brother printer files: $(find /usr/local/Brother/ -type f 2>/dev/null | head -20 || echo 'none')"
         fi
     fi
 
@@ -779,7 +690,6 @@ install_drivers() {
         "$f" --version &>/dev/null || "$f" --help &>/dev/null || "$f" &>/dev/null
     }
 
-    log_debug "Scanning Brother driver directory for i386 binaries..."
     local i386_binaries_found=0
     local i386_binaries_failed=0
     while IFS= read -r -d '' bin_file; do
@@ -787,18 +697,13 @@ install_drivers() {
         bin_type=$(file "$bin_file" 2>/dev/null || echo 'unknown')
         if echo "$bin_type" | grep -qi "ELF.*Intel 80386\|ELF.*i386\|ELF.*x86-64\|ELF.*80386"; then
             i386_binaries_found=$((i386_binaries_found + 1))
-            log_debug "i386 binary: $bin_file"
             if ! can_execute_binary "$bin_file"; then
                 i386_binaries_failed=$((i386_binaries_failed + 1))
-                log_debug "  -> FAILED to execute"
-            else
-                log_debug "  -> executes OK"
             fi
         fi
     done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
 
     if [[ $i386_binaries_found -gt 0 ]]; then
-        log_debug "Found $i386_binaries_found i386 ELF binaries, $i386_binaries_failed failed to execute"
         if [[ $i386_binaries_failed -gt 0 ]]; then
             log_warn "$i386_binaries_failed of $i386_binaries_found Brother i386 binaries cannot execute on this ARM system."
             log_info "Setting up i386 binary support..."
@@ -807,8 +712,6 @@ install_drivers() {
             if ! dpkg -s qemu-user-static &>/dev/null; then
                 log_info "Installing qemu-user-static..."
                 sudo apt-get install -y qemu-user-static 2>&1 | tail -3
-            else
-                log_debug "qemu-user-static is already installed"
             fi
 
             # Step 2: Provide the i386 dynamic linker (/lib/ld-linux.so.2)
@@ -817,8 +720,6 @@ install_drivers() {
             # Debian mirrors and extract the needed files.
             if [[ ! -f /lib/ld-linux.so.2 ]] || [[ ! -f /lib/i386-linux-gnu/libc.so.6 ]]; then
                 log_info "i386 libraries missing. Downloading from Debian mirrors..."
-                log_debug "ld-linux.so.2 exists: $(test -f /lib/ld-linux.so.2 && echo yes || echo no)"
-                log_debug "libc.so.6 exists: $(test -f /lib/i386-linux-gnu/libc.so.6 && echo yes || echo no)"
                 local i386_tmp
                 i386_tmp=$(mktemp -d)
                 local libc6_deb="${i386_tmp}/libc6_i386.deb"
@@ -831,14 +732,9 @@ install_drivers() {
                     | sort -V | tail -1)
 
                 if [[ -n "$libc6_filename" ]]; then
-                    log_debug "Downloading: ${libc6_url}${libc6_filename}"
                     if wget -q --timeout=30 -O "$libc6_deb" "${libc6_url}${libc6_filename}" 2>/dev/null; then
-                        log_debug "Extracting i386 libraries..."
                         dpkg-deb -x "$libc6_deb" "${i386_tmp}/extract/" 2>/dev/null
                         # Debug: show what was extracted
-                        if [[ "$DEBUG" == "1" ]]; then
-                            log_debug "Extracted directories: $(find "${i386_tmp}/extract/" -maxdepth 4 -type d 2>/dev/null | head -20)"
-                        fi
                         # Copy ld-linux.so.2 to /lib/ where the kernel's binfmt_misc expects it
                         local ld_linux
                         ld_linux=$(find "${i386_tmp}/extract/" \( -name 'ld-linux.so.2' -o -name 'ld-linux*.so*' \) 2>/dev/null | head -1)
@@ -851,24 +747,18 @@ install_drivers() {
                         local i386_lib_dir
                         i386_lib_dir=$(find "${i386_tmp}/extract/" -type d -name 'i386-linux-gnu' 2>/dev/null | head -1)
                         if [[ -n "$i386_lib_dir" ]]; then
-                            log_debug "Found i386 lib directory: $i386_lib_dir"
                             sudo mkdir -p /lib/i386-linux-gnu
                             sudo cp -a "${i386_lib_dir}/"* /lib/i386-linux-gnu/ 2>/dev/null || true
-                            log_debug "Copied i386 libs to /lib/i386-linux-gnu/"
                         else
-                            log_debug "No i386-linux-gnu directory found, searching for libc.so.6 directly..."
                             local libc_so
                             libc_so=$(find "${i386_tmp}/extract/" \( -name 'libc.so.6' -o -name 'libc-*.so' \) 2>/dev/null | head -1)
                             if [[ -n "$libc_so" ]]; then
                                 local libc_dir
                                 libc_dir=$(dirname "$libc_so")
-                                log_debug "Found libc.so.6 at: $libc_so (dir: $libc_dir)"
                                 sudo mkdir -p /lib/i386-linux-gnu
                                 sudo cp -a "${libc_dir}/"*.so* /lib/i386-linux-gnu/ 2>/dev/null || true
-                                log_debug "Copied i386 libs from $libc_dir to /lib/i386-linux-gnu/"
                             else
                                 log_warn "Could not find libc.so.6 anywhere in extracted package"
-                                log_debug "Extracted contents: $(find "${i386_tmp}/extract/" -type f -name '*.so*' 2>/dev/null | head -20)"
                             fi
                         fi
                         # Verify libc.so.6 was installed
@@ -880,10 +770,8 @@ install_drivers() {
                         # Register i386 library paths with the dynamic linker
                         if ! grep -qsF 'i386-linux-gnu' /etc/ld.so.conf.d/i386-linux-gnu.conf 2>/dev/null; then
                             printf "/lib/i386-linux-gnu\n/usr/lib/i386-linux-gnu\n" | sudo tee /etc/ld.so.conf.d/i386-linux-gnu.conf > /dev/null
-                            log_debug "Registered i386 library paths in ld.so.conf.d"
                         fi
                         sudo ldconfig 2>/dev/null || true
-                        log_debug "Ran ldconfig to update library cache"
                     else
                         log_warn "Could not download libc6 i386 from Debian mirrors."
                     fi
@@ -891,8 +779,6 @@ install_drivers() {
                     log_warn "Could not find libc6 i386 package in Debian pool."
                 fi
                 rm -rf "$i386_tmp"
-            else
-                log_debug "i386 libraries already present: /lib/ld-linux.so.2 and /lib/i386-linux-gnu/libc.so.6"
             fi
 
             # Fix Raspberry Pi /etc/ld.so.preload that causes errors under qemu-user-static.
@@ -901,7 +787,6 @@ install_drivers() {
             if [[ -f /etc/ld.so.preload ]] && grep -q 'libarmmem' /etc/ld.so.preload 2>/dev/null; then
                 log_info "Fixing /etc/ld.so.preload for i386 compatibility..."
                 sudo sed -i 's|^[[:space:]]*/usr/lib/arm-linux-gnueabihf/libarmmem|# Commented for i386 compat: /usr/lib/arm-linux-gnueabihf/libarmmem|' /etc/ld.so.preload
-                log_debug "Commented out libarmmem preload to prevent i386 binary errors"
             fi
 
             # Re-check binaries after installing i386 support
@@ -915,8 +800,6 @@ install_drivers() {
                         recheck_failed=$((recheck_failed + 1))
                         local run_err
                         run_err=$("$bin_file" 2>&1 || true)
-                        log_debug "Still fails: $bin_file"
-                        log_debug "  Error: ${run_err:-<no output>}"
                     fi
                 fi
             done < <(find /usr/local/Brother/Printer/dcp130c/ -type f -print0 2>/dev/null)
@@ -931,8 +814,6 @@ install_drivers() {
         else
             log_info "All Brother i386 binaries execute successfully on this ARM system."
         fi
-    else
-        log_debug "No i386 ELF binaries found (driver uses shell scripts only)"
     fi
 
     # Restore original Brother filter if it was previously wrapped.
@@ -943,9 +824,7 @@ install_drivers() {
     # BRMonoColor option for grayscale — no wrapper is needed.
     local brother_filter="/usr/lib/cups/filter/brlpdwrapperdcp130c"
     if [[ -f "${brother_filter}.real" ]]; then
-        log_debug "Restoring original Brother filter (removing grayscale wrapper)..."
         sudo mv -f "${brother_filter}.real" "$brother_filter"
-        log_debug "Original Brother filter restored: $brother_filter"
     fi
 
     # Patch the Brother filter script to translate CUPS color mode options
@@ -958,7 +837,6 @@ install_drivers() {
     # options contain ColorModel=Gray or print-color-mode=monochrome.
     if [[ -f "$brother_filter" ]]; then
         if ! grep -q 'BRMonoColor' "$brother_filter"; then
-            log_debug "Patching Brother filter to translate ColorModel to BRMonoColor..."
             # Insert color mode translation right after the shebang line
             sudo sed -i '1 a\
 # --- Grayscale patch: translate CUPS ColorModel to Brother BRMonoColor ---\
@@ -970,14 +848,10 @@ case "$5" in\
     ;;\
 esac\
 # --- End grayscale patch ---' "$brother_filter"
-            log_debug "Brother filter patched for grayscale: $brother_filter"
-        else
-            log_debug "Brother filter already has BRMonoColor handling"
         fi
     fi
 
     # Restart CUPS to pick up new filters
-    log_debug "Restarting CUPS to pick up new filters..."
     sudo systemctl restart cups 2>/dev/null || true
 
     log_info "Drivers installed successfully."
@@ -987,8 +861,6 @@ esac\
 detect_printer() {
     log_info "Detecting Brother DCP-130C printer..."
     
-    log_debug "USB devices:"
-    log_debug "$(lsusb 2>/dev/null || echo 'lsusb not available')"
     
     # Check USB connection
     if lsusb | grep -i "Brother"; then
@@ -998,8 +870,6 @@ detect_printer() {
         log_warn "Brother printer not detected on USB. Please ensure the printer is connected and powered on."
     fi
     
-    log_debug "CUPS backends:"
-    log_debug "$(lpinfo -v 2>/dev/null || echo 'lpinfo not available')"
     
     # Check printer device
     if lpinfo -v | grep -i "Brother"; then
@@ -1021,7 +891,6 @@ configure_printer() {
     
     # Get the printer URI
     PRINTER_URI=$(lpinfo -v | grep -i "Brother.*DCP-130C" | awk '{print $2}' | head -n 1)
-    log_debug "Auto-detected printer URI: '${PRINTER_URI:-<empty>}'"
     
     if [[ -z "$PRINTER_URI" ]]; then
         log_warn "Could not auto-detect printer URI. Using default USB URI."
@@ -1033,7 +902,6 @@ configure_printer() {
     # Remove existing printer if it exists
     lpstat -p "$PRINTER_NAME" &>/dev/null && {
         log_info "Removing existing printer configuration..."
-        log_debug "Removing printer: $PRINTER_NAME"
         sudo lpadmin -x "$PRINTER_NAME"
     }
     
@@ -1045,7 +913,6 @@ configure_printer() {
     )
     
     # Also search dynamically
-    log_debug "Searching for DCP-130C PPD files..."
     local found_ppd
     found_ppd=$(find /usr/share/cups/model/ /usr/share/ppd/ /opt/brother/ -iname '*dcp130c*.ppd' 2>/dev/null | head -n 1)
     if [[ -n "$found_ppd" ]]; then
@@ -1055,7 +922,6 @@ configure_printer() {
     for path in "${ppd_search_paths[@]}"; do
         if [[ -f "$path" ]]; then
             ppd_file="$path"
-            log_debug "PPD file found: $(ls -lh "$ppd_file")"
             break
         fi
     done
@@ -1067,7 +933,6 @@ configure_printer() {
     # entries that map IPP print-color-mode to the Brother driver's
     # native BRMonoColor option.
     if [[ -n "$ppd_file" ]] && ! grep -q 'APPrinterPreset' "$ppd_file"; then
-        log_debug "Patching PPD to add print-color-mode IPP attributes..."
         local patched_ppd
         patched_ppd=$(mktemp /tmp/brother_dcp130c_patched.XXXXXX.ppd)
         cp "$ppd_file" "$patched_ppd"
@@ -1081,19 +946,16 @@ configure_printer() {
 *APPrinterPreset Grayscale/Grayscale: "*BRMonoColor BrMono"
 COLORPATCH
         ppd_file="$patched_ppd"
-        log_debug "Patched PPD with color mode mapping: $patched_ppd"
     fi
     
     # Check if we also have a PPD via lpinfo -m (CUPS driver list)
     if [[ -z "$ppd_file" ]]; then
-        log_debug "No PPD file found on disk, checking CUPS driver list..."
         local cups_driver
         cups_driver=$(lpinfo -m 2>/dev/null | grep -i "dcp.*130c\|DCP-130C" | awk '{print $1}' | head -n 1)
         if [[ -n "$cups_driver" ]]; then
             log_info "Found CUPS driver: $cups_driver"
             log_info "Adding printer to CUPS using driver..."
             local share_opt="printer-is-shared=$PRINTER_SHARED"
-            log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -m $cups_driver -E -o $share_opt"
             sudo lpadmin -p "$PRINTER_NAME" \
                 -v "$PRINTER_URI" \
                 -m "$cups_driver" \
@@ -1108,8 +970,6 @@ COLORPATCH
                 -o ColorModel=RGB
 
             # Debug: verify options were set
-            log_debug "Printer options after configure:"
-            log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|BRMonoColor' || echo '<no matching options>')"
             
             sudo lpadmin -d "$PRINTER_NAME"
             sudo cupsenable "$PRINTER_NAME"
@@ -1194,13 +1054,11 @@ COLORPATCH
 *APPrinterPreset Color/Color: "*ColorModel RGB"
 *APPrinterPreset Grayscale/Grayscale: "*ColorModel Gray"
 PPEOF
-        log_debug "Generated basic PPD at $ppd_file"
     fi
     
     # Add the printer
     local share_opt="printer-is-shared=$PRINTER_SHARED"
     log_info "Adding printer to CUPS..."
-    log_debug "lpadmin -p $PRINTER_NAME -v $PRINTER_URI -P $ppd_file -E -o $share_opt"
     sudo lpadmin -p "$PRINTER_NAME" \
         -v "$PRINTER_URI" \
         -P "$ppd_file" \
@@ -1217,18 +1075,13 @@ PPEOF
     # Verify the installed PPD and Brother filter
     local installed_ppd="/etc/cups/ppd/${PRINTER_NAME}.ppd"
     if [[ -f "$installed_ppd" ]]; then
-        log_debug "Installed PPD filter/color options:"
-        log_debug "$(grep -iE 'ColorModel|cupsFilter|color-mode|BRMonoColor|APPrinterPreset' "$installed_ppd" || echo '<none>')"
         # Ensure no stale cupsFilter2 entries from previous installs
         if grep -q 'cupsFilter2.*brother_grayscale_prefilter' "$installed_ppd"; then
-            log_debug "Removing stale cupsFilter2 entry from installed PPD"
             sudo sed -i '/cupsFilter2.*brother_grayscale_prefilter/d' "$installed_ppd"
         fi
     fi
 
     # Debug: verify PPD options are visible to CUPS
-    log_debug "Printer options after configure:"
-    log_debug "$(lpoptions -p "$PRINTER_NAME" -l 2>/dev/null | grep -iE 'ColorModel|color-mode|BRMonoColor' || echo '<no matching options>')"
     
     # Set as default printer
     sudo lpadmin -d "$PRINTER_NAME"
@@ -1280,7 +1133,6 @@ EOF
         if [[ "$DEBUG" == "1" ]]; then
             current_log_level=$(grep -i "^LogLevel" /etc/cups/cupsd.conf 2>/dev/null | awk '{print $2}' || echo "warn")
             if [[ "$current_log_level" != "debug" && "$current_log_level" != "debug2" ]]; then
-                log_debug "Temporarily enabling CUPS debug logging (was: $current_log_level)..."
                 sudo sed -i "s/^LogLevel .*/LogLevel debug/" /etc/cups/cupsd.conf 2>/dev/null || true
                 sudo systemctl restart cups 2>/dev/null || true
                 sleep 2
@@ -1296,7 +1148,6 @@ EOF
         log_info "Sending test page to printer..."
         local job_output
         job_output=$(lpr -P "$PRINTER_NAME" /tmp/test_page.txt 2>&1) || true
-        log_debug "lpr output: '${job_output:-<empty>}'"
         
         # Wait for the job to be processed
         sleep 5
@@ -1309,24 +1160,12 @@ EOF
         log_info "Printer status: $printer_status"
         
         # Show all recent jobs for this printer
-        log_debug "Recent print jobs:"
-        log_debug "$(lpstat -W completed -o "$PRINTER_NAME" 2>/dev/null || lpstat -o "$PRINTER_NAME" 2>/dev/null || echo 'no jobs found')"
         
         # Check CUPS error log for new entries since we sent the job
         if [[ -f /var/log/cups/error_log ]]; then
             local new_log_entries
             new_log_entries=$(tail -n +"$((log_lines_before + 1))" /var/log/cups/error_log 2>/dev/null || true)
             if [[ -n "$new_log_entries" ]]; then
-                # Filter to show only important lines (errors, warnings, job/filter activity)
-                # Skip verbose IPP client chatter (Client N, HTTP, Content-Length, etc.)
-                local important_entries
-                important_entries=$(echo "$new_log_entries" \
-                    | grep -iE "^\w \[.*\] \[Job [0-9]|^E \[|filter|backend|Started |PID [0-9]+ .* exited|ld-linux|Could not open|Sent [0-9]+ bytes" \
-                    | grep -viE "envp\[|argv\[" || true)
-                if [[ -n "$important_entries" ]]; then
-                    log_debug "CUPS job/filter log entries:"
-                    log_debug "$important_entries"
-                fi
                 # Check for actual filter/backend errors (NOT normal client disconnects)
                 if echo "$new_log_entries" | grep -qiE "\[Job [0-9]+\].*(not available|no such file|filter failed|exec format error|ld-linux|Could not open|cannot open shared object|libarmmem)" \
                     || echo "$new_log_entries" | grep -qP "\[Job [0-9]+\].*Sent 0 bytes"; then
@@ -1342,8 +1181,6 @@ EOF
                         log_warn "This usually means the Brother i386 binary can't run on ARM."
                     fi
                 fi
-            else
-                log_debug "No new CUPS log entries for this print job"
             fi
         fi
 
@@ -1351,7 +1188,6 @@ EOF
         # (restarting while the job is active would kill it)
         local wait_count=0
         while lpq -P "$PRINTER_NAME" 2>/dev/null | grep -q "active\|pending" && [[ $wait_count -lt 30 ]]; do
-            log_debug "Print job still in queue, waiting..."
             sleep 2
             wait_count=$((wait_count + 1))
         done
@@ -1361,7 +1197,6 @@ EOF
 
         # Restore CUPS log level if we changed it
         if [[ $cups_log_level_changed -eq 1 ]]; then
-            log_debug "Restoring CUPS log level to $current_log_level..."
             sudo sed -i "s/^LogLevel .*/LogLevel $current_log_level/" /etc/cups/cupsd.conf 2>/dev/null || true
             sudo systemctl restart cups 2>/dev/null || true
         fi
@@ -1417,19 +1252,11 @@ display_info() {
     log_info "To manage printer: http://localhost:631"
     echo
     log_info "If you were added to the lpadmin group, you may need to log out and back in."
-    log_debug "All CUPS printers after installation: $(lpstat -e 2>/dev/null || echo '<none>')"
 }
 
 # Main installation process
 main() {
     log_info "Starting Brother DCP-130C printer driver installation..."
-    if [[ "$DEBUG" == "1" ]]; then
-        log_debug "Debug mode is active"
-        log_debug "Script: $0"
-        log_debug "Date: $(date)"
-        log_debug "Shell: $BASH_VERSION"
-        log_debug "System: $(uname -a)"
-    fi
     echo
     
     check_root
@@ -1451,13 +1278,11 @@ main() {
     # Final cleanup: remove any duplicate printers that may have been
     # re-created by CUPS restarts during installation.  This must be the
     # last step before displaying results.
-    log_debug "CUPS printers before final cleanup: $(lpstat -e 2>/dev/null || echo '<none>')"
     remove_duplicate_printers
     # Restart CUPS once more so it forgets the removed queues
     sudo systemctl restart cups 2>/dev/null || true
     # Brief pause to let CUPS settle, then verify
     sleep 2
-    log_debug "CUPS printers after final cleanup + restart: $(lpstat -e 2>/dev/null || echo '<none>')"
 
     display_info
     
