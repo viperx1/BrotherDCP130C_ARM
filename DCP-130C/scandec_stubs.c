@@ -67,6 +67,11 @@ static struct {
     struct timespec last_progress; /* timestamp of last progress report */
     double        max_gap_ms;    /* longest gap between writes */
     double        max_write_ms;  /* longest single ScanDecWrite call */
+    double        first_data_ms; /* latency from Open to first Write (scanner warm-up) */
+    int           got_first;     /* flag: have we received first Write yet? */
+    unsigned long gaps_over_100; /* gaps > 100 ms */
+    unsigned long gaps_over_1s;  /* gaps > 1 second */
+    unsigned long gaps_over_5s;  /* gaps > 5 seconds */
 } g_stats;
 
 __attribute__((constructor))
@@ -294,6 +299,15 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         double gap = elapsed_ms(&g_stats.last_write, &t_start);
         if (gap > g_stats.max_gap_ms)
             g_stats.max_gap_ms = gap;
+        /* Gap histogram: count long gaps for pattern analysis */
+        if (gap > 5000.0) g_stats.gaps_over_5s++;
+        else if (gap > 1000.0) g_stats.gaps_over_1s++;
+        else if (gap > 100.0) g_stats.gaps_over_100++;
+        /* First-data latency (scanner warm-up time) */
+        if (!g_stats.got_first) {
+            g_stats.first_data_ms = elapsed_ms(&g_stats.open_time, &t_start);
+            g_stats.got_first = 1;
+        }
         g_stats.last_write = t_start;
         g_stats.bytes_in += w->dwLineDataSize;
     }
@@ -508,6 +522,10 @@ BOOL ScanDecClose(void)
         double throughput = g_stats.bytes_out ?
             (g_stats.bytes_out / 1024.0) / (total_ms / 1000.0) : 0;
         double backend_ms = total_ms - g_stats.write_ms;
+        double tail_ms = elapsed_ms(&g_stats.last_write, &now);
+        double scan_ms = total_ms - g_stats.first_data_ms - tail_ms;
+        double scan_rate = (g_stats.lines_total && scan_ms > 0)
+            ? scan_ms / g_stats.lines_total : 0;
         fprintf(stderr,
                 "[SCANDEC] === scan session summary ===\n"
                 "[SCANDEC]   total time:    %.1f ms\n"
@@ -518,6 +536,10 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   backend time:  %.1f ms (%.1f%% — USB I/O + protocol)\n"
                 "[SCANDEC]   max write:     %.3f ms (single call)\n"
                 "[SCANDEC]   max gap:       %.1f ms (between writes — I/O or backend wait)\n"
+                "[SCANDEC]   long gaps:     %lu >100ms, %lu >1s, %lu >5s\n"
+                "[SCANDEC]   first data:    %.1f ms after open (scanner warm-up)\n"
+                "[SCANDEC]   tail latency:  %.1f ms after last data (stall detection)\n"
+                "[SCANDEC]   scan rate:     %.1f ms/line (%.1f lines/sec during active scan)\n"
                 "[SCANDEC]   throughput:    %.1f KB/s\n",
                 total_ms,
                 g_stats.lines_total,
@@ -531,7 +553,28 @@ BOOL ScanDecClose(void)
                 total_ms > 0 ? (backend_ms / total_ms) * 100.0 : 0,
                 g_stats.max_write_ms,
                 g_stats.max_gap_ms,
+                g_stats.gaps_over_100, g_stats.gaps_over_1s,
+                g_stats.gaps_over_5s,
+                g_stats.first_data_ms,
+                tail_ms,
+                scan_rate,
+                scan_rate > 0 ? 1000.0 / scan_rate : 0,
                 throughput);
+        /* Human-readable diagnosis */
+        double decode_pct = total_ms > 0
+            ? (g_stats.write_ms / total_ms) * 100.0 : 0;
+        if (decode_pct < 1.0 && g_stats.lines_total > 0) {
+            fprintf(stderr,
+                "[SCANDEC] diagnosis: scan is USB-bandwidth limited "
+                "(decode < 1%% of time). %.1f KB/s is typical for USB 1.1 full-speed.\n",
+                throughput);
+        } else if (g_stats.lines_total > 0) {
+            fprintf(stderr,
+                "[SCANDEC] diagnosis: decode uses %.1f%% of scan time "
+                "(%.3f ms/line). Check CPU load if scan is slow.\n",
+                decode_pct,
+                g_stats.write_ms / g_stats.lines_total);
+        }
     }
 
     memset(&g_open, 0, sizeof(g_open));

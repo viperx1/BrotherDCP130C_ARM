@@ -345,6 +345,119 @@ CEOF
     [[ "$stderr_out" == *"USB I/O + protocol"* ]]
 }
 
+@test "scandec: summary shows first-data latency" {
+    cat > "$TEST_TMPDIR/test_first_data.c" << 'CEOF'
+#include <string.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0200; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    BYTE line[100], out[200]; memset(line, 128, 100);
+    SCANDEC_WRITE w = {2, 0, line, 100, out, 200, 0}; INT st;
+    ScanDecWrite(&w, &st);
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_first_data" "$TEST_TMPDIR/test_first_data.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_first_data" 2>&1 >/dev/null)
+    [[ "$stderr_out" == *"first data:"* ]]
+    [[ "$stderr_out" == *"scanner warm-up"* ]]
+}
+
+@test "scandec: summary shows gap histogram and tail latency" {
+    cat > "$TEST_TMPDIR/test_gaps.c" << 'CEOF'
+#include <string.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0200; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    BYTE line[100], out[200]; memset(line, 128, 100);
+    for (int i = 0; i < 5; i++) {
+        SCANDEC_WRITE w = {2, 0, line, 100, out, 200, 0}; INT st;
+        ScanDecWrite(&w, &st);
+    }
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_gaps" "$TEST_TMPDIR/test_gaps.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_gaps" 2>&1 >/dev/null)
+    [[ "$stderr_out" == *"long gaps:"* ]]
+    [[ "$stderr_out" == *"tail latency:"* ]]
+    [[ "$stderr_out" == *"stall detection"* ]]
+}
+
+@test "scandec: summary shows human-readable diagnosis" {
+    cat > "$TEST_TMPDIR/test_diag.c" << 'CEOF'
+#include <string.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0200; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    BYTE line[100], out[200]; memset(line, 128, 100);
+    SCANDEC_WRITE w = {2, 0, line, 100, out, 200, 0}; INT st;
+    ScanDecWrite(&w, &st);
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_diag" "$TEST_TMPDIR/test_diag.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_diag" 2>&1 >/dev/null)
+    [[ "$stderr_out" == *"diagnosis:"* ]]
+}
+
 # --- install_scanner.sh patch tests ---
 
 @test "scanner: ReadDeviceData patch includes usleep for CPU yield" {
@@ -359,4 +472,12 @@ CEOF
 
 @test "scanner: ReadDeviceData patch includes debug fprintf" {
     grep -q 'ReadDeviceData EOF' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: ReadDeviceData EOF message includes avg bytes/read" {
+    grep -q 'avg.*bytes/read' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: ReadDeviceData EOF message includes stall timeout" {
+    grep -q 'stall timeout' "$PROJECT_ROOT/install_scanner.sh"
 }
