@@ -533,67 +533,25 @@ compile_arm_backend() {
     fi
 
     # Add debug instrumentation to brother2.c for crash diagnosis.
-    # The bus scan loop in sane_init is the site of the segfault
-    # (issue #65). We inject fflush(stderr) after every DBG() so output
-    # appears even if the process crashes immediately after, and add
-    # fine-grained trace messages around every pointer dereference in
-    # the bus scan to pinpoint the exact crash location.
+    # Minimal traces: device match, bus scan completion, and sane_open.
+    # (Verbose per-device and USB-level traces for issue #65 have been
+    # removed now that the init crash is fixed.)
     local brother2_c="$brscan_src/backend_src/brother2.c"
     if [[ -f "$brother2_c" ]]; then
-        # 1. Force stderr flush after every DBG() call in sane_init's bus scan
-        #    so crash output is not lost in stdio buffers
+        # 1. Force stderr flush after bus scan start DBG() call
         sed -i 's/DBG(DEBUG_INFO,"starting bus scan\\n");/DBG(DEBUG_INFO,"starting bus scan\\n"); fflush(stderr);/' "$brother2_c"
 
-        # 2. Inject fine-grained trace messages inside the bus scan loop.
-        #    The crash occurs between "starting bus scan" and the first device
-        #    found message — we need to know if it is the bus pointer,
-        #    the device pointer, or the model-info chain that is corrupt.
-        #
-        #    Replace the sparse debug around the loop with a verbose version
-        #    that traces every pointer dereference and flushes after each.
-        sed -i '/DBG(DEBUG_JUNK,"scanning bus %s\\n", pbus->dirname);/c\
-      fprintf(stderr, "[BROTHER2-DBG] scanning bus %p dirname=%s\\n", (void*)pbus, pbus->dirname ? pbus->dirname : "(null)"); fflush(stderr);' "$brother2_c"
-
-        # Replace the 3-line DBG(DEBUG_JUNK,"found dev ...") with a single fprintf
-        # that adds bus/device numbers and flushes immediately.
-        # Original is: DBG(DEBUG_JUNK,"found dev %04X/%04X\n",
-        #                  pdev->descriptor.idVendor,
-        #                  pdev->descriptor.idProduct);
-        sed -i '/DBG(DEBUG_JUNK,"found dev %04X\/%04X/{
-N;N
-s|DBG(DEBUG_JUNK,"found dev %04X/%04X\\n",\n.*pdev->descriptor.idVendor,\n.*pdev->descriptor.idProduct);|fprintf(stderr, "[BROTHER2-DBG] found dev %04X/%04X on bus %d dev %d\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, iBus, iDev); fflush(stderr);|
-}' "$brother2_c"
-
-        # 3. Add a trace when a matching device IS found (not for every comparison).
-        #    The per-model comparison logging was removed — it produced ~200+
-        #    lines of noise per device and is no longer needed (issue #65 fixed).
+        # 2. Add a trace when a matching device IS found
         sed -i '/RegisterSaneDev(pdev,ach,pModelInf/i\
 \t\t\t      fprintf(stderr, "[BROTHER2-DBG] MATCH: dev %04X/%04X matches model vendor=%04X product=%04X\\n", pdev->descriptor.idVendor, pdev->descriptor.idProduct, pModelInf->vendorID, pModelInf->productID); fflush(stderr);' "$brother2_c"
 
-        # 4. Add a trace after the bus scan loop finishes
+        # 3. Add a trace after the bus scan loop finishes
         sed -i '/WriteLog.*sane_init Check Interface/i\
     fprintf(stderr, "[BROTHER2-DBG] bus scan complete, checking network interfaces\\n"); fflush(stderr);' "$brother2_c"
 
-        # 5. Add sane_open tracing — the crash may actually be in sane_open
-        #    when it calls usb_open() or usb_set_configuration() on the device.
+        # 4. Add sane_open tracing
         sed -i '/WriteLog.*sane_open start dev_name/a\
   fprintf(stderr, "[BROTHER2-DBG] sane_open: device=\\"%s\\"\\n", devicename); fflush(stderr);' "$brother2_c"
-
-        # 6. Add trace before usb_open in sane_open (NET_AND_ADVINI path)
-        sed -i '/this->hScanner->usb = usb_open(pdev->pdev);/i\
-\t\t    fprintf(stderr, "[BROTHER2-DBG] sane_open: calling usb_open(pdev=%p pdev->pdev=%p)\\n", (void*)pdev, (void*)pdev->pdev); fflush(stderr);' "$brother2_c"
-
-        # 7. Add trace after usb_open
-        sed -i '/if (!this->hScanner->usb)/i\
-\t\t    fprintf(stderr, "[BROTHER2-DBG] sane_open: usb_open returned %p\\n", (void*)this->hScanner->usb); fflush(stderr);' "$brother2_c"
-
-        # 8. Add trace before OpenDevice
-        sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/i\
-  fprintf(stderr, "[BROTHER2-DBG] sane_open: calling OpenDevice(seriesNo=%d)\\n", pdev->modelInf.seriesNo); fflush(stderr);' "$brother2_c"
-
-        # 9. Add trace after OpenDevice returns
-        sed -i '/rc= OpenDevice(this->hScanner, pdev->modelInf.seriesNo);/a\
-  fprintf(stderr, "[BROTHER2-DBG] sane_open: OpenDevice returned %d\\n", rc); fflush(stderr);' "$brother2_c"
 
         log_debug "Injected bus-scan debug instrumentation into brother2.c"
     fi
@@ -602,26 +560,30 @@ s|DBG(DEBUG_JUNK,"found dev %04X/%04X\\n",\n.*pdev->descriptor.idVendor,\n.*pdev
     # to trace USB claim/control operations that follow WriteLog.
     local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
     if [[ -f "$devaccs_c" ]]; then
-        # Add trace before and after usb_claim_interface
-        sed -i '/usb_claim_interface(hScanner->usb, 1)/{
-i\\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: calling usb_claim_interface\\n"); fflush(stderr);
-}' "$devaccs_c"
-
-        # Add trace after usb_control_msg
-        sed -i '/if (rc >= 0) {/i\
-\t\tfprintf(stderr, "[BROTHER2-DBG] OpenDevice: usb_control_msg returned %d\\n", rc); fflush(stderr);' "$devaccs_c"
-
         log_debug "Injected OpenDevice debug instrumentation into brother_devaccs.c"
 
         # Add ReadDeviceData tracing for USB read debugging.
-        # The scan timeout (issue #68) occurs during ReadDeviceData where
-        # usb_bulk_read returns 0 bytes repeatedly. These traces show
-        # every USB read attempt and result on stderr.
+        # The scan timeout occurs during ReadDeviceData where
+        # usb_bulk_read returns 0 bytes repeatedly. We rate-limit
+        # the trace to avoid flooding stderr: log every 50th read
+        # call and always log transitions (nResultSize changing).
+        # Also inject a static counter and prev-result tracker.
+        sed -i '/WriteLog.*ReadDeviceData Start nReadSize/i\
+{\
+\tstatic int _rdd_count = 0;\
+\tstatic int _rdd_prev_result = -1;\
+\t_rdd_count++;' "$devaccs_c"
+
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/a\
-\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData: nReadSize=%d iReadStatus=%d\\n", nReadSize, iReadStatus); fflush(stderr);' "$devaccs_c"
+\tif (_rdd_count <= 3 || _rdd_count % 50 == 0)\
+\t\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData[%d]: nReadSize=%d iReadStatus=%d\\n", _rdd_count, nReadSize, iReadStatus); fflush(stderr);' "$devaccs_c"
 
         sed -i '/WriteLog.*ReadDeviceData ReadEnd nResultSize/a\
-\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData: nResultSize=%d\\n", nResultSize); fflush(stderr);' "$devaccs_c"
+\tif (nResultSize != _rdd_prev_result || _rdd_count <= 3 || _rdd_count % 50 == 0) {\
+\t\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData[%d]: nResultSize=%d\\n", _rdd_count, nResultSize); fflush(stderr);\
+\t\t_rdd_prev_result = nResultSize;\
+\t}\
+}' "$devaccs_c"
 
         log_debug "Injected ReadDeviceData debug instrumentation into brother_devaccs.c"
     fi
@@ -1228,24 +1190,53 @@ except OSError as e:
                 if [[ $exit_code -eq 124 ]]; then
                     log_warn "Test scan with '$try_device' timed out after 120 seconds."
                     all_invalid_arg=false
-                    # Show BrMfc32.log on timeout for diagnosis
+
+                    # Structured timeout diagnostics
+                    if [[ -s "$test_stderr" ]]; then
+                        # SCANDEC summary (shows whether decoder received/produced data)
+                        local scandec_summary
+                        scandec_summary=$(grep "^\[SCANDEC\]" "$test_stderr" | grep -E "ScanDecOpen|ScanDecClose|ScanDecPageEnd" || true)
+                        if [[ -n "$scandec_summary" ]]; then
+                            log_info "SCANDEC summary:"
+                            echo "$scandec_summary" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
+
+                        # Count how many SCANDEC writes happened
+                        local scandec_writes
+                        scandec_writes=$(grep -c "^\[SCANDEC\] Write" "$test_stderr" 2>/dev/null || echo 0)
+                        log_info "SCANDEC decoder received $scandec_writes write calls"
+
+                        # Show last few ReadDeviceData entries (rate-limited, shows the stuck pattern)
+                        local rdd_trace
+                        rdd_trace=$(grep '^\[BROTHER2-DBG\] ReadDeviceData' "$test_stderr" | tail -5 || true)
+                        if [[ -n "$rdd_trace" ]]; then
+                            log_info "Last ReadDeviceData calls:"
+                            echo "$rdd_trace" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
+
+                        # Show sane_read/PageScan traces if any (may not appear if stuck in ReadDeviceData)
+                        local scan_flow
+                        scan_flow=$(grep '^\[BROTHER2-DBG\].*\(sane_read\|PageScan\|sane_start\)' "$test_stderr" | tail -10 || true)
+                        if [[ -n "$scan_flow" ]]; then
+                            log_info "Scan data flow:"
+                            echo "$scan_flow" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
+
+                        # Show scanimage output (rounded values, signals)
+                        local scanimage_msg
+                        scanimage_msg=$(grep "^scanimage:" "$test_stderr" || true)
+                        if [[ -n "$scanimage_msg" ]]; then
+                            log_info "$scanimage_msg"
+                        fi
+                    fi
+
+                    # Show BrMfc32.log tail on timeout
                     local brother_log_timeout="/usr/local/Brother/sane/BrMfc32.log"
                     if [[ -f "$brother_log_timeout" ]] && [[ -s "$brother_log_timeout" ]]; then
                         log_info "Brother backend log (BrMfc32.log):"
-                        cat "$brother_log_timeout" | while IFS= read -r bline; do
+                        tail -10 "$brother_log_timeout" | while IFS= read -r bline; do
                             log_info "  $bline"
                         done
-                    else
-                        log_warn "BrMfc32.log is empty or missing"
-                    fi
-                    # Show scan-progress traces on timeout (sane_start/sane_read/PageScan)
-                    if [[ -s "$test_stderr" ]]; then
-                        local timeout_trace
-                        timeout_trace=$(grep '^\[BROTHER2-DBG\]' "$test_stderr" | tail -30 || true)
-                        if [[ -n "$timeout_trace" ]]; then
-                            log_info "Scan progress trace:"
-                            echo "$timeout_trace" | while IFS= read -r line; do log_info "  $line"; done
-                        fi
                     fi
                 else
                     log_warn "Test scan with '$try_device' failed (exit code: $exit_code)."
@@ -1354,18 +1345,21 @@ except OSError as e:
                 if [[ -s "$test_stderr" ]]; then
                     local err_text
                     err_text=$(cat "$test_stderr")
-                    # Show SCANDEC debug output
-                    local scandec_out
-                    scandec_out=$(echo "$err_text" | grep "^\[SCANDEC\]" | head -20)
-                    if [[ -n "$scandec_out" ]]; then
-                        log_info "SCANDEC debug output:"
-                        echo "$scandec_out" | while IFS= read -r line; do log_info "  $line"; done
+                    # On timeout we already showed SCANDEC summary above
+                    if [[ $exit_code -ne 124 ]]; then
+                        # Show SCANDEC debug output for non-timeout failures
+                        local scandec_out
+                        scandec_out=$(echo "$err_text" | grep "^\[SCANDEC\]" | head -20)
+                        if [[ -n "$scandec_out" ]]; then
+                            log_info "SCANDEC debug output:"
+                            echo "$scandec_out" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
                     fi
                     # Show ALL stderr on segfault (not just filtered lines)
                     if [[ $exit_code -eq 139 ]]; then
                         log_info "Full stderr from segfaulted scan (last 50 lines):"
                         tail -50 "$test_stderr" | while IFS= read -r line; do log_info "  $line"; done
-                    else
+                    elif [[ $exit_code -ne 124 ]]; then
                         # Show only the scanimage error, not SANE debug noise
                         local scan_err
                         scan_err=$(echo "$err_text" | grep -v "^\[SCANDEC\]" | grep -i "scanimage\|failed\|error\|Invalid" | head -5)
@@ -1388,26 +1382,6 @@ except OSError as e:
         if ! $scan_ok; then
             if $all_invalid_arg; then
                 log_warn "All scan devices returned 'Invalid argument'."
-            fi
-
-            # Show Brother backend debug log if available
-            local brother_log="/usr/local/Brother/sane/BrMfc32.log"
-            if [[ -f "$brother_log" ]] && [[ -s "$brother_log" ]]; then
-                log_info "Brother backend log (last 50 lines):"
-                tail -50 "$brother_log" | while IFS= read -r line; do
-                    log_info "  $line"
-                done
-                # Highlight ARMFIX_DEBUG entries
-                local armfix_lines
-                armfix_lines=$(grep 'ARMFIX_DEBUG' "$brother_log" 2>/dev/null | tail -10)
-                if [[ -n "$armfix_lines" ]]; then
-                    log_info "ARMFIX debug summary:"
-                    echo "$armfix_lines" | while IFS= read -r line; do
-                        log_info "  $line"
-                    done
-                fi
-            else
-                log_warn "BrMfc32.log is empty or missing"
             fi
 
             log_info "Try manually: sudo $scan_cmd -d '${scan_devices[0]:-brother2:bus1;dev1}' --format=pnm > scan.pnm"

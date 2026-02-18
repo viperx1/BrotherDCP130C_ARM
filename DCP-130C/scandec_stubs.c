@@ -98,6 +98,8 @@ static SCANDEC_OPEN g_open;
 static int g_write_count = 0;
 static int g_nonzero_lines = 0;
 static int g_bpp = 0;  /* bytes per pixel for the output format */
+static unsigned long g_total_in_bytes = 0;   /* total input bytes received */
+static unsigned long g_total_out_bytes = 0;  /* total output bytes emitted */
 
 /*
  * PackBits decompression (TIFF/Apple standard)
@@ -156,6 +158,8 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
 
     g_write_count = 0;
     g_nonzero_lines = 0;
+    g_total_in_bytes = 0;
+    g_total_out_bytes = 0;
 
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
 
@@ -296,22 +300,39 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
     }
 
+    /* Track total data flow */
+    g_total_in_bytes += w->dwLineDataSize;
+    g_total_out_bytes += outLine;
+
     /* Check for non-zero data */
     int has_data = 0;
     for (DWORD i = 0; i < outLine && !has_data; i++)
         if (w->pWriteBuff[i] != 0) has_data = 1;
     if (has_data) g_nonzero_lines++;
 
-    /* Log first 50 calls and then every 50th call thereafter */
-    if (g_write_count <= 50 || g_write_count % 50 == 0)
+    /* Log first 5 calls with input hex dump, then every 100th */
+    if (g_write_count <= 5) {
+        /* Hex dump first 16 input bytes for protocol analysis */
+        char hexbuf[16*3 + 1];
+        DWORD hexlen = w->dwLineDataSize < 16 ? w->dwLineDataSize : 16;
+        for (DWORD i = 0; i < hexlen; i++)
+            sprintf(hexbuf + i*3, "%02X ", w->pLineData[i]);
+        if (hexlen > 0) hexbuf[hexlen*3 - 1] = '\0';
+        else hexbuf[0] = '\0';
         fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
                 "inLen=%lu outLine=%lu hasData=%d bpp=%d "
-                "outBuf=%p writeBufSz=%lu\n",
+                "in=[%s]\n",
                 g_write_count, w->nInDataComp, w->nInDataKind,
                 (unsigned long)w->dwLineDataSize,
                 (unsigned long)outLine, has_data, g_bpp,
-                (void*)w->pWriteBuff,
-                (unsigned long)w->dwWriteBuffSize);
+                hexbuf);
+    } else if (g_write_count % 100 == 0) {
+        fprintf(stderr, "[SCANDEC] Write #%d: comp=%d "
+                "inLen=%lu hasData=%d totalIn=%lu totalOut=%lu\n",
+                g_write_count, w->nInDataComp,
+                (unsigned long)w->dwLineDataSize, has_data,
+                g_total_in_bytes, g_total_out_bytes);
+    }
 
     if (st) *st = 1;
     return outLine;
@@ -320,7 +341,9 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
 DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
 {
     fprintf(stderr, "[SCANDEC] ScanDecPageEnd: total_writes=%d "
-            "nonzero_lines=%d\n", g_write_count, g_nonzero_lines);
+            "nonzero_lines=%d totalIn=%lu totalOut=%lu\n",
+            g_write_count, g_nonzero_lines,
+            g_total_in_bytes, g_total_out_bytes);
     (void)w;
     if (st) *st = 0;
     return 0;
@@ -329,8 +352,12 @@ DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
 BOOL ScanDecClose(void)
 {
     fprintf(stderr, "[SCANDEC] ScanDecClose: total_writes=%d "
-            "nonzero_lines=%d\n", g_write_count, g_nonzero_lines);
+            "nonzero_lines=%d totalIn=%lu totalOut=%lu\n",
+            g_write_count, g_nonzero_lines,
+            g_total_in_bytes, g_total_out_bytes);
     memset(&g_open, 0, sizeof(g_open));
     g_bpp = 0;
+    g_total_in_bytes = 0;
+    g_total_out_bytes = 0;
     return TRUE;
 }
