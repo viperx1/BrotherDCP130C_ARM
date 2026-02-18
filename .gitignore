@@ -1,19 +1,20 @@
-# Temporary files
-/tmp/
-*.tmp
-*.log
-
-# Debian packages
-*.deb
-
-# Extract directories
-*_extract/
 
 # Backup files
-*~
-*.bak
-*.swp
-
+# Debian packages
+# Extract directories
 # OS files
+# Temporary files
+*.bak
+*.deb
+*.log
+*.swp
+*.tmp
+*_extract/
+*~
 .DS_Store
+/tmp/
 Thumbs.db
+_codeql_detected_source_root
+node_modules/
+package.json
+package-lock.json

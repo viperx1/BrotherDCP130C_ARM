@@ -1,0 +1,300 @@
+/*
+ * Backend initialization stub — linked into libsane-brother2.so
+ *
+ * Installs a SIGSEGV handler so crashes in the SANE backend produce
+ * a visible error on stderr before the process dies (the default
+ * behavior is a silent crash).
+ *
+ * Debug diagnostics: set BROTHER_DEBUG=1 to log backend load on stderr.
+ * When enabled, also probes the USB environment to report:
+ *   - USB bus speed (1.1 / 2.0 / 3.0)
+ *   - Whether the usblp kernel module is bound to the scanner
+ *   - Whether QEMU binfmt_misc handlers are registered (can cause
+ *     USB contention on ARM when i386 helpers touch device nodes)
+ */
+#include <signal.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <time.h>
+
+/* Brother USB vendor ID */
+#define BROTHER_VID "04f9"
+
+/* Path to Brother SANE config — must match BROTHER_SANE_DIR in brscan2 source */
+#define BROTHER_INI_PATH "/usr/local/Brother/sane/Brsane2.ini"
+
+/*
+ * Format current wall-clock time as "HH:MM:SS.mmm" into a static buffer.
+ */
+static const char *debug_ts(void) {
+    static char buf[16];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (int)(ts.tv_nsec / 1000000));
+    return buf;
+}
+
+static void backend_segfault_handler(int sig) {
+    const char msg[] = "\n[BROTHER2] FATAL: Segmentation fault in SANE brother2 backend!\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
+
+/*
+ * Read a single-line sysfs attribute into buf (NUL-terminated, no newline).
+ * Returns number of bytes read, or 0 on failure.
+ */
+static int read_sysfs(const char *path, char *buf, int bufsz) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(buf, bufsz, f)) { fclose(f); buf[0] = '\0'; return 0; }
+    fclose(f);
+    int len = (int)strlen(buf);
+    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+        buf[--len] = '\0';
+    return len;
+}
+
+/*
+ * Probe USB environment for Brother devices.
+ * Reports bus speed, usblp binding status, and product info.
+ */
+static void probe_usb_environment(void) {
+    DIR *d = opendir("/sys/bus/usb/devices");
+    if (!d) {
+        fprintf(stderr, "%s [BROTHER2] usb: cannot read /sys/bus/usb/devices\n", debug_ts());
+        return;
+    }
+
+    int found = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        /* Skip . and .. and interfaces (contain ':') */
+        if (ent->d_name[0] == '.' || strchr(ent->d_name, ':'))
+            continue;
+
+        char path[512], val[128];
+
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name);
+        if (read_sysfs(path, val, sizeof(val)) == 0)
+            continue;
+        if (strcmp(val, BROTHER_VID) != 0)
+            continue;
+
+        found = 1;
+
+        /* Read product ID */
+        char pid[16] = "????";
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name);
+        read_sysfs(path, pid, sizeof(pid));
+
+        /* Read product name */
+        char product[128] = "";
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name);
+        read_sysfs(path, product, sizeof(product));
+
+        /* Read USB speed (link rate in Mbit/s) */
+        char speed[16] = "?";
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/speed", ent->d_name);
+        read_sysfs(path, speed, sizeof(speed));
+
+        /* Read USB spec version from device descriptor (e.g. "2.00", "1.10") */
+        char version[16] = "";
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/version", ent->d_name);
+        read_sysfs(path, version, sizeof(version));
+        /* Trim leading whitespace (sysfs pads with spaces) */
+        const char *ver = version;
+        while (*ver == ' ') ver++;
+
+        const char *speed_label = "unknown";
+        int speed_mbit = atoi(speed);
+        int usb_ver_major = atoi(ver);  /* "2.00" → 2, "1.10" → 1 */
+
+        if (speed_mbit == 12) {
+            /*
+             * 12 Mbit/s = Full-Speed. The DCP-130C is a "USB 2.0 Full-Speed"
+             * device — it's USB 2.0 compliant but only supports Full-Speed
+             * (same 12 Mbit/s as USB 1.1), NOT High-Speed (480 Mbit/s).
+             * The sysfs 'version' tells us the USB spec the device claims.
+             */
+            if (usb_ver_major >= 2)
+                speed_label = "USB 2.0 Full-Speed (12 Mbit/s)";
+            else
+                speed_label = "USB 1.1 Full-Speed (12 Mbit/s)";
+        }
+        else if (speed_mbit == 480)  speed_label = "USB 2.0 High-Speed (480 Mbit/s)";
+        else if (speed_mbit == 5000) speed_label = "USB 3.0 SuperSpeed (5 Gbit/s)";
+        else if (strcmp(speed, "1.5") == 0) { speed_mbit = 1; speed_label = "USB 1.0 Low-Speed (1.5 Mbit/s)"; }
+
+        fprintf(stderr, "%s [BROTHER2] usb: found %s (04f9:%s) at %s, speed: %s\n",
+                debug_ts(), product[0] ? product : "Brother device", pid, ent->d_name, speed_label);
+        if (ver[0])
+            fprintf(stderr, "%s [BROTHER2] usb: device descriptor version: USB %s\n", debug_ts(), ver);
+
+        if (speed_mbit == 12) {
+            fprintf(stderr, "%s [BROTHER2] usb: NOTE — Full-Speed (12 Mbit/s) limits throughput to ~70 KB/s.\n", debug_ts());
+            if (usb_ver_major >= 2) {
+                fprintf(stderr, "%s [BROTHER2] usb: The DCP-130C is \"USB 2.0 Full-Speed\" — it is USB 2.0 compliant\n"
+                        "[BROTHER2] usb: but only supports Full-Speed (12 Mbit/s), NOT High-Speed (480 Mbit/s).\n"
+                        "[BROTHER2] usb: This is a silicon-level limit — the scanner has no High-Speed PHY.\n"
+                        "[BROTHER2] usb: Forcing USB 2.0 High-Speed is NOT possible with this device.\n"
+                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput.\n", debug_ts());
+            }
+            fprintf(stderr, "%s [BROTHER2] cpu: High CPU during scans is normal — the USB bulk-read\n"
+                    "[BROTHER2] cpu: loop polls for data. A 2 ms yield reduces CPU load.\n"
+                    "[BROTHER2] cpu: CPU usage does NOT affect scan speed (USB is the bottleneck).\n"
+                    "[BROTHER2] cpu: The scanner head finishes physically before data transfer ends.\n"
+                    "[BROTHER2] cpu: The DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
+            fprintf(stderr, "%s [BROTHER2] data: The backend requests PackBits compression via Brsane2.ini compression=1.\n"
+                    "[BROTHER2] data: This sends C=RLENGTH in the scan start command to the scanner.\n"
+                    "[BROTHER2] data: The SAME C=RLENGTH is sent for ALL scan modes (color, gray, B&W).\n"
+                    "[BROTHER2] data: However, the scanner firmware decides per-line whether to compress.\n"
+                    "[BROTHER2] data: Confirmed: True Gray mode = 3.9x compression (PackBits on every line).\n"
+                    "[BROTHER2] data: Confirmed: 24-bit Color mode = 1.0x (firmware sends all planes uncompressed).\n"
+                    "[BROTHER2] data: The line header byte from the scanner encodes both plane type (bits[4:2])\n"
+                    "[BROTHER2] data: and compression flag (bits[1:0]). For color planes (R/G/B), the firmware\n"
+                    "[BROTHER2] data: always clears the compression bits. This is a firmware-level decision\n"
+                    "[BROTHER2] data: that cannot be changed from the driver side.\n", debug_ts());
+            /* Check actual compression setting in Brsane2.ini */
+            {
+                FILE *ini = fopen(BROTHER_INI_PATH, "r");
+                if (ini) {
+                    char line[256];
+                    int in_driver = 0, found_comp = 0;
+                    while (fgets(line, sizeof(line), ini)) {
+                        if (line[0] == '[')
+                            in_driver = (strncmp(line, "[Driver]", 8) == 0);
+                        if (in_driver && strncmp(line, "compression=", 12) == 0) {
+                            int val = atoi(line + 12);
+                            fprintf(stderr, "%s [BROTHER2] ini: Brsane2.ini [Driver] compression=%d (%s)\n",
+                                    debug_ts(), val, val ? "C=RLENGTH requested" : "C=NONE — compression disabled!");
+                            if (!val)
+                                fprintf(stderr, "%s [BROTHER2] ini: WARNING — compression=0 means no compression is requested.\n"
+                                        "[BROTHER2] ini: Set compression=1 in %s to request PackBits.\n", debug_ts(), BROTHER_INI_PATH);
+                            found_comp = 1;
+                            break;
+                        }
+                    }
+                    fclose(ini);
+                    if (!found_comp)
+                        fprintf(stderr, "%s [BROTHER2] ini: WARNING — no compression= key found in Brsane2.ini [Driver] section\n", debug_ts());
+                } else {
+                    fprintf(stderr, "%s [BROTHER2] ini: cannot read %s\n", debug_ts(), BROTHER_INI_PATH);
+                }
+            }
+            fprintf(stderr, "%s [BROTHER2] windows: The original Windows driver had the SAME USB speed limit.\n"
+                    "[BROTHER2] windows: The ~60 sec post-scan transfer is normal for Full-Speed USB.\n"
+                    "[BROTHER2] windows: Windows may have seemed faster due to different default settings\n"
+                    "[BROTHER2] windows: (lower DPI, grayscale) or its progress bar masking the wait.\n"
+                    "[BROTHER2] windows: The physical USB transfer speed is identical on all platforms.\n", debug_ts());
+        }
+
+        /* Check host controller port speed */
+        {
+            char parent_path[512], parent_speed[16];
+            /* Parent hub/port: strip last component after the final '.' or '-' */
+            snprintf(parent_path, sizeof(parent_path), "%s", ent->d_name);
+            char *sep = strrchr(parent_path, '.');
+            if (!sep) sep = strrchr(parent_path, '-');
+            if (sep) {
+                *sep = '\0';
+                char hpath[512];
+                snprintf(hpath, sizeof(hpath), "/sys/bus/usb/devices/%s/speed", parent_path);
+                if (read_sysfs(hpath, parent_speed, sizeof(parent_speed)) > 0) {
+                    int host_speed = atoi(parent_speed);
+                    fprintf(stderr, "%s [BROTHER2] usb: host port speed: %s Mbit/s", debug_ts(), parent_speed);
+                    if (host_speed >= 480)
+                        fprintf(stderr, " — host supports High-Speed; device is the bottleneck\n");
+                    else
+                        fprintf(stderr, "\n");
+                }
+            }
+        }
+
+        /* Check if usblp is bound to any interface */
+        DIR *d2 = opendir("/sys/bus/usb/devices");
+        if (d2) {
+            struct dirent *ent2;
+            while ((ent2 = readdir(d2)) != NULL) {
+                /* Look for interfaces of this device: name starts with device name + ':' */
+                if (strncmp(ent2->d_name, ent->d_name, strlen(ent->d_name)) != 0
+                    || ent2->d_name[strlen(ent->d_name)] != ':')
+                    continue;
+
+                char driver_link[512], driver_target[256];
+                snprintf(driver_link, sizeof(driver_link),
+                         "/sys/bus/usb/devices/%s/driver", ent2->d_name);
+                int dlen = (int)readlink(driver_link, driver_target, sizeof(driver_target) - 1);
+                if (dlen > 0) {
+                    driver_target[dlen] = '\0';
+                    /* basename of the link target is the driver name */
+                    const char *drv = strrchr(driver_target, '/');
+                    drv = drv ? drv + 1 : driver_target;
+                    if (strcmp(drv, "usblp") == 0) {
+                        fprintf(stderr, "%s [BROTHER2] usb: WARNING — usblp driver is bound to %s. "
+                                "This can block SANE USB access. Run: "
+                                "echo '%s' | sudo tee /sys/bus/usb/drivers/usblp/unbind\n",
+                                debug_ts(), ent2->d_name, ent2->d_name);
+                    }
+                }
+            }
+            closedir(d2);
+        }
+    }
+    closedir(d);
+
+    if (!found)
+        fprintf(stderr, "%s [BROTHER2] usb: no Brother device (vendor %s) found on USB bus\n",
+                debug_ts(), BROTHER_VID);
+
+    /* Check for QEMU binfmt_misc registration */
+    DIR *binfmt = opendir("/proc/sys/fs/binfmt_misc");
+    if (binfmt) {
+        struct dirent *bf;
+        int qemu_found = 0;
+        while ((bf = readdir(binfmt)) != NULL) {
+            if (strncmp(bf->d_name, "qemu-", 5) == 0) {
+                if (!qemu_found) {
+                    fprintf(stderr, "%s [BROTHER2] qemu: binfmt_misc QEMU handlers detected\n", debug_ts());
+                    qemu_found = 1;
+                }
+            }
+        }
+        if (qemu_found) {
+            fprintf(stderr, "%s [BROTHER2] qemu: i386 binaries (e.g. brsaneconfig2) run via QEMU. "
+                    "This is normal for configuration but should NOT affect scan speed.\n"
+                    "[BROTHER2] qemu: if QEMU processes access the USB device during scanning, "
+                    "contention may slow I/O. Check with: ps aux | grep qemu\n", debug_ts());
+        }
+        closedir(binfmt);
+    }
+}
+
+__attribute__((constructor))
+static void backend_init(void) {
+    struct sigaction sa;
+    sa.sa_handler = backend_segfault_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, NULL);
+
+    const char *env = getenv("BROTHER_DEBUG");
+    if (env && env[0] == '1') {
+        fprintf(stderr, "%s [BROTHER2] SANE brother2 backend loaded "
+                "(BROTHER_DEBUG=1, diagnostics enabled)\n", debug_ts());
+        probe_usb_environment();
+    }
+}

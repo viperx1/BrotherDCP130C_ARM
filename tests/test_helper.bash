@@ -1,11 +1,12 @@
 #!/bin/bash
-# Test helper for install_printer.sh tests.
-# Sources functions from the main script without executing main().
+# Test helper for install_printer.sh and install_scanner.sh tests.
+# Sources functions from the target script without executing main().
 # Provides mock utilities for system commands.
 
 # Absolute path to the project root
 export PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SCRIPT="$PROJECT_ROOT/install_printer.sh"
+export SCANNER_SCRIPT="$PROJECT_ROOT/install_scanner.sh"
 
 # Create a temporary directory for test artifacts
 setup_test_tmpdir() {
@@ -27,6 +28,18 @@ source_functions() {
     sed -e 's/^set -e/# set -e (disabled for testing)/' \
         -e '/^[[:space:]]*main\([[:space:]]\|$\)/d' \
         "$SCRIPT" > "$tmp_script"
+    # shellcheck disable=SC1090
+    source "$tmp_script"
+    rm -f "$tmp_script"
+}
+
+# Source only the functions from install_scanner.sh without running main().
+source_scanner_functions() {
+    local tmp_script
+    tmp_script=$(mktemp)
+    sed -e 's/^set -e/# set -e (disabled for testing)/' \
+        -e '/^[[:space:]]*main\([[:space:]]\|$\)/d' \
+        "$SCANNER_SCRIPT" > "$tmp_script"
     # shellcheck disable=SC1090
     source "$tmp_script"
     rm -f "$tmp_script"
