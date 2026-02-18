@@ -97,7 +97,7 @@ static void probe_usb_environment(void) {
         if (speed_mbit == 12)       speed_label = "USB 1.1 Full-Speed (12 Mbit/s)";
         else if (speed_mbit == 480)  speed_label = "USB 2.0 High-Speed (480 Mbit/s)";
         else if (speed_mbit == 5000) speed_label = "USB 3.0 SuperSpeed (5 Gbit/s)";
-        else if (speed_mbit == 1)    speed_label = "USB 1.0 Low-Speed (1.5 Mbit/s)";
+        else if (strcmp(speed, "1.5") == 0) { speed_mbit = 1; speed_label = "USB 1.0 Low-Speed (1.5 Mbit/s)"; }
 
         fprintf(stderr, "[BROTHER2] usb: found %s (04f9:%s) at %s, speed: %s\n",
                 product[0] ? product : "Brother device", pid, ent->d_name, speed_label);
@@ -151,13 +151,13 @@ static void probe_usb_environment(void) {
         while ((bf = readdir(binfmt)) != NULL) {
             if (strncmp(bf->d_name, "qemu-", 5) == 0) {
                 if (!qemu_found) {
-                    fprintf(stderr, "[BROTHER2] qemu: binfmt_misc QEMU handlers detected");
+                    fprintf(stderr, "[BROTHER2] qemu: binfmt_misc QEMU handlers detected\n");
                     qemu_found = 1;
                 }
             }
         }
         if (qemu_found) {
-            fprintf(stderr, "\n[BROTHER2] qemu: i386 binaries (e.g. brsaneconfig2) run via QEMU. "
+            fprintf(stderr, "[BROTHER2] qemu: i386 binaries (e.g. brsaneconfig2) run via QEMU. "
                     "This is normal for configuration but should NOT affect scan speed.\n"
                     "[BROTHER2] qemu: if QEMU processes access the USB device during scanning, "
                     "contention may slow I/O. Check with: ps aux | grep qemu\n");
