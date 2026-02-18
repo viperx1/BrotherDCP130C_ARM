@@ -299,6 +299,14 @@ try_download() {
         if wget -q --timeout=30 --tries=2 -O "$output_file" "$url" 2>/dev/null; then
             # Verify we got an actual file (not an HTML error page)
             if [[ -s "$output_file" ]] && file "$output_file" | grep -qi "debian\|archive\|data"; then
+                # Extra integrity check for gzip archives (catches truncated downloads)
+                if [[ "$output_file" == *.tar.gz || "$output_file" == *.gz ]]; then
+                    if ! gzip -t "$output_file" 2>/dev/null; then
+                        log_debug "Download from $url is a truncated/corrupt gzip file, trying next..."
+                        rm -f "$output_file"
+                        continue
+                    fi
+                fi
                 log_info "Downloaded successfully from: $url"
                 return 0
             fi
@@ -471,6 +479,11 @@ compile_arm_backend() {
     mkdir -p "$src_dir" "$build_dir"
 
     local src_tarball="$TMP_DIR/$DRIVER_BRSCAN2_SRC_FILE"
+    # Validate existing tarball — remove if corrupt (e.g. truncated download)
+    if [[ -f "$src_tarball" ]] && ! gzip -t "$src_tarball" 2>/dev/null; then
+        log_warn "Existing source tarball is corrupt, re-downloading..."
+        rm -f "$src_tarball"
+    fi
     if [[ ! -f "$src_tarball" ]]; then
         if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
             log_warn "Failed to download brscan2 source code"
@@ -478,11 +491,21 @@ compile_arm_backend() {
         fi
     fi
 
-    # Extract source
-    tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 || {
-        log_warn "Failed to extract brscan2 source"
-        return 1
-    }
+    # Extract source (retry once on failure after re-downloading)
+    local tar_err
+    if ! tar_err=$(tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 2>&1); then
+        log_debug "Extraction error: $tar_err"
+        log_warn "Failed to extract brscan2 source, re-downloading..."
+        rm -f "$src_tarball"
+        if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
+            log_warn "Failed to download brscan2 source code"
+            return 1
+        fi
+        tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 || {
+            log_warn "Failed to extract brscan2 source after re-download"
+            return 1
+        }
+    fi
 
     local brscan_src="$src_dir/brscan"
     if [[ ! -d "$brscan_src/backend_src" ]]; then

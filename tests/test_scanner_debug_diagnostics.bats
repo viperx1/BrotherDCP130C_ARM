@@ -700,3 +700,36 @@ CEOF
     grep -q 'Forcing USB 2.0 High-Speed is NOT possible' "$PROJECT_ROOT/DCP-130C/backend_init.c"
     grep -q 'no High-Speed PHY' "$PROJECT_ROOT/DCP-130C/backend_init.c"
 }
+
+# --- tarball integrity validation tests ---
+
+@test "scanner: try_download validates gzip integrity for .tar.gz files" {
+    grep -q 'gzip -t' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'truncated/corrupt gzip' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend validates existing tarball before use" {
+    grep -q 'Existing source tarball is corrupt' "$PROJECT_ROOT/install_scanner.sh"
+    # Verify gzip -t is used to check existing tarballs
+    grep -q 'gzip -t.*src_tarball' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend retries download on extraction failure" {
+    grep -q 'Failed to extract brscan2 source, re-downloading' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Failed to extract brscan2 source after re-download' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: corrupt tarball is detected and removed" {
+    # Gzip magic number header (1f 8b) + method (08) + flags (00) — truncated
+    printf '\x1f\x8b\x08\x00' > "$TEST_TMPDIR/test.tar.gz"
+    # gzip -t should fail on this truncated file
+    run gzip -t "$TEST_TMPDIR/test.tar.gz"
+    [[ "$status" -ne 0 ]]
+}
+
+@test "scanner: valid tarball passes gzip integrity check" {
+    # Create a valid small gzip file
+    echo "test content" | gzip > "$TEST_TMPDIR/test.tar.gz"
+    run gzip -t "$TEST_TMPDIR/test.tar.gz"
+    [[ "$status" -eq 0 ]]
+}
