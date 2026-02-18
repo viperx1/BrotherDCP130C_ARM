@@ -14,12 +14,17 @@
  *   SC_8BIT  modes (TG/256): 8-bit gray, pixels bytes/line
  *   SC_24BIT modes (FUL):    24-bit RGB, pixels*3 bytes/line
  *
+ * Debug diagnostics: set BROTHER_DEBUG=1 to enable timing and statistics
+ * output on stderr.  Useful for diagnosing CPU usage and scanning pauses.
+ *
  * Copyright: 2026, based on Brother brscan2-src-0.2.5-1 API
  */
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <time.h>
 
 /* SIGSEGV handler: write crash info to stderr before dying */
 static void scandec_segfault_handler(int sig) {
@@ -33,6 +38,36 @@ static void scandec_segfault_handler(int sig) {
     raise(sig);
 }
 
+/* Debug diagnostics — enabled by BROTHER_DEBUG=1 environment variable */
+static int g_debug = 0;
+
+static double timespec_ms(struct timespec *ts) {
+    return ts->tv_sec * 1000.0 + ts->tv_nsec / 1e6;
+}
+
+static double elapsed_ms(struct timespec *start, struct timespec *end) {
+    return timespec_ms(end) - timespec_ms(start);
+}
+
+/* Scan statistics for debug reporting */
+static struct {
+    unsigned long lines_total;
+    unsigned long lines_white;
+    unsigned long lines_noncomp;
+    unsigned long lines_pack;
+    unsigned long lines_unknown;
+    unsigned long bytes_in;
+    unsigned long bytes_out;
+    unsigned long rgb_planes;
+    double        decode_ms;     /* total time in decode_packbits */
+    double        convert_ms;    /* total time in gray8_to_1bit */
+    double        write_ms;      /* total time in ScanDecWrite */
+    struct timespec open_time;   /* when ScanDecOpen was called */
+    struct timespec last_write;  /* timestamp of last ScanDecWrite */
+    double        max_gap_ms;    /* longest gap between writes */
+    double        max_write_ms;  /* longest single ScanDecWrite call */
+} g_stats;
+
 __attribute__((constructor))
 static void scandec_init(void) {
     struct sigaction sa;
@@ -40,6 +75,12 @@ static void scandec_init(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGSEGV, &sa, NULL);
+
+    const char *env = getenv("BROTHER_DEBUG");
+    if (env && env[0] == '1') {
+        g_debug = 1;
+        fprintf(stderr, "[SCANDEC] debug diagnostics enabled (BROTHER_DEBUG=1)\n");
+    }
 }
 
 typedef int            BOOL;
@@ -152,6 +193,11 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
 {
     if (!p) return FALSE;
 
+    /* Reset statistics */
+    memset(&g_stats, 0, sizeof(g_stats));
+    clock_gettime(CLOCK_MONOTONIC, &g_stats.open_time);
+    g_stats.last_write = g_stats.open_time;
+
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
 
     /*
@@ -198,6 +244,18 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
         }
     }
 
+    if (g_debug) {
+        const char *mode = (g_bpp == 3) ? "24-bit RGB" :
+                           (g_bpp == 1) ? "8-bit gray" : "1-bit B&W";
+        fprintf(stderr, "[SCANDEC] ScanDecOpen: %lux%lu px, reso %dx%d→%dx%d, "
+                "mode=%s, outLine=%lu bytes\n",
+                (unsigned long)p->dwInLinePixCnt,
+                (unsigned long)p->dwOutLinePixCnt,
+                p->nInResoX, p->nInResoY,
+                p->nOutResoX, p->nOutResoY,
+                mode, (unsigned long)p->dwOutLineByte);
+    }
+
     return TRUE;
 }
 
@@ -214,6 +272,10 @@ BOOL ScanDecPageStart(void)
 
 DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
 {
+    struct timespec t_start, t_end;
+    if (g_debug)
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     if (!w || !w->pLineData || !w->pWriteBuff) {
         if (st) *st = -1;
         return 0;
@@ -225,6 +287,15 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         return 0;
     }
 
+    if (g_debug) {
+        /* Track gap between consecutive writes (inter-call latency) */
+        double gap = elapsed_ms(&g_stats.last_write, &t_start);
+        if (gap > g_stats.max_gap_ms)
+            g_stats.max_gap_ms = gap;
+        g_stats.last_write = t_start;
+        g_stats.bytes_in += w->dwLineDataSize;
+    }
+
     /*
      * 24-bit color mode: the scanner sends separate R, G, B planes
      * (nInDataKind 2=Red, 3=Green, 4=Blue). Buffer each plane and
@@ -233,6 +304,8 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
     if (g_bpp == 3 && g_red_plane && g_green_plane && g_blue_plane
         && w->nInDataKind >= 2 && w->nInDataKind <= 4)
     {
+        if (g_debug) g_stats.rgb_planes++;
+
         BYTE *planeBuf;
         switch (w->nInDataKind) {
         case 2:  planeBuf = g_red_plane;   g_have_red = 1;   break;
@@ -282,6 +355,24 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         g_have_red = 0;
         g_have_green = 0;
 
+        if (g_debug) {
+            g_stats.lines_total++;
+            g_stats.bytes_out += outLine;
+            clock_gettime(CLOCK_MONOTONIC, &t_end);
+            double call_ms = elapsed_ms(&t_start, &t_end);
+            g_stats.write_ms += call_ms;
+            if (call_ms > g_stats.max_write_ms)
+                g_stats.max_write_ms = call_ms;
+            if ((g_stats.lines_total % 100) == 0) {
+                double total_ms = elapsed_ms(&g_stats.open_time, &t_end);
+                fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
+                        "%.2f ms/line avg, %.2f ms max gap between writes\n",
+                        g_stats.lines_total, total_ms,
+                        g_stats.write_ms / g_stats.lines_total,
+                        g_stats.max_gap_ms);
+            }
+        }
+
         if (st) *st = 1;
         return outLine;
     }
@@ -298,6 +389,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
 
     switch (w->nInDataComp) {
     case SCIDC_WHITE:
+        if (g_debug) g_stats.lines_white++;
         /* White line: fill output with white */
         if (g_bpp == 0) {
             /* 1-bit packed: white = all 1s = 0xFF */
@@ -310,6 +402,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
 
     case SCIDC_NONCOMP:
+        if (g_debug) g_stats.lines_noncomp++;
         if (g_bpp == 0) {
             /* B&W: input is 8-bit gray, convert to 1-bit packed */
             gray8_to_1bit(w->pLineData, pixelsPerLine,
@@ -324,6 +417,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
 
     case SCIDC_PACK:
+        if (g_debug) g_stats.lines_pack++;
         if (g_bpp == 0) {
             /* B&W: decompress to temp buffer, then convert to 1-bit */
             rawBuf = (BYTE *)malloc(pixelsPerLine);
@@ -344,6 +438,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
 
     default:
+        if (g_debug) g_stats.lines_unknown++;
         /* Unknown compression: try direct copy */
         rawLen = w->dwLineDataSize;
         if (rawLen > outLine) rawLen = outLine;
@@ -352,12 +447,39 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
     }
 
+    if (g_debug) {
+        g_stats.lines_total++;
+        g_stats.bytes_out += outLine;
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        double call_ms = elapsed_ms(&t_start, &t_end);
+        g_stats.write_ms += call_ms;
+        if (call_ms > g_stats.max_write_ms)
+            g_stats.max_write_ms = call_ms;
+        if ((g_stats.lines_total % 100) == 0) {
+            double total_ms = elapsed_ms(&g_stats.open_time, &t_end);
+            fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
+                    "%.2f ms/line avg, %.2f ms max gap between writes\n",
+                    g_stats.lines_total, total_ms,
+                    g_stats.write_ms / g_stats.lines_total,
+                    g_stats.max_gap_ms);
+        }
+    }
+
     if (st) *st = 1;
     return outLine;
 }
 
 DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
 {
+    if (g_debug) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double total_ms = elapsed_ms(&g_stats.open_time, &now);
+        fprintf(stderr, "[SCANDEC] ScanDecPageEnd: %lu lines in %.1f ms "
+                "(%.1f lines/sec)\n",
+                g_stats.lines_total, total_ms,
+                g_stats.lines_total ? g_stats.lines_total / (total_ms / 1000.0) : 0);
+    }
     (void)w;
     if (st) *st = 0;
     return 0;
@@ -365,6 +487,35 @@ DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
 
 BOOL ScanDecClose(void)
 {
+    if (g_debug) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double total_ms = elapsed_ms(&g_stats.open_time, &now);
+        double throughput = g_stats.bytes_out ?
+            (g_stats.bytes_out / 1024.0) / (total_ms / 1000.0) : 0;
+        fprintf(stderr,
+                "[SCANDEC] === scan session summary ===\n"
+                "[SCANDEC]   total time:    %.1f ms\n"
+                "[SCANDEC]   lines:         %lu (white=%lu noncomp=%lu pack=%lu unknown=%lu)\n"
+                "[SCANDEC]   RGB planes:    %lu\n"
+                "[SCANDEC]   data in/out:   %lu / %lu bytes\n"
+                "[SCANDEC]   decode time:   %.1f ms total (%.3f ms/line avg)\n"
+                "[SCANDEC]   max write:     %.3f ms (single call)\n"
+                "[SCANDEC]   max gap:       %.1f ms (between writes — I/O or backend wait)\n"
+                "[SCANDEC]   throughput:    %.1f KB/s\n",
+                total_ms,
+                g_stats.lines_total,
+                g_stats.lines_white, g_stats.lines_noncomp,
+                g_stats.lines_pack, g_stats.lines_unknown,
+                g_stats.rgb_planes,
+                g_stats.bytes_in, g_stats.bytes_out,
+                g_stats.write_ms,
+                g_stats.lines_total ? g_stats.write_ms / g_stats.lines_total : 0,
+                g_stats.max_write_ms,
+                g_stats.max_gap_ms,
+                throughput);
+    }
+
     memset(&g_open, 0, sizeof(g_open));
     g_bpp = 0;
     free(g_red_plane);   g_red_plane = NULL;

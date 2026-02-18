@@ -4,10 +4,14 @@
  * Installs a SIGSEGV handler so crashes in the SANE backend produce
  * a visible error on stderr before the process dies (the default
  * behavior is a silent crash).
+ *
+ * Debug diagnostics: set BROTHER_DEBUG=1 to log backend load on stderr.
  */
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static void backend_segfault_handler(int sig) {
     const char msg[] = "\n[BROTHER2] FATAL: Segmentation fault in SANE brother2 backend!\n";
@@ -28,4 +32,10 @@ static void backend_init(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGSEGV, &sa, NULL);
+
+    const char *env = getenv("BROTHER_DEBUG");
+    if (env && env[0] == '1') {
+        fprintf(stderr, "[BROTHER2] SANE brother2 backend loaded "
+                "(BROTHER_DEBUG=1, diagnostics enabled)\n");
+    }
 }
