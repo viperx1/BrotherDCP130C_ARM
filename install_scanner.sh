@@ -641,6 +641,22 @@ compile_arm_backend() {
         sed -i '/WriteLog.*bReadbufEnd =TRUE/i\
 \t\t\t\tfprintf(stderr, "[BROTHER2-DBG] PageScan: ReadNonFixedData rc=%d wData=%d\\n", rc, wData); fflush(stderr);' "$scanner_c"
 
+        # Fix end-of-scan handling: When ReadNonFixedData returns -1
+        # (from our stall detection), the original code sets bReadbufEnd=TRUE
+        # but then returns an I/O error immediately without flushing the
+        # remaining processed data. The scan data is complete but gets
+        # reported as SANE_STATUS_IO_ERROR instead of SANE_STATUS_EOF.
+        #
+        # Fix: After bReadbufEnd is set to TRUE, also set iProcessEnd=1
+        # and change rc to 0 so PageScan continues into ProcessMain to
+        # flush the remaining buffer, then returns cleanly as SANE_STATUS_EOF.
+        sed -i '/WriteLog.*bReadbufEnd =TRUE/a\
+\t\t\t\tthis->scanState.iProcessEnd = 1;\
+\t\t\t\tfprintf(stderr, "[BROTHER2-DBG] PageScan: end-of-scan — set iProcessEnd=1 to flush remaining data\\n"); fflush(stderr);\
+\t\t\t\trc = 0;' "$scanner_c"
+
+        log_debug "Patched PageScan end-of-scan handling in brother_scanner.c"
+
         # Trace ProcessMain exit with FwTempBuffLength
         sed -i '/WriteLog.*ProcessMain End dwRxTempBuffLength/a\
 \tfprintf(stderr, "[BROTHER2-DBG] PageScan: ProcessMain done FwTemp=%d lRealY=%ld iProcessEnd=%d\\n", FwTempBuffLength, lRealY, this->scanState.iProcessEnd); fflush(stderr);' "$scanner_c"
