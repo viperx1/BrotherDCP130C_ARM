@@ -569,8 +569,13 @@ compile_arm_backend() {
 
         # Inject static counters and stall detection before the WriteLog
         # at the start of ReadDeviceData.
+        # STALL_THRESHOLD: consecutive zero-byte USB reads after data was
+        # received before forcing EOF. 200 iterations ≈ 5-10s of polling.
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/i\
 {\
+\t#ifndef STALL_THRESHOLD\
+\t#define STALL_THRESHOLD 200\
+\t#endif\
 \tstatic int _rdd_count = 0;\
 \tstatic int _rdd_prev_result = -1;\
 \tstatic int _rdd_zero_streak = 0;\
@@ -590,7 +595,7 @@ compile_arm_backend() {
 \t\t_rdd_had_data = 1;\
 \t} else if (_rdd_had_data) {\
 \t\t_rdd_zero_streak++;\
-\t\tif (_rdd_zero_streak >= 200) {\
+\t\tif (_rdd_zero_streak >= STALL_THRESHOLD) {\
 \t\t\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData[%d]: STALL DETECTED — %d consecutive zero-byte reads after data, forcing EOF\\n", _rdd_count, _rdd_zero_streak); fflush(stderr);\
 \t\t\tnResultSize = -1;\
 \t\t\t_rdd_zero_streak = 0;\
