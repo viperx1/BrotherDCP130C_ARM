@@ -567,7 +567,7 @@ compile_arm_backend() {
 \tstatic int _rdd_debug = -1;\
 \tif (_rdd_debug < 0) {\
 \t\tconst char *_e = getenv("BROTHER_DEBUG");\
-\t\t_rdd_debug = (_e && _e[0] == '"'"'1'"'"');\
+\t\t_rdd_debug = (_e && strcmp(_e, "1") == 0);\
 \t}' "$devaccs_c"
 
         # After the ReadEnd WriteLog, add stall detection + CPU yield:

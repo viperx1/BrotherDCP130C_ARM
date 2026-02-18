@@ -374,7 +374,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
                 double interval_ms = elapsed_ms(&g_stats.last_progress, &t_end);
                 g_stats.last_progress = t_end;
                 fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
-                        "last 100 in %.0f ms (%.1f ms/line), "
+                        "last 100 in %.1f ms (%.1f ms/line), "
                         "%.2f ms/line decode avg, max gap %.1f ms\n",
                         g_stats.lines_total, total_ms,
                         interval_ms, interval_ms / 100.0,
@@ -470,7 +470,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
             double interval_ms = elapsed_ms(&g_stats.last_progress, &t_end);
             g_stats.last_progress = t_end;
             fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
-                    "last 100 in %.0f ms (%.1f ms/line), "
+                    "last 100 in %.1f ms (%.1f ms/line), "
                     "%.2f ms/line decode avg, max gap %.1f ms\n",
                     g_stats.lines_total, total_ms,
                     interval_ms, interval_ms / 100.0,
