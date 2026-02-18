@@ -1024,16 +1024,35 @@ configure_scanner() {
 
     log_info "Scanner configured successfully."
 
-    # Enable Brother debug logging for diagnostics
+    # Configure Brsane2.ini [Driver] section for optimal scanning
     local ini_file="/usr/local/Brother/sane/Brsane2.ini"
     if [[ -f "$ini_file" ]]; then
+        # Enable Brother debug logging
         if grep -q "^LogFile=" "$ini_file"; then
-            # Ensure it's set to 1 (may be 0 from original deb)
             sudo sed -i 's/^LogFile=.*/LogFile=1/' "$ini_file"
         elif grep -q "^\[Driver\]" "$ini_file"; then
             sudo sed -i '/^\[Driver\]/a LogFile=1' "$ini_file"
         fi
         log_debug "Brother debug logging enabled in Brsane2.ini"
+
+        # Ensure compression=1 is set in [Driver] section.
+        # When compression=1, the backend sends "C=RLENGTH" (PackBits) in the
+        # scan start command. The scanner firmware decides whether to actually
+        # compress — the DCP-130C ignores this for 24-bit Color but may use
+        # it for B&W/grayscale modes.
+        if grep -q "^compression=" "$ini_file"; then
+            local cur_val
+            cur_val=$(grep "^compression=" "$ini_file" | head -1 | cut -d= -f2)
+            if [[ "$cur_val" != "1" ]]; then
+                sudo sed -i 's/^compression=.*/compression=1/' "$ini_file"
+                log_debug "Set compression=1 in Brsane2.ini (was $cur_val)"
+            else
+                log_debug "Brsane2.ini already has compression=1"
+            fi
+        elif grep -q "^\[Driver\]" "$ini_file"; then
+            sudo sed -i '/^\[Driver\]/a compression=1' "$ini_file"
+            log_debug "Added compression=1 to Brsane2.ini [Driver] section"
+        fi
     fi
 }
 
@@ -1253,10 +1272,11 @@ display_info() {
     log_info "  A full-page 150 DPI color scan takes ~90 seconds."
     echo
     log_info "Data compression (confirmed by real-world testing):"
-    log_info "  The scan protocol supports PackBits (run-length) compression and"
-    log_info "  white-line markers. However, real-world testing at 150 DPI 24-bit"
-    log_info "  Color shows the DCP-130C sends ALL data UNCOMPRESSED (1.0x ratio)."
+    log_info "  The backend requests PackBits compression (C=RLENGTH) via Brsane2.ini"
+    log_info "  compression=1. However, the DCP-130C scanner firmware ignores this"
+    log_info "  request for 24-bit Color mode and sends ALL data UNCOMPRESSED (1.0x)."
     log_info "  150 DPI color: 1232x1713 lines x 3 planes = ~6 MB raw, 88 sec transfer."
+    log_info "  Forcing compression is NOT possible — it is a scanner firmware decision."
     log_info "  B&W/grayscale modes may use compression — run with BROTHER_DEBUG=1"
     log_info "  to see exact compression stats for each scan mode."
     log_info "  The original Windows driver faced the same uncompressed data stream."

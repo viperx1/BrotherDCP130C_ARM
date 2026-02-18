@@ -622,8 +622,10 @@ BOOL ScanDecClose(void)
             fprintf(stderr,
                 "[SCANDEC] compression: scanner sent ALL data uncompressed (no PackBits or White lines).\n"
                 "[SCANDEC]   Compression ratio: %.1fx — no compression benefit for this scan.\n"
-                "[SCANDEC]   The DCP-130C does not compress 24-bit Color data despite protocol support.\n"
-                "[SCANDEC]   This means all %lu bytes were raw pixel data over USB.\n",
+                "[SCANDEC]   The backend requested PackBits (C=RLENGTH via Brsane2.ini compression=1)\n"
+                "[SCANDEC]   but the DCP-130C firmware ignores this for 24-bit Color mode.\n"
+                "[SCANDEC]   Forcing compression is NOT possible — this is a scanner firmware decision.\n"
+                "[SCANDEC]   All %lu bytes were raw uncompressed pixel data over USB.\n",
                 compress_ratio, g_stats.bytes_in);
         }
         if (decode_pct < 1.0 && g_stats.lines_total > 0) {

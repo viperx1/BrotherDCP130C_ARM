@@ -785,7 +785,7 @@ CEOF
 
 @test "scandec: diagnosis explains compression modes used by scanner" {
     grep -q 'Scanner used PackBits run-length encoding' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
-    grep -q 'does not compress 24-bit Color data' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'scanner firmware decision' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
 }
 
 @test "scandec: diagnosis includes Windows comparison" {
@@ -794,8 +794,8 @@ CEOF
 }
 
 @test "backend_init: reports scanner compression info" {
-    grep -q 'PackBits.*compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
-    grep -q 'White lines can be sent as single-byte' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'PackBits compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'scanner firmware decision' "$PROJECT_ROOT/DCP-130C/backend_init.c"
 }
 
 @test "backend_init: includes Windows comparison for transfer speed" {
@@ -813,4 +813,37 @@ CEOF
     grep -q 'Why scanning seems slower than on Windows:' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'USB transfer speed is identical on all platforms' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'progress bar' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- compression forcing analysis tests ---
+
+@test "scanner: install_scanner ensures compression=1 in Brsane2.ini" {
+    grep -q 'compression=1' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'compression=.*Brsane2.ini' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains compression cannot be forced" {
+    grep -q 'Forcing compression is NOT possible' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'scanner firmware decision' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains backend requests PackBits via INI" {
+    grep -q 'C=RLENGTH.*Brsane2.ini' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'compression=1' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "backend_init: reads and logs compression setting from Brsane2.ini" {
+    grep -q 'Brsane2.ini' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'compression=' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'C=RLENGTH requested' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: warns when compression=0 in INI" {
+    grep -q 'compression=0 means no compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "scandec: uncompressed diagnosis explains compression was requested" {
+    grep -q 'backend requested PackBits' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'C=RLENGTH.*Brsane2.ini' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'Forcing compression is NOT possible' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
 }

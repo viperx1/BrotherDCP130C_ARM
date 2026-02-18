@@ -23,6 +23,9 @@
 /* Brother USB vendor ID */
 #define BROTHER_VID "04f9"
 
+/* Path to Brother SANE config — must match BROTHER_SANE_DIR in brscan2 source */
+#define BROTHER_INI_PATH "/usr/local/Brother/sane/Brsane2.ini"
+
 /*
  * Format current wall-clock time as "HH:MM:SS.mmm" into a static buffer.
  */
@@ -155,11 +158,38 @@ static void probe_usb_environment(void) {
                     "[BROTHER2] cpu: CPU usage does NOT affect scan speed (USB is the bottleneck).\n"
                     "[BROTHER2] cpu: The scanner head finishes physically before data transfer ends.\n"
                     "[BROTHER2] cpu: The DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
-            fprintf(stderr, "%s [BROTHER2] data: The scanner protocol supports PackBits (run-length) compression.\n"
-                    "[BROTHER2] data: White lines can be sent as single-byte markers (huge savings).\n"
-                    "[BROTHER2] data: However, the DCP-130C sends 24-bit Color data UNCOMPRESSED.\n"
-                    "[BROTHER2] data: Real-world test: 150 DPI color = 6 MB raw, 1.0x ratio, 0%% compression.\n"
-                    "[BROTHER2] data: B&W/grayscale modes may use compression — run BROTHER_DEBUG=1 to check.\n", debug_ts());
+            fprintf(stderr, "%s [BROTHER2] data: The backend requests PackBits compression via Brsane2.ini compression=1.\n"
+                    "[BROTHER2] data: This sends C=RLENGTH in the scan start command to the scanner.\n"
+                    "[BROTHER2] data: However, the DCP-130C firmware ignores this for 24-bit Color mode.\n"
+                    "[BROTHER2] data: Forcing compression is NOT possible — it is a scanner firmware decision.\n"
+                    "[BROTHER2] data: B&W/grayscale modes may honour the compression request.\n", debug_ts());
+            /* Check actual compression setting in Brsane2.ini */
+            {
+                FILE *ini = fopen(BROTHER_INI_PATH, "r");
+                if (ini) {
+                    char line[256];
+                    int in_driver = 0, found_comp = 0;
+                    while (fgets(line, sizeof(line), ini)) {
+                        if (line[0] == '[')
+                            in_driver = (strncmp(line, "[Driver]", 8) == 0);
+                        if (in_driver && strncmp(line, "compression=", 12) == 0) {
+                            int val = atoi(line + 12);
+                            fprintf(stderr, "%s [BROTHER2] ini: Brsane2.ini [Driver] compression=%d (%s)\n",
+                                    debug_ts(), val, val ? "C=RLENGTH requested" : "C=NONE — compression disabled!");
+                            if (!val)
+                                fprintf(stderr, "%s [BROTHER2] ini: WARNING — compression=0 means no compression is requested.\n"
+                                        "[BROTHER2] ini: Set compression=1 in %s to request PackBits.\n", debug_ts(), BROTHER_INI_PATH);
+                            found_comp = 1;
+                            break;
+                        }
+                    }
+                    fclose(ini);
+                    if (!found_comp)
+                        fprintf(stderr, "%s [BROTHER2] ini: WARNING — no compression= key found in Brsane2.ini [Driver] section\n", debug_ts());
+                } else {
+                    fprintf(stderr, "%s [BROTHER2] ini: cannot read %s\n", debug_ts(), BROTHER_INI_PATH);
+                }
+            }
             fprintf(stderr, "%s [BROTHER2] windows: The original Windows driver had the SAME USB speed limit.\n"
                     "[BROTHER2] windows: The ~60 sec post-scan transfer is normal for Full-Speed USB.\n"
                     "[BROTHER2] windows: Windows may have seemed faster due to different default settings\n"
