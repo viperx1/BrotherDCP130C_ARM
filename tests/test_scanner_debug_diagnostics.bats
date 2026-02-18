@@ -784,8 +784,8 @@ CEOF
 }
 
 @test "scandec: diagnosis explains compression modes used by scanner" {
-    grep -q 'scanner DOES compress data before sending' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
-    grep -q 'PackBits run-length encoding' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'Scanner used PackBits run-length encoding' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'does not compress 24-bit Color data' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
 }
 
 @test "scandec: diagnosis includes Windows comparison" {
@@ -795,7 +795,7 @@ CEOF
 
 @test "backend_init: reports scanner compression info" {
     grep -q 'PackBits.*compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
-    grep -q 'White lines are sent as single-byte' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'White lines can be sent as single-byte' "$PROJECT_ROOT/DCP-130C/backend_init.c"
 }
 
 @test "backend_init: includes Windows comparison for transfer speed" {
@@ -804,8 +804,8 @@ CEOF
 }
 
 @test "scanner: display_info explains compression used by scanner" {
-    grep -q 'Data compression:' "$PROJECT_ROOT/install_scanner.sh"
-    grep -q 'scanner DOES compress data before sending' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Data compression' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'sends ALL data UNCOMPRESSED' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'PackBits' "$PROJECT_ROOT/install_scanner.sh"
 }
 

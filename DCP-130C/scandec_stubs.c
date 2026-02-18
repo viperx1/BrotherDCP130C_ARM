@@ -611,7 +611,7 @@ BOOL ScanDecClose(void)
                 ? (compressed_lines * 100.0) / total_lines : 0;
             fprintf(stderr,
                 "[SCANDEC] compression: %.0f%% of lines used compression (PackBits=%lu, White=%lu, Raw=%lu)\n"
-                "[SCANDEC]   The scanner DOES compress data before sending (PackBits run-length encoding).\n"
+                "[SCANDEC]   Scanner used PackBits run-length encoding for this scan mode.\n"
                 "[SCANDEC]   Compression ratio: %.1fx — %.1f MB sent over USB for %.1f MB of pixel data.\n",
                 pct_compressed,
                 g_stats.lines_pack, g_stats.lines_white, g_stats.lines_noncomp,
@@ -620,9 +620,11 @@ BOOL ScanDecClose(void)
                 g_stats.bytes_out / (1024.0 * 1024.0));
         } else if (g_stats.lines_noncomp > 0) {
             fprintf(stderr,
-                "[SCANDEC] compression: scanner sent all lines uncompressed (no PackBits or White lines).\n"
-                "[SCANDEC]   Compression ratio: %.1fx — no compression benefit for this scan.\n",
-                compress_ratio);
+                "[SCANDEC] compression: scanner sent ALL data uncompressed (no PackBits or White lines).\n"
+                "[SCANDEC]   Compression ratio: %.1fx — no compression benefit for this scan.\n"
+                "[SCANDEC]   The DCP-130C does not compress 24-bit Color data despite protocol support.\n"
+                "[SCANDEC]   This means all %lu bytes were raw pixel data over USB.\n",
+                compress_ratio, g_stats.bytes_in);
         }
         if (decode_pct < 1.0 && g_stats.lines_total > 0) {
             fprintf(stderr,
