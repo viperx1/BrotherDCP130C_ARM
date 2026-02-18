@@ -46,6 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCANNER_MODEL="DCP-130C"
 SCANNER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_scanner_install"
+SCANNER_SHARED=false
 
 # Driver filename
 DRIVER_BRSCAN2_FILE="brscan2-0.2.5-1.i386.deb"
@@ -244,6 +245,100 @@ fix_broken_packages() {
         fi
         log_info "Cleaned up broken package state. apt-get is working."
     fi
+}
+
+# Ask user whether to enable scanner sharing on the local network.
+# When enabled, the scanner will be shared via saned (SANE network daemon)
+# and discoverable on the LAN through Avahi/Bonjour (mDNS).
+ask_scanner_sharing() {
+    echo
+    log_info "Scanner sharing allows other devices on your local network to discover and use this scanner."
+    read -p "Do you want to enable scanner sharing on the local network? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        SCANNER_SHARED=true
+        log_info "Scanner sharing will be enabled."
+    else
+        SCANNER_SHARED=false
+        log_info "Scanner sharing will not be enabled. The scanner will only be available locally."
+    fi
+}
+
+# Configure scanner sharing on the local network via saned and Avahi.
+# saned provides network access to the scanner; Avahi advertises the
+# service via mDNS/DNS-SD so other devices can discover it automatically.
+setup_scanner_sharing() {
+    if [[ "$SCANNER_SHARED" != true ]]; then
+        return
+    fi
+
+    log_info "Configuring scanner sharing on the local network..."
+
+    # --- saned configuration ---
+    # saned.conf controls which hosts may access the scanner over the network.
+    local saned_conf="/etc/sane.d/saned.conf"
+    if [[ -f "$saned_conf" ]]; then
+        sudo cp "$saned_conf" "${saned_conf}.bak"
+    fi
+    # Allow all hosts on the local network (link-local ranges) to connect.
+    # saned accepts CIDR notation for access control.
+    local -a acl_entries=("192.168.0.0/16" "10.0.0.0/8" "172.16.0.0/12")
+    for entry in "${acl_entries[@]}"; do
+        if ! grep -q "^${entry}$" "$saned_conf" 2>/dev/null; then
+            echo "$entry" | sudo tee -a "$saned_conf" > /dev/null
+            log_debug "Added $entry to saned.conf"
+        else
+            log_debug "$entry already in saned.conf"
+        fi
+    done
+
+    # Enable and start saned via systemd socket activation.
+    # saned.socket listens on port 6566 and spawns saned on demand.
+    if systemctl list-unit-files saned.socket &>/dev/null; then
+        sudo systemctl enable saned.socket || log_warn "Failed to enable saned.socket"
+        sudo systemctl start saned.socket || log_warn "Failed to start saned.socket"
+        log_debug "saned.socket status: $(systemctl is-active saned.socket 2>/dev/null || echo 'unknown')"
+    else
+        log_warn "saned.socket unit not found. saned may need manual configuration."
+    fi
+
+    # --- Avahi/mDNS advertisement ---
+    # Install Avahi daemon if not already present
+    if ! dpkg -s avahi-daemon &>/dev/null; then
+        log_info "Installing Avahi daemon for network scanner discovery..."
+        sudo apt-get install -y avahi-daemon 2>&1 | tail -3
+    else
+        log_debug "Avahi daemon is already installed"
+    fi
+    sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
+    sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
+    log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
+
+    # Publish a SANE scanner service via Avahi so that other devices on the
+    # network can automatically discover this scanner using DNS-SD / mDNS.
+    # The standard service type for SANE is _sane-port._tcp on port 6566.
+    local avahi_service_dir="/etc/avahi/services"
+    local avahi_service_file="${avahi_service_dir}/sane.service"
+    sudo mkdir -p "$avahi_service_dir"
+    sudo tee "$avahi_service_file" > /dev/null << 'AVAHI_EOF'
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">SANE scanner on %h</name>
+  <service>
+    <type>_sane-port._tcp</type>
+    <port>6566</port>
+  </service>
+</service-group>
+AVAHI_EOF
+    log_debug "Created Avahi service file: $avahi_service_file"
+
+    # Reload Avahi so it picks up the new service file
+    sudo systemctl reload avahi-daemon 2>/dev/null \
+        || sudo systemctl restart avahi-daemon 2>/dev/null \
+        || log_warn "Failed to reload avahi-daemon"
+
+    log_info "Scanner sharing configured. Other devices on the network can discover this scanner."
 }
 
 # Install required dependencies
@@ -1313,6 +1408,21 @@ display_info() {
     log_info "  2. Run: sudo scanimage -L"
     log_info "  3. Check SANE backend: grep brother2 /etc/sane.d/dll.conf"
     echo
+    if [[ "$SCANNER_SHARED" == true ]]; then
+        local ip_addr
+        ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+        log_info "Scanner sharing: ENABLED"
+        log_info "Other devices on the network can discover and use this scanner."
+        log_info "  - Linux clients: Install sane-utils, then run 'scanimage -L' to discover"
+        log_info "  - The scanner is advertised via Avahi/mDNS (service: _sane-port._tcp)"
+        log_info "  - saned is listening on port 6566 (via systemd socket activation)"
+        if [[ -n "$ip_addr" ]]; then
+            log_info "  - Remote clients can add '$ip_addr' to /etc/sane.d/net.conf"
+        fi
+    else
+        log_info "Scanner sharing: DISABLED (local only)"
+    fi
+    echo
     log_info "If you were added to the scanner group, you may need to log out and back in."
 }
 
@@ -1330,6 +1440,7 @@ main() {
     
     check_root
     check_architecture
+    ask_scanner_sharing
     fix_broken_packages
     install_dependencies
     create_temp_dir
@@ -1346,6 +1457,7 @@ main() {
 
     detect_scanner
     configure_scanner
+    setup_scanner_sharing
     test_scan
     cleanup
     display_info

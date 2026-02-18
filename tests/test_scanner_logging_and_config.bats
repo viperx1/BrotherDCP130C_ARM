@@ -88,6 +88,10 @@ teardown() {
     [[ "$TMP_DIR" == *"scanner"* ]]
 }
 
+@test "scanner: SCANNER_SHARED defaults to false" {
+    [[ "$SCANNER_SHARED" == "false" ]]
+}
+
 # --- Debug flag parsing ---
 
 @test "scanner: --debug flag is parsed from args" {
