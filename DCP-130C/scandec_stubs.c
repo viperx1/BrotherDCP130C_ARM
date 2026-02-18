@@ -18,17 +18,13 @@
  */
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <signal.h>
 #include <unistd.h>
 
 /* SIGSEGV handler: write crash info to stderr before dying */
 static void scandec_segfault_handler(int sig) {
-    const char msg[] = "\n[SCANDEC] FATAL: Segmentation fault (SIGSEGV) in scan backend!\n"
-                       "[SCANDEC] The crash occurred during scanning. Check BrMfc32.log for details.\n";
-    /* Use write() not fprintf() — async-signal-safe */
+    const char msg[] = "\n[SCANDEC] FATAL: Segmentation fault (SIGSEGV) in scan backend!\n";
     write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    /* Restore default handler and re-raise for core dump */
     struct sigaction sa;
     sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);
@@ -37,7 +33,6 @@ static void scandec_segfault_handler(int sig) {
     raise(sig);
 }
 
-/* Install signal handler on library load */
 __attribute__((constructor))
 static void scandec_init(void) {
     struct sigaction sa;
@@ -45,9 +40,6 @@ static void scandec_init(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGSEGV, &sa, NULL);
-    /* Use write() for signal-safe consistency */
-    const char msg[] = "[SCANDEC] Library loaded (ARM native stub)\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
 }
 
 typedef int            BOOL;
@@ -95,11 +87,7 @@ typedef struct {
 } SCANDEC_WRITE;
 
 static SCANDEC_OPEN g_open;
-static int g_write_count = 0;
-static int g_nonzero_lines = 0;
 static int g_bpp = 0;  /* bytes per pixel for the output format */
-static unsigned long g_total_in_bytes = 0;   /* total input bytes received */
-static unsigned long g_total_out_bytes = 0;  /* total output bytes emitted */
 
 /* Color plane assembly for 24-bit RGB mode.
  * The scanner sends separate R, G, B planes (nInDataKind 2,3,4).
@@ -162,15 +150,7 @@ static void gray8_to_1bit(const BYTE *gray, DWORD nPixels,
 
 BOOL ScanDecOpen(SCANDEC_OPEN *p)
 {
-    if (!p) {
-        fprintf(stderr, "[SCANDEC] ScanDecOpen: NULL pointer\n");
-        return FALSE;
-    }
-
-    g_write_count = 0;
-    g_nonzero_lines = 0;
-    g_total_in_bytes = 0;
-    g_total_out_bytes = 0;
+    if (!p) return FALSE;
 
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
 
@@ -188,15 +168,13 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
         g_bpp = 1;
         p->dwOutLineByte = p->dwOutLinePixCnt;
     } else {
-        /* SC_2BIT: B&W / Error Diffusion — 1-bit packed output */
-        g_bpp = 0;  /* special: 1-bit packed */
+        g_bpp = 0;
         p->dwOutLineByte = (p->dwOutLinePixCnt + 7) / 8;
     }
 
     if (p->bLongBoundary)
         p->dwOutLineByte = (p->dwOutLineByte + 3) & ~3UL;
 
-    /* Max output per ScanDecWrite call (multiple lines possible) */
     p->dwOutWriteMaxSize = p->dwOutLineByte * 16;
 
     memcpy(&g_open, p, sizeof(*p));
@@ -213,7 +191,6 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
         g_green_plane = (BYTE *)calloc(g_plane_pixels, 1);
         g_blue_plane  = (BYTE *)calloc(g_plane_pixels, 1);
         if (!g_red_plane || !g_green_plane || !g_blue_plane) {
-            fprintf(stderr, "[SCANDEC] ScanDecOpen: plane buffer allocation failed\n");
             free(g_red_plane);   g_red_plane = NULL;
             free(g_green_plane); g_green_plane = NULL;
             free(g_blue_plane);  g_blue_plane = NULL;
@@ -221,14 +198,6 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
         }
     }
 
-    fprintf(stderr, "[SCANDEC] ScanDecOpen: nColorType=0x%x pixels=%lu "
-            "bpp=%d dwOutLineByte=%lu dwOutWriteMaxSize=%lu "
-            "bLongBoundary=%d inReso=%dx%d outReso=%dx%d\n",
-            p->nColorType, (unsigned long)p->dwInLinePixCnt, g_bpp,
-            (unsigned long)p->dwOutLineByte,
-            (unsigned long)p->dwOutWriteMaxSize,
-            p->bLongBoundary,
-            p->nInResoX, p->nInResoY, p->nOutResoX, p->nOutResoY);
     return TRUE;
 }
 
@@ -240,33 +209,21 @@ void ScanDecSetTblHandle(HANDLE h1, HANDLE h2)
 
 BOOL ScanDecPageStart(void)
 {
-    fprintf(stderr, "[SCANDEC] ScanDecPageStart\n");
     return TRUE;
 }
 
 DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
 {
     if (!w || !w->pLineData || !w->pWriteBuff) {
-        fprintf(stderr, "[SCANDEC] ScanDecWrite: NULL pointers "
-                "w=%p pLineData=%p pWriteBuff=%p\n",
-                (void*)w,
-                w ? (void*)w->pLineData : NULL,
-                w ? (void*)w->pWriteBuff : NULL);
         if (st) *st = -1;
         return 0;
     }
 
     DWORD outLine = g_open.dwOutLineByte;
     if (outLine == 0 || outLine > w->dwWriteBuffSize) {
-        fprintf(stderr, "[SCANDEC] ScanDecWrite: bad outLine=%lu "
-                "writeBuffSize=%lu\n",
-                (unsigned long)outLine, (unsigned long)w->dwWriteBuffSize);
         if (st) *st = 0;
         return 0;
     }
-
-    g_write_count++;
-    g_total_in_bytes += w->dwLineDataSize;
 
     /*
      * 24-bit color mode: the scanner sends separate R, G, B planes
@@ -276,7 +233,6 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
     if (g_bpp == 3 && g_red_plane && g_green_plane && g_blue_plane
         && w->nInDataKind >= 2 && w->nInDataKind <= 4)
     {
-        /* Select the target plane buffer */
         BYTE *planeBuf;
         switch (w->nInDataKind) {
         case 2:  planeBuf = g_red_plane;   g_have_red = 1;   break;
@@ -284,7 +240,6 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         default: planeBuf = g_blue_plane;                      break;
         }
 
-        /* Decode input into the single-channel plane buffer */
         switch (w->nInDataComp) {
         case SCIDC_WHITE:
             memset(planeBuf, 0xFF, g_plane_pixels);
@@ -309,31 +264,6 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         }
         }
 
-        /* Log (first 5 writes with hex dump, then every 100th) */
-        if (g_write_count <= 5) {
-            char hexbuf[16*3 + 1];
-            DWORD hexlen = w->dwLineDataSize < 16 ? w->dwLineDataSize : 16;
-            for (DWORD i = 0; i < hexlen; i++)
-                snprintf(hexbuf + i*3, 4, "%02X ", w->pLineData[i]);
-            if (hexlen > 0) hexbuf[hexlen*3 - 1] = '\0';
-            else hexbuf[0] = '\0';
-            fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
-                    "inLen=%lu outLine=%lu hasData=- bpp=%d "
-                    "plane=%c in=[%s]\n",
-                    g_write_count, w->nInDataComp, w->nInDataKind,
-                    (unsigned long)w->dwLineDataSize,
-                    (unsigned long)outLine, g_bpp,
-                    w->nInDataKind == 2 ? 'R' : w->nInDataKind == 3 ? 'G' : 'B',
-                    hexbuf);
-        } else if (g_write_count % 100 == 0) {
-            fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
-                    "inLen=%lu plane=%c totalIn=%lu totalOut=%lu\n",
-                    g_write_count, w->nInDataComp, w->nInDataKind,
-                    (unsigned long)w->dwLineDataSize,
-                    w->nInDataKind == 2 ? 'R' : w->nInDataKind == 3 ? 'G' : 'B',
-                    g_total_in_bytes, g_total_out_bytes);
-        }
-
         /* If this is not the Blue plane, or we're missing a plane, buffer only */
         if (w->nInDataKind != 4 || !g_have_red || !g_have_green) {
             if (st) *st = 0;
@@ -352,19 +282,12 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         g_have_red = 0;
         g_have_green = 0;
 
-        g_total_out_bytes += outLine;
-
-        int has_data = 0;
-        for (DWORD i = 0; i < outLine && !has_data; i++)
-            if (w->pWriteBuff[i] != 0) has_data = 1;
-        if (has_data) g_nonzero_lines++;
-
         if (st) *st = 1;
         return outLine;
     }
 
     /*
-     * Grayscale / B&W path (original behavior)
+     * Grayscale / B&W path
      */
     memset(w->pWriteBuff, 0, outLine);
 
@@ -429,49 +352,12 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
     }
 
-    /* Track total output (input already tracked at top of function) */
-    g_total_out_bytes += outLine;
-
-    /* Check for non-zero data */
-    int has_data = 0;
-    for (DWORD i = 0; i < outLine && !has_data; i++)
-        if (w->pWriteBuff[i] != 0) has_data = 1;
-    if (has_data) g_nonzero_lines++;
-
-    /* Log first 5 calls with input hex dump, then every 100th */
-    if (g_write_count <= 5) {
-        /* Hex dump first 16 input bytes for protocol analysis */
-        char hexbuf[16*3 + 1];
-        DWORD hexlen = w->dwLineDataSize < 16 ? w->dwLineDataSize : 16;
-        for (DWORD i = 0; i < hexlen; i++)
-            snprintf(hexbuf + i*3, 4, "%02X ", w->pLineData[i]);
-        if (hexlen > 0) hexbuf[hexlen*3 - 1] = '\0';
-        else hexbuf[0] = '\0';
-        fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
-                "inLen=%lu outLine=%lu hasData=%d bpp=%d "
-                "in=[%s]\n",
-                g_write_count, w->nInDataComp, w->nInDataKind,
-                (unsigned long)w->dwLineDataSize,
-                (unsigned long)outLine, has_data, g_bpp,
-                hexbuf);
-    } else if (g_write_count % 100 == 0) {
-        fprintf(stderr, "[SCANDEC] Write #%d: comp=%d "
-                "inLen=%lu hasData=%d totalIn=%lu totalOut=%lu\n",
-                g_write_count, w->nInDataComp,
-                (unsigned long)w->dwLineDataSize, has_data,
-                g_total_in_bytes, g_total_out_bytes);
-    }
-
     if (st) *st = 1;
     return outLine;
 }
 
 DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
 {
-    fprintf(stderr, "[SCANDEC] ScanDecPageEnd: total_writes=%d "
-            "nonzero_lines=%d totalIn=%lu totalOut=%lu\n",
-            g_write_count, g_nonzero_lines,
-            g_total_in_bytes, g_total_out_bytes);
     (void)w;
     if (st) *st = 0;
     return 0;
@@ -479,14 +365,8 @@ DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
 
 BOOL ScanDecClose(void)
 {
-    fprintf(stderr, "[SCANDEC] ScanDecClose: total_writes=%d "
-            "nonzero_lines=%d totalIn=%lu totalOut=%lu\n",
-            g_write_count, g_nonzero_lines,
-            g_total_in_bytes, g_total_out_bytes);
     memset(&g_open, 0, sizeof(g_open));
     g_bpp = 0;
-    g_total_in_bytes = 0;
-    g_total_out_bytes = 0;
     free(g_red_plane);   g_red_plane = NULL;
     free(g_green_plane); g_green_plane = NULL;
     free(g_blue_plane);  g_blue_plane = NULL;
