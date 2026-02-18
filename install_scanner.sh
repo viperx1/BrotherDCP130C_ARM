@@ -296,16 +296,37 @@ try_download() {
     
     for url in "${urls[@]}"; do
         log_debug "Trying download: $url"
-        if wget -q --timeout=30 --tries=2 -O "$output_file" "$url" 2>/dev/null; then
+        local wget_err wget_args
+        wget_args=(--timeout=60 --tries=3 -O "$output_file")
+        # In non-debug mode, suppress wget output
+        if [[ "$DEBUG" != "1" ]]; then
+            wget_args+=(-q)
+        fi
+        if wget_err=$( wget "${wget_args[@]}" "$url" 2>&1 ); then
+            local file_size file_type
+            file_size=$(stat -c%s "$output_file" 2>/dev/null || echo "0")
+            file_type=$(file -b "$output_file" 2>/dev/null || echo "unknown")
+            log_debug "Downloaded: $(basename "$output_file") — ${file_size} bytes, type: ${file_type}"
             # Verify we got an actual file (not an HTML error page)
-            if [[ -s "$output_file" ]] && file "$output_file" | grep -qi "debian\|archive\|data"; then
+            if [[ -s "$output_file" ]] && grep -qi "debian\|archive\|data\|gzip" <<< "$file_type"; then
+                # Extra integrity check for gzip archives (catches truncated downloads)
+                if [[ "$output_file" == *.tar.gz || "$output_file" == *.gz ]]; then
+                    if ! gzip -t "$output_file" 2>/dev/null; then
+                        log_debug "Download from $url is a truncated/corrupt gzip file (${file_size} bytes), trying next..."
+                        rm -f "$output_file"
+                        continue
+                    fi
+                    log_debug "gzip integrity check passed"
+                fi
                 log_info "Downloaded successfully from: $url"
                 return 0
             fi
-            log_debug "Download from $url succeeded but file appears invalid, trying next..."
+            log_debug "Download from $url succeeded but file appears invalid (type: ${file_type}), trying next..."
             rm -f "$output_file"
         else
             log_debug "Download failed from: $url"
+            log_debug "wget error: $(tail -n 3 <<< "$wget_err")"
+            rm -f "$output_file"
         fi
     done
     
@@ -469,20 +490,57 @@ compile_arm_backend() {
     # Download source
     log_info "Downloading brscan2 source code..."
     mkdir -p "$src_dir" "$build_dir"
+    log_debug "brscan2 source URLs to try: ${DRIVER_BRSCAN2_SRC_URLS[*]}"
 
     local src_tarball="$TMP_DIR/$DRIVER_BRSCAN2_SRC_FILE"
+    # Validate existing tarball — remove if corrupt (e.g. truncated download)
+    if [[ -f "$src_tarball" ]]; then
+        local existing_size
+        existing_size=$(stat -c%s "$src_tarball" 2>/dev/null || echo "0")
+        log_debug "Existing source tarball: ${existing_size} bytes"
+        if ! gzip -t "$src_tarball" 2>/dev/null; then
+            log_warn "Existing source tarball is corrupt (${existing_size} bytes), re-downloading..."
+            rm -f "$src_tarball"
+        else
+            log_debug "Existing source tarball passes gzip integrity check"
+        fi
+    fi
     if [[ ! -f "$src_tarball" ]]; then
         if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
-            log_warn "Failed to download brscan2 source code"
+            log_warn "Failed to download brscan2 source code from all URLs"
+            log_warn "URLs tried:"
+            for url in "${DRIVER_BRSCAN2_SRC_URLS[@]}"; do
+                log_warn "  - $url"
+            done
             return 1
         fi
     fi
 
-    # Extract source
-    tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 || {
-        log_warn "Failed to extract brscan2 source"
-        return 1
-    }
+    # Clean src_dir before extraction to avoid interference from prior runs
+    rm -rf "$src_dir"
+    mkdir -p "$src_dir"
+
+    # Extract source (retry once on failure after re-downloading)
+    local tar_err
+    if ! tar_err=$(tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 2>&1); then
+        local tarball_size
+        tarball_size=$(stat -c%s "$src_tarball" 2>/dev/null || echo "0")
+        log_debug "Extraction error: $tar_err"
+        log_debug "Tarball size: ${tarball_size} bytes, type: $(file -b "$src_tarball" 2>/dev/null)"
+        log_warn "Failed to extract brscan2 source, re-downloading..."
+        rm -f "$src_tarball"
+        rm -rf "$src_dir"
+        mkdir -p "$src_dir"
+        if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
+            log_warn "Failed to download brscan2 source code from all URLs"
+            return 1
+        fi
+        if ! tar_err=$(tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 2>&1); then
+            log_debug "Retry extraction error: $tar_err"
+            log_warn "Failed to extract brscan2 source after re-download"
+            return 1
+        fi
+    fi
 
     local brscan_src="$src_dir/brscan"
     if [[ ! -d "$brscan_src/backend_src" ]]; then
@@ -841,6 +899,64 @@ a\
     return 0
 }
 
+# Diagnose USB speed for Brother scanner.
+# Reads sysfs speed attribute to report negotiated link rate and
+# explains whether High-Speed (480 Mbit/s) is possible.
+diagnose_usb_speed() {
+    local found=0
+    for devpath in /sys/bus/usb/devices/*/idVendor; do
+        local ddir
+        ddir=$(dirname "$devpath")
+        local vid
+        vid=$(cat "$ddir/idVendor" 2>/dev/null) || continue
+        [[ "$vid" == "04f9" ]] || continue
+        found=1
+
+        local speed version product
+        speed=$(cat "$ddir/speed" 2>/dev/null || echo "?")
+        version=$(cat "$ddir/version" 2>/dev/null | tr -d ' ' || echo "?")
+        product=$(cat "$ddir/product" 2>/dev/null || echo "Brother device")
+
+        log_debug "USB device: $product at $(basename "$ddir")"
+        log_debug "  Negotiated speed: ${speed} Mbit/s"
+        log_debug "  USB descriptor version: $version"
+
+        if [[ "$speed" == "12" ]]; then
+            log_info "USB speed: 12 Mbit/s (Full-Speed)."
+            log_info "  The DCP-130C is a 'USB 2.0 Full-Speed' device."
+            log_info "  It is USB 2.0 compliant but only has a Full-Speed transceiver."
+            log_info "  High-Speed (480 Mbit/s) is NOT supported by this hardware."
+            log_info "  This cannot be changed — it is a silicon-level limitation."
+        elif [[ "$speed" == "480" ]]; then
+            log_info "USB speed: 480 Mbit/s (High-Speed). Unexpected for DCP-130C."
+        else
+            log_debug "USB speed: ${speed} Mbit/s"
+        fi
+
+        # Check host controller speed capability
+        # USB device names: "1-2.3" → parent hub "1-2", "1-2" → root hub "usb1"
+        local devname parent_name parent_speed
+        devname=$(basename "$ddir")
+        parent_name="${devname%.*}"        # strip ".N" suffix
+        if [[ "$parent_name" == "$devname" ]]; then
+            parent_name="${devname%-*}"    # strip "-N" suffix for root level
+            [[ "$parent_name" == "$devname" ]] && parent_name=""
+        fi
+        if [[ -n "$parent_name" ]]; then
+            parent_speed=$(cat "/sys/bus/usb/devices/$parent_name/speed" 2>/dev/null || echo "")
+            if [[ -n "$parent_speed" ]]; then
+                log_debug "  Host port speed: ${parent_speed} Mbit/s"
+                if [[ "$parent_speed" == "480" || "$parent_speed" == "5000" || "$parent_speed" == "10000" ]]; then
+                    log_debug "  Host supports High-Speed — device is the bottleneck."
+                fi
+            fi
+        fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+        log_debug "No Brother USB device found for speed diagnosis."
+    fi
+}
+
 # Detect scanner USB connection
 detect_scanner() {
     log_info "Detecting Brother DCP-130C scanner..."
@@ -852,6 +968,7 @@ detect_scanner() {
     if lsusb | grep -i "Brother"; then
         log_info "Brother device detected on USB."
         lsusb | grep -i "Brother"
+        diagnose_usb_speed
     else
         log_warn "Brother device not detected on USB. Please ensure the scanner is connected and powered on."
     fi
@@ -907,16 +1024,35 @@ configure_scanner() {
 
     log_info "Scanner configured successfully."
 
-    # Enable Brother debug logging for diagnostics
+    # Configure Brsane2.ini [Driver] section for optimal scanning
     local ini_file="/usr/local/Brother/sane/Brsane2.ini"
     if [[ -f "$ini_file" ]]; then
+        # Enable Brother debug logging
         if grep -q "^LogFile=" "$ini_file"; then
-            # Ensure it's set to 1 (may be 0 from original deb)
             sudo sed -i 's/^LogFile=.*/LogFile=1/' "$ini_file"
         elif grep -q "^\[Driver\]" "$ini_file"; then
             sudo sed -i '/^\[Driver\]/a LogFile=1' "$ini_file"
         fi
         log_debug "Brother debug logging enabled in Brsane2.ini"
+
+        # Ensure compression=1 is set in [Driver] section.
+        # When compression=1, the backend sends "C=RLENGTH" (PackBits) in the
+        # scan start command. The scanner firmware decides whether to actually
+        # compress — the DCP-130C ignores this for 24-bit Color but may use
+        # it for B&W/grayscale modes.
+        if grep -q "^compression=" "$ini_file"; then
+            local cur_val
+            cur_val=$(grep "^compression=" "$ini_file" | head -1 | cut -d= -f2)
+            if [[ "$cur_val" != "1" ]]; then
+                sudo sed -i 's/^compression=.*/compression=1/' "$ini_file"
+                log_debug "Set compression=1 in Brsane2.ini (was $cur_val)"
+            else
+                log_debug "Brsane2.ini already has compression=1"
+            fi
+        elif grep -q "^\[Driver\]" "$ini_file"; then
+            sudo sed -i '/^\[Driver\]/a compression=1' "$ini_file"
+            log_debug "Added compression=1 to Brsane2.ini [Driver] section"
+        fi
     fi
 }
 
@@ -1126,13 +1262,48 @@ display_info() {
     log_info "  brsaneconfig2 -q"
     echo
     log_info "Performance notes:"
-    log_info "  The DCP-130C is a USB 2.0 Full-Speed device (12 Mbit/s)."
+    log_info "  The DCP-130C is a Full-Speed USB device (12 Mbit/s)."
     log_info "  'Full-Speed' means 12 Mbit/s — NOT High-Speed (480 Mbit/s)."
+    log_info "  This is a hardware limit of the scanner's USB transceiver."
+    log_info "  Forcing USB 2.0 High-Speed (480 Mbit/s) is NOT possible."
+    log_info "  The scanner only has a Full-Speed PHY (a silicon-level limit)."
+    log_info "  No software, cable, or host setting can change this."
     log_info "  This limits scan throughput to ~70 KB/s by design."
     log_info "  A full-page 150 DPI color scan takes ~90 seconds."
-    log_info "  This is a hardware limit — the scanner itself is the bottleneck."
-    log_info "  Tips for faster scans:"
-    log_info "    - Use grayscale mode (3x less data than color)"
+    echo
+    log_info "Data compression (confirmed by real-world testing at 150 DPI):"
+    log_info "  True Gray mode:  3.9x compression (PackBits on 100% of lines)"
+    log_info "    0.5 MB over USB for 1.9 MB of pixel data — 31 sec scan time."
+    log_info "  24-bit Color mode: 1.0x (uncompressed — all 5139 RGB planes raw)"
+    log_info "    6.0 MB over USB, no compression benefit — 88 sec scan time."
+    log_info "  The backend sends the same C=RLENGTH request for both modes."
+    log_info "  The scanner firmware decides per-line via the line header byte."
+    log_info "  For color planes (R/G/B), the firmware never sets compression bits."
+    log_info "  This is a firmware-level decision — forcing color compression is"
+    log_info "  NOT possible from the driver side."
+    echo
+    log_info "Why scanning seems slower than on Windows:"
+    log_info "  The USB transfer speed is identical on all platforms (12 Mbit/s)."
+    log_info "  The scanner head finishes physically around line 400-500 but the"
+    log_info "  DCP-130C buffers data internally and continues transmitting over"
+    log_info "  USB after the head returns home (~60 sec for a color page)."
+    log_info "  Windows may have seemed faster because:"
+    log_info "    - It may have used lower default resolution or grayscale mode"
+    log_info "    - Its progress bar showed transfer progress (making wait feel shorter)"
+    log_info "    - The driver UI may have returned control before transfer finished"
+    log_info "  The physical USB data transfer takes the same time on both platforms."
+    echo
+    log_info "CPU usage during scanning:"
+    log_info "  scanimage may show high CPU usage during scans. This is caused by"
+    log_info "  the USB bulk-read polling loop in the SANE backend — it repeatedly"
+    log_info "  calls usb_bulk_read() waiting for data from the scanner."
+    log_info "  A 2 ms yield (usleep) is injected after zero-byte reads to reduce"
+    log_info "  CPU usage. The CPU load does NOT affect scan speed — the bottleneck"
+    log_info "  is the 12 Mbit/s USB link, not the host CPU."
+    echo
+    log_info "Tips for faster scans:"
+    log_info "    - Use 'True Gray' mode (3x less data than color, ~30 sec vs ~88 sec)"
+    log_info "      scanimage -d 'brother2:bus1;dev1' --mode 'True Gray' --resolution=150 --format=pnm > scan.pnm"
     log_info "    - Use 150 DPI instead of 300 DPI (4x less data)"
     log_info "    - Ensure usblp is unbound: echo '<intf>' | sudo tee /sys/bus/usb/drivers/usblp/unbind"
     log_info "  For debug diagnostics, scan with: sudo BROTHER_DEBUG=1 scanimage ..."

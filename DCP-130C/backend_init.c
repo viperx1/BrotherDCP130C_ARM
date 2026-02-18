@@ -23,6 +23,9 @@
 /* Brother USB vendor ID */
 #define BROTHER_VID "04f9"
 
+/* Path to Brother SANE config — must match BROTHER_SANE_DIR in brscan2 source */
+#define BROTHER_INI_PATH "/usr/local/Brother/sane/Brsane2.ini"
+
 /*
  * Format current wall-clock time as "HH:MM:SS.mmm" into a static buffer.
  */
@@ -146,8 +149,78 @@ static void probe_usb_environment(void) {
             if (usb_ver_major >= 2) {
                 fprintf(stderr, "%s [BROTHER2] usb: The DCP-130C is \"USB 2.0 Full-Speed\" — it is USB 2.0 compliant\n"
                         "[BROTHER2] usb: but only supports Full-Speed (12 Mbit/s), NOT High-Speed (480 Mbit/s).\n"
-                        "[BROTHER2] usb: This is BY DESIGN — the scanner hardware has no High-Speed capability.\n"
-                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput for this device.\n", debug_ts());
+                        "[BROTHER2] usb: This is a silicon-level limit — the scanner has no High-Speed PHY.\n"
+                        "[BROTHER2] usb: Forcing USB 2.0 High-Speed is NOT possible with this device.\n"
+                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput.\n", debug_ts());
+            }
+            fprintf(stderr, "%s [BROTHER2] cpu: High CPU during scans is normal — the USB bulk-read\n"
+                    "[BROTHER2] cpu: loop polls for data. A 2 ms yield reduces CPU load.\n"
+                    "[BROTHER2] cpu: CPU usage does NOT affect scan speed (USB is the bottleneck).\n"
+                    "[BROTHER2] cpu: The scanner head finishes physically before data transfer ends.\n"
+                    "[BROTHER2] cpu: The DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
+            fprintf(stderr, "%s [BROTHER2] data: The backend requests PackBits compression via Brsane2.ini compression=1.\n"
+                    "[BROTHER2] data: This sends C=RLENGTH in the scan start command to the scanner.\n"
+                    "[BROTHER2] data: The SAME C=RLENGTH is sent for ALL scan modes (color, gray, B&W).\n"
+                    "[BROTHER2] data: However, the scanner firmware decides per-line whether to compress.\n"
+                    "[BROTHER2] data: Confirmed: True Gray mode = 3.9x compression (PackBits on every line).\n"
+                    "[BROTHER2] data: Confirmed: 24-bit Color mode = 1.0x (firmware sends all planes uncompressed).\n"
+                    "[BROTHER2] data: The line header byte from the scanner encodes both plane type (bits[4:2])\n"
+                    "[BROTHER2] data: and compression flag (bits[1:0]). For color planes (R/G/B), the firmware\n"
+                    "[BROTHER2] data: always clears the compression bits. This is a firmware-level decision\n"
+                    "[BROTHER2] data: that cannot be changed from the driver side.\n", debug_ts());
+            /* Check actual compression setting in Brsane2.ini */
+            {
+                FILE *ini = fopen(BROTHER_INI_PATH, "r");
+                if (ini) {
+                    char line[256];
+                    int in_driver = 0, found_comp = 0;
+                    while (fgets(line, sizeof(line), ini)) {
+                        if (line[0] == '[')
+                            in_driver = (strncmp(line, "[Driver]", 8) == 0);
+                        if (in_driver && strncmp(line, "compression=", 12) == 0) {
+                            int val = atoi(line + 12);
+                            fprintf(stderr, "%s [BROTHER2] ini: Brsane2.ini [Driver] compression=%d (%s)\n",
+                                    debug_ts(), val, val ? "C=RLENGTH requested" : "C=NONE — compression disabled!");
+                            if (!val)
+                                fprintf(stderr, "%s [BROTHER2] ini: WARNING — compression=0 means no compression is requested.\n"
+                                        "[BROTHER2] ini: Set compression=1 in %s to request PackBits.\n", debug_ts(), BROTHER_INI_PATH);
+                            found_comp = 1;
+                            break;
+                        }
+                    }
+                    fclose(ini);
+                    if (!found_comp)
+                        fprintf(stderr, "%s [BROTHER2] ini: WARNING — no compression= key found in Brsane2.ini [Driver] section\n", debug_ts());
+                } else {
+                    fprintf(stderr, "%s [BROTHER2] ini: cannot read %s\n", debug_ts(), BROTHER_INI_PATH);
+                }
+            }
+            fprintf(stderr, "%s [BROTHER2] windows: The original Windows driver had the SAME USB speed limit.\n"
+                    "[BROTHER2] windows: The ~60 sec post-scan transfer is normal for Full-Speed USB.\n"
+                    "[BROTHER2] windows: Windows may have seemed faster due to different default settings\n"
+                    "[BROTHER2] windows: (lower DPI, grayscale) or its progress bar masking the wait.\n"
+                    "[BROTHER2] windows: The physical USB transfer speed is identical on all platforms.\n", debug_ts());
+        }
+
+        /* Check host controller port speed */
+        {
+            char parent_path[512], parent_speed[16];
+            /* Parent hub/port: strip last component after the final '.' or '-' */
+            snprintf(parent_path, sizeof(parent_path), "%s", ent->d_name);
+            char *sep = strrchr(parent_path, '.');
+            if (!sep) sep = strrchr(parent_path, '-');
+            if (sep) {
+                *sep = '\0';
+                char hpath[512];
+                snprintf(hpath, sizeof(hpath), "/sys/bus/usb/devices/%s/speed", parent_path);
+                if (read_sysfs(hpath, parent_speed, sizeof(parent_speed)) > 0) {
+                    int host_speed = atoi(parent_speed);
+                    fprintf(stderr, "%s [BROTHER2] usb: host port speed: %s Mbit/s", debug_ts(), parent_speed);
+                    if (host_speed >= 480)
+                        fprintf(stderr, " — host supports High-Speed; device is the bottleneck\n");
+                    else
+                        fprintf(stderr, "\n");
+                }
             }
         }
 

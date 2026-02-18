@@ -637,3 +637,283 @@ CEOF
 @test "scanner: ReadDeviceData EOF message includes timestamp" {
     grep -q 'tm_hour.*tm_min.*tm_sec' "$PROJECT_ROOT/install_scanner.sh"
 }
+
+# --- USB speed diagnosis tests ---
+
+@test "scanner: diagnose_usb_speed function exists" {
+    grep -q 'diagnose_usb_speed()' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: diagnose_usb_speed reads sysfs speed attribute" {
+    grep -q '/sys/bus/usb/devices/\*/idVendor' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'speed' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: diagnose_usb_speed explains Full-Speed is hardware limited" {
+    grep -q 'Full-Speed transceiver' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'silicon-level limitation' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: diagnose_usb_speed checks host controller speed" {
+    grep -q 'Host port speed' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Host supports High-Speed' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains USB 2.0 High-Speed cannot be forced" {
+    grep -q 'Forcing USB 2.0 High-Speed.*NOT possible' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Full-Speed PHY' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- CPU usage analysis tests ---
+
+@test "scanner: display_info explains CPU usage during scanning" {
+    grep -q 'CPU usage during scanning' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'USB bulk-read polling loop' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains scanner buffer drain behavior" {
+    grep -q 'scanner head finishes physically' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'buffers data internally' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains CPU does not affect scan speed" {
+    grep -q 'CPU load does NOT affect scan speed' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'USB link.*not the host CPU' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "backend_init: reports CPU usage explanation for Full-Speed devices" {
+    grep -q 'cpu:.*High CPU during scans is normal' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'cpu:.*CPU usage does NOT affect scan speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: explains scanner buffer drain behavior" {
+    grep -q 'scanner head finishes physically' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'buffers data internally' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: checks host controller port speed" {
+    grep -q 'host port speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'host supports High-Speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: explains forcing High-Speed is not possible" {
+    grep -q 'Forcing USB 2.0 High-Speed is NOT possible' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'no High-Speed PHY' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+# --- tarball integrity validation tests ---
+
+@test "scanner: try_download validates gzip integrity for .tar.gz files" {
+    grep -q 'gzip -t' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'truncated/corrupt gzip' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend validates existing tarball before use" {
+    grep -q 'Existing source tarball is corrupt' "$PROJECT_ROOT/install_scanner.sh"
+    # Verify gzip -t is used to check existing tarballs
+    grep -q 'gzip -t.*src_tarball' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend retries download on extraction failure" {
+    grep -q 'Failed to extract brscan2 source, re-downloading' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Failed to extract brscan2 source after re-download' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: corrupt tarball is detected and removed" {
+    # Gzip magic number header (1f 8b) + method (08) + flags (00) — truncated
+    printf '\x1f\x8b\x08\x00' > "$TEST_TMPDIR/test.tar.gz"
+    # gzip -t should fail on this truncated file
+    run gzip -t "$TEST_TMPDIR/test.tar.gz"
+    [[ "$status" -ne 0 ]]
+}
+
+@test "scanner: valid tarball passes gzip integrity check" {
+    # Create a valid small gzip file
+    echo "test content" | gzip > "$TEST_TMPDIR/test.tar.gz"
+    run gzip -t "$TEST_TMPDIR/test.tar.gz"
+    [[ "$status" -eq 0 ]]
+}
+
+# --- source download debug logging tests ---
+
+@test "scanner: try_download logs file size and type after download" {
+    grep -q 'file_size.*stat' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'file_type.*file -b' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Downloaded:.*bytes.*type:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: try_download logs wget errors on failure" {
+    grep -q 'wget error:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: try_download uses longer timeout for reliability" {
+    grep -q 'timeout=60' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'tries=3' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend logs source URLs being tried" {
+    grep -q 'brscan2 source URLs to try:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend logs existing tarball size" {
+    grep -q 'Existing source tarball:.*bytes' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend logs tarball details on extraction failure" {
+    grep -q 'Tarball size:.*bytes' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend cleans src_dir before extraction" {
+    grep -q 'Clean src_dir before extraction' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend lists failed URLs on download failure" {
+    grep -q 'Failed to download brscan2 source code from all URLs' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'URLs tried:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- compression and data transfer analysis tests ---
+
+@test "scandec: summary includes compression ratio" {
+    grep -q 'compression:.*ratio' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'compress_ratio' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: summary includes wire throughput" {
+    grep -q 'USB wire' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: diagnosis explains compression modes used by scanner" {
+    grep -q 'Scanner used PackBits run-length encoding' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'scanner firmware decision' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: diagnosis includes Windows comparison" {
+    grep -q 'original Windows driver had the same USB bandwidth limit' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'physical USB transfer speed is' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "backend_init: reports scanner compression info" {
+    grep -q 'PackBits compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'firmware-level decision' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: includes Windows comparison for transfer speed" {
+    grep -q 'original Windows driver had the SAME USB speed limit' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'physical USB transfer speed is identical' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "scanner: display_info explains compression used by scanner" {
+    grep -q 'Data compression' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '3.9x compression' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'PackBits' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains why scanning seems slower than Windows" {
+    grep -q 'Why scanning seems slower than on Windows:' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'USB transfer speed is identical on all platforms' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'progress bar' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- compression forcing analysis tests ---
+
+@test "scanner: install_scanner ensures compression=1 in Brsane2.ini" {
+    grep -q 'compression=1' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'compression=.*Brsane2.ini' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains compression cannot be forced" {
+    grep -q 'forcing color compression is' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'firmware-level decision' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains backend requests PackBits via INI" {
+    grep -q 'C=RLENGTH' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'compression=1' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "backend_init: reads and logs compression setting from Brsane2.ini" {
+    grep -q 'Brsane2.ini' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'compression=' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'C=RLENGTH requested' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: warns when compression=0 in INI" {
+    grep -q 'compression=0 means no compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "scandec: uncompressed diagnosis explains compression was requested" {
+    grep -q 'backend requested PackBits' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'C=RLENGTH.*Brsane2.ini' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'Forcing compression is NOT possible' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+# --- mode-aware compression diagnostics ---
+
+@test "scandec: summary header includes scan mode name" {
+    grep -q 'scan session summary (%s mode)' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'mode_name' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: stores scan mode in g_stats for summary" {
+    grep -q 'mode_name.*24-bit RGB' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q '"8-bit gray"' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q '"1-bit B&W"' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: uncompressed message includes scan mode" {
+    grep -q 'ALL data uncompressed in %s mode' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: suggests grayscale test when color is uncompressed" {
+    grep -q 'True Gray.*mode to test' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'Grayscale transfers 3x less' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: compressed message includes mode name" {
+    grep -q 'compression in %s mode' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scanner: display_info tips suggest True Gray mode with timing" {
+    grep -q "True Gray.*3x less data" "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '30 sec.*88 sec' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- protocol-level compression analysis (confirmed by real-world testing) ---
+
+@test "backend_init: explains same C=RLENGTH sent for all modes" {
+    grep -q 'SAME C=RLENGTH.*sent for ALL scan modes' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: explains per-line header byte compression decision" {
+    grep -q 'line header byte' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'bits\[1:0\]' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: reports confirmed gray compression ratio" {
+    grep -q 'True Gray.*3.9x compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q '24-bit Color.*1.0x' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "scandec: compressed summary notes color does not compress" {
+    grep -q 'DCP-130C only compresses grayscale' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'firmware-level decision.*per-line header' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: uncompressed summary includes protocol analysis" {
+    grep -q 'same C=RLENGTH for all modes' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'line header byte.*bits\[1:0\]' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'True Gray achieves 3.9x compression' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scanner: display_info shows confirmed gray and color compression data" {
+    grep -q '3.9x compression' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '1.0x.*uncompressed' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '0.5 MB.*1.9 MB' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '6.0 MB' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains per-line header protocol" {
+    grep -q 'line header byte' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'same C=RLENGTH request' "$PROJECT_ROOT/install_scanner.sh"
+}
