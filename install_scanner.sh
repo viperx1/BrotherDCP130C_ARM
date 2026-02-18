@@ -876,14 +876,21 @@ diagnose_usb_speed() {
         fi
 
         # Check host controller speed capability
-        local parent_speed
-        local parent_dir
-        parent_dir=$(dirname "$ddir")
-        parent_speed=$(cat "$parent_dir/speed" 2>/dev/null || echo "")
-        if [[ -n "$parent_speed" ]]; then
-            log_debug "  Host port speed: ${parent_speed} Mbit/s"
-            if [[ "$parent_speed" == "480" || "$parent_speed" == "5000" || "$parent_speed" == "10000" ]]; then
-                log_debug "  Host supports High-Speed — device is the bottleneck."
+        # USB device names: "1-2.3" → parent hub "1-2", "1-2" → root hub "usb1"
+        local devname parent_name parent_speed
+        devname=$(basename "$ddir")
+        parent_name="${devname%.*}"        # strip ".N" suffix
+        if [[ "$parent_name" == "$devname" ]]; then
+            parent_name="${devname%-*}"    # strip "-N" suffix for root level
+            [[ "$parent_name" == "$devname" ]] && parent_name=""
+        fi
+        if [[ -n "$parent_name" ]]; then
+            parent_speed=$(cat "/sys/bus/usb/devices/$parent_name/speed" 2>/dev/null || echo "")
+            if [[ -n "$parent_speed" ]]; then
+                log_debug "  Host port speed: ${parent_speed} Mbit/s"
+                if [[ "$parent_speed" == "480" || "$parent_speed" == "5000" || "$parent_speed" == "10000" ]]; then
+                    log_debug "  Host supports High-Speed — device is the bottleneck."
+                fi
             fi
         fi
     done
@@ -1181,9 +1188,9 @@ display_info() {
     log_info "  The DCP-130C is a USB 2.0 Full-Speed device (12 Mbit/s)."
     log_info "  'Full-Speed' means 12 Mbit/s — NOT High-Speed (480 Mbit/s)."
     log_info "  This is a hardware limit of the scanner's USB transceiver."
-    log_info "  Forcing USB 2.0 High-Speed (480 Mbit/s) is NOT possible — the"
-    log_info "  scanner only has a Full-Speed PHY. This cannot be changed by"
-    log_info "  software, cables, or host controller settings."
+    log_info "  Forcing USB 2.0 High-Speed (480 Mbit/s) is NOT possible."
+    log_info "  The scanner only has a Full-Speed PHY (a silicon-level limit)."
+    log_info "  No software, cable, or host setting can change this."
     log_info "  This limits scan throughput to ~70 KB/s by design."
     log_info "  A full-page 150 DPI color scan takes ~90 seconds."
     echo

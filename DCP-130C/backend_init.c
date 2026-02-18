@@ -150,11 +150,11 @@ static void probe_usb_environment(void) {
                         "[BROTHER2] usb: Forcing USB 2.0 High-Speed is NOT possible with this device.\n"
                         "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput.\n", debug_ts());
             }
-            fprintf(stderr, "%s [BROTHER2] cpu: high CPU during scans is normal — the USB bulk-read\n"
+            fprintf(stderr, "%s [BROTHER2] cpu: High CPU during scans is normal — the USB bulk-read\n"
                     "[BROTHER2] cpu: loop polls for data. A 2 ms yield reduces CPU load.\n"
                     "[BROTHER2] cpu: CPU usage does NOT affect scan speed (USB is the bottleneck).\n"
-                    "[BROTHER2] cpu: the scanner head finishes physically before data transfer ends —\n"
-                    "[BROTHER2] cpu: the DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
+                    "[BROTHER2] cpu: The scanner head finishes physically before data transfer ends.\n"
+                    "[BROTHER2] cpu: The DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
         }
 
         /* Check host controller port speed */

@@ -682,7 +682,7 @@ CEOF
 }
 
 @test "backend_init: reports CPU usage explanation for Full-Speed devices" {
-    grep -q 'cpu:.*high CPU during scans is normal' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'cpu:.*High CPU during scans is normal' "$PROJECT_ROOT/DCP-130C/backend_init.c"
     grep -q 'cpu:.*CPU usage does NOT affect scan speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
 }
 
