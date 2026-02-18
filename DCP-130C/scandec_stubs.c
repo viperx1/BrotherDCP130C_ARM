@@ -101,6 +101,17 @@ static int g_bpp = 0;  /* bytes per pixel for the output format */
 static unsigned long g_total_in_bytes = 0;   /* total input bytes received */
 static unsigned long g_total_out_bytes = 0;  /* total output bytes emitted */
 
+/* Color plane assembly for 24-bit RGB mode.
+ * The scanner sends separate R, G, B planes (nInDataKind 2,3,4).
+ * We buffer each plane and only emit interleaved RGB when all three
+ * planes for a line have been received. */
+static BYTE *g_red_plane = NULL;
+static BYTE *g_green_plane = NULL;
+static BYTE *g_blue_plane = NULL;
+static DWORD g_plane_pixels = 0;
+static int g_have_red = 0;
+static int g_have_green = 0;
+
 /*
  * PackBits decompression (TIFF/Apple standard)
  * Returns number of bytes written to output.
@@ -190,6 +201,19 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
 
     memcpy(&g_open, p, sizeof(*p));
 
+    /* Allocate plane buffers for 24-bit color mode */
+    free(g_red_plane);   g_red_plane = NULL;
+    free(g_green_plane); g_green_plane = NULL;
+    free(g_blue_plane);  g_blue_plane = NULL;
+    g_have_red = 0;
+    g_have_green = 0;
+    if (g_bpp == 3) {
+        g_plane_pixels = p->dwInLinePixCnt;
+        g_red_plane   = (BYTE *)calloc(g_plane_pixels, 1);
+        g_green_plane = (BYTE *)calloc(g_plane_pixels, 1);
+        g_blue_plane  = (BYTE *)calloc(g_plane_pixels, 1);
+    }
+
     fprintf(stderr, "[SCANDEC] ScanDecOpen: nColorType=0x%x pixels=%lu "
             "bpp=%d dwOutLineByte=%lu dwOutWriteMaxSize=%lu "
             "bLongBoundary=%d inReso=%dx%d outReso=%dx%d\n",
@@ -235,8 +259,104 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
     }
 
     g_write_count++;
+    g_total_in_bytes += w->dwLineDataSize;
 
-    /* Clear output buffer */
+    /*
+     * 24-bit color mode: the scanner sends separate R, G, B planes
+     * (nInDataKind 2=Red, 3=Green, 4=Blue). Buffer each plane and
+     * only emit a pixel-interleaved RGB line when all three are received.
+     */
+    if (g_bpp == 3 && g_red_plane && g_green_plane && g_blue_plane
+        && w->nInDataKind >= 2 && w->nInDataKind <= 4)
+    {
+        /* Select the target plane buffer */
+        BYTE *planeBuf;
+        switch (w->nInDataKind) {
+        case 2:  planeBuf = g_red_plane;   g_have_red = 1;   break;
+        case 3:  planeBuf = g_green_plane; g_have_green = 1;  break;
+        default: planeBuf = g_blue_plane;                      break;
+        }
+
+        /* Decode input into the single-channel plane buffer */
+        switch (w->nInDataComp) {
+        case SCIDC_WHITE:
+            memset(planeBuf, 0xFF, g_plane_pixels);
+            break;
+        case SCIDC_NONCOMP: {
+            DWORD cpLen = w->dwLineDataSize;
+            if (cpLen > g_plane_pixels) cpLen = g_plane_pixels;
+            memcpy(planeBuf, w->pLineData, cpLen);
+            if (cpLen < g_plane_pixels)
+                memset(planeBuf + cpLen, 0, g_plane_pixels - cpLen);
+            break;
+        }
+        case SCIDC_PACK:
+            decode_packbits(w->pLineData, w->dwLineDataSize,
+                            planeBuf, g_plane_pixels);
+            break;
+        default: {
+            DWORD cpLen = w->dwLineDataSize;
+            if (cpLen > g_plane_pixels) cpLen = g_plane_pixels;
+            memcpy(planeBuf, w->pLineData, cpLen);
+            break;
+        }
+        }
+
+        /* Log (first 5 writes with hex dump, then every 100th) */
+        if (g_write_count <= 5) {
+            char hexbuf[16*3 + 1];
+            DWORD hexlen = w->dwLineDataSize < 16 ? w->dwLineDataSize : 16;
+            for (DWORD i = 0; i < hexlen; i++)
+                snprintf(hexbuf + i*3, 4, "%02X ", w->pLineData[i]);
+            if (hexlen > 0) hexbuf[hexlen*3 - 1] = '\0';
+            else hexbuf[0] = '\0';
+            fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
+                    "inLen=%lu outLine=%lu hasData=- bpp=%d "
+                    "plane=%c in=[%s]\n",
+                    g_write_count, w->nInDataComp, w->nInDataKind,
+                    (unsigned long)w->dwLineDataSize,
+                    (unsigned long)outLine, g_bpp,
+                    w->nInDataKind == 2 ? 'R' : w->nInDataKind == 3 ? 'G' : 'B',
+                    hexbuf);
+        } else if (g_write_count % 100 == 0) {
+            fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "
+                    "inLen=%lu plane=%c totalIn=%lu totalOut=%lu\n",
+                    g_write_count, w->nInDataComp, w->nInDataKind,
+                    (unsigned long)w->dwLineDataSize,
+                    w->nInDataKind == 2 ? 'R' : w->nInDataKind == 3 ? 'G' : 'B',
+                    g_total_in_bytes, g_total_out_bytes);
+        }
+
+        /* If this is not the Blue plane, or we're missing a plane, buffer only */
+        if (w->nInDataKind != 4 || !g_have_red || !g_have_green) {
+            if (st) *st = 0;
+            return 0;
+        }
+
+        /* All three planes received — interleave R,G,B into pixel RGB */
+        memset(w->pWriteBuff, 0, outLine);
+        for (DWORD i = 0; i < g_plane_pixels && (i * 3 + 2) < outLine; i++) {
+            w->pWriteBuff[i * 3 + 0] = g_red_plane[i];
+            w->pWriteBuff[i * 3 + 1] = g_green_plane[i];
+            w->pWriteBuff[i * 3 + 2] = g_blue_plane[i];
+        }
+        g_have_red = 0;
+        g_have_green = 0;
+
+        g_total_out_bytes += outLine;
+
+        int has_data = 0;
+        for (DWORD i = 0; i < outLine && !has_data; i++)
+            if (w->pWriteBuff[i] != 0) has_data = 1;
+        if (has_data) g_nonzero_lines++;
+
+        if (st) *st = 1;
+        return outLine;
+    }
+
+    /*
+     * Grayscale / B&W path (original behavior)
+     */
     memset(w->pWriteBuff, 0, outLine);
 
     /* Temporary buffer for decompressed 8-bit data (for B&W conversion) */
@@ -300,8 +420,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         break;
     }
 
-    /* Track total data flow */
-    g_total_in_bytes += w->dwLineDataSize;
+    /* Track total output (input already tracked at top of function) */
     g_total_out_bytes += outLine;
 
     /* Check for non-zero data */
@@ -359,5 +478,11 @@ BOOL ScanDecClose(void)
     g_bpp = 0;
     g_total_in_bytes = 0;
     g_total_out_bytes = 0;
+    free(g_red_plane);   g_red_plane = NULL;
+    free(g_green_plane); g_green_plane = NULL;
+    free(g_blue_plane);  g_blue_plane = NULL;
+    g_plane_pixels = 0;
+    g_have_red = 0;
+    g_have_green = 0;
     return TRUE;
 }
