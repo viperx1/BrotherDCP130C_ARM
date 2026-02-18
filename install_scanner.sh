@@ -79,7 +79,6 @@ DRIVER_BRSCAN2_URLS=(
 
 # Check if running as root
 check_root() {
-    log_debug "EUID=$EUID, USER=$USER"
     if [[ $EUID -eq 0 ]]; then
         log_warn "Running as root. This is recommended for installation."
     else
@@ -92,8 +91,6 @@ check_architecture() {
     log_info "Checking system architecture..."
     ARCH=$(uname -m)
     log_info "Detected architecture: $ARCH"
-    log_debug "Kernel: $(uname -r)"
-    log_debug "OS: $(grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null | tr '\n' ' ')"
     
     if [[ "$ARCH" != "armv7l" && "$ARCH" != "armv6l" && "$ARCH" != "aarch64" ]]; then
         log_warn "This script is designed for ARM architecture (Raspberry Pi). Detected: $ARCH"
@@ -110,17 +107,14 @@ check_architecture() {
 is_package_installed() {
     local pkg="$1"
     if dpkg -s "$pkg" &>/dev/null; then
-        log_debug "is_package_installed: '$pkg' is installed"
         echo "$pkg"
         return 0
     fi
     local t64_pkg="${pkg}t64"
     if dpkg -s "$t64_pkg" &>/dev/null; then
-        log_debug "is_package_installed: '$t64_pkg' is installed (t64 variant of '$pkg')"
         echo "$t64_pkg"
         return 0
     fi
-    log_debug "is_package_installed: '$pkg' is NOT installed"
     return 1
 }
 
@@ -132,45 +126,27 @@ resolve_package() {
     local installed
     # Check if already installed (original or t64 variant)
     if installed=$(is_package_installed "$pkg"); then
-        log_debug "resolve_package: '$pkg' already installed as '$installed'"
         echo "$installed"
         return
     fi
     # Not installed - check which variant is available in apt
     local policy
     local candidate
-    log_debug "resolve_package: checking apt for '$pkg'"
     policy=$(apt-cache policy "$pkg" 2>/dev/null)
     candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
-    log_debug "resolve_package: '$pkg' candidate='$candidate'"
     if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
-        log_debug "resolve_package: resolved '$pkg' -> '$pkg'"
         echo "$pkg"
         return
     fi
     # Try the t64 variant
     local t64_pkg="${pkg}t64"
-    log_debug "resolve_package: trying t64 variant '$t64_pkg'"
     policy=$(apt-cache policy "$t64_pkg" 2>/dev/null)
     candidate=$(echo "$policy" | grep "Candidate:" | awk '{print $2}')
-    log_debug "resolve_package: '$t64_pkg' candidate='$candidate'"
     if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
-        log_debug "resolve_package: resolved '$pkg' -> '$t64_pkg'"
         echo "$t64_pkg"
         return
     fi
     # Fall back to the original name and let apt-get report the error
-    log_debug "resolve_package: no candidate found for '$pkg' or '$t64_pkg'"
-    # Search for similarly-named packages as a diagnostic hint
-    local similar
-    similar=$(apt-cache search "^${pkg}" 2>/dev/null | head -5)
-    if [[ -n "$similar" ]]; then
-        log_debug "resolve_package: similar packages in apt:"
-        while IFS= read -r line; do
-            log_debug "  $line"
-        done <<< "$similar"
-    fi
-    log_debug "resolve_package: falling back to '$pkg' (apt-get will report the actual error)"
     echo "$pkg"
 }
 
@@ -183,7 +159,6 @@ fix_broken_packages() {
         if dpkg -s "$pkg" &>/dev/null; then
             local status
             status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
-            log_debug "fix_broken_packages: $pkg status='$status'"
             if echo "$status" | grep -qi "reinst-required\|half-installed\|half-configured" || \
                echo "$status" | grep -qw "unpacked"; then
                 log_warn "Fixing broken package state: $pkg ($status)"
@@ -195,7 +170,6 @@ fix_broken_packages() {
                     for sp in "/var/lib/dpkg/info/${pkg_base}.${script}" \
                               "/var/lib/dpkg/info/${pkg}.${script}"; do
                         if [[ -f "$sp" ]]; then
-                            log_debug "Neutralizing broken maintainer script: $sp"
                             sudo cp "$sp" "${sp}.bak" 2>/dev/null || true
                             echo '#!/bin/sh' | sudo tee "$sp" > /dev/null
                             echo 'exit 0' | sudo tee -a "$sp" > /dev/null
@@ -205,14 +179,12 @@ fix_broken_packages() {
                 done
 
                 # Try aggressive removal
-                log_debug "Attempting dpkg --purge --force-all $pkg"
                 sudo dpkg --purge --force-all "$pkg" 2>/dev/null || true
 
                 # Verify removal succeeded
                 if dpkg -s "$pkg" &>/dev/null; then
                     local new_status
                     new_status=$(dpkg -s "$pkg" 2>/dev/null | grep "^Status:" || true)
-                    log_debug "Package $pkg still present after purge: $new_status"
 
                     # Last resort: directly clean the dpkg database
                     log_warn "Standard removal failed for $pkg, cleaning dpkg database directly..."
@@ -226,10 +198,7 @@ fix_broken_packages() {
                             /^$/ { if (skip) { skip=0; next } }
                             !skip { print }
                         ' /var/lib/dpkg/status.bak | sudo tee /var/lib/dpkg/status > /dev/null
-                        log_debug "Removed $pkg_base entry from dpkg status database"
                     fi
-                else
-                    log_debug "Package $pkg successfully removed"
                 fi
 
                 packages_fixed=1
@@ -238,10 +207,8 @@ fix_broken_packages() {
     done
 
     if [[ $packages_fixed -eq 1 ]]; then
-        log_debug "Running apt-get install -f to fix remaining dependency issues..."
         sudo apt-get install -f -y 2>/dev/null || true
 
-        log_debug "Verifying apt-get works after cleanup..."
         local check_output
         check_output=$(sudo apt-get check 2>&1 || true)
         if echo "$check_output" | grep -qi "reinst-required\|needs to be reinstalled"; then
@@ -294,9 +261,6 @@ setup_scanner_sharing() {
     for entry in "${acl_entries[@]}"; do
         if ! grep -q "^${entry}$" "$saned_conf" 2>/dev/null; then
             echo "$entry" | sudo tee -a "$saned_conf" > /dev/null
-            log_debug "Added $entry to saned.conf"
-        else
-            log_debug "$entry already in saned.conf"
         fi
     done
 
@@ -305,7 +269,6 @@ setup_scanner_sharing() {
     if systemctl list-unit-files saned.socket &>/dev/null; then
         sudo systemctl enable saned.socket || log_warn "Failed to enable saned.socket"
         sudo systemctl start saned.socket || log_warn "Failed to start saned.socket"
-        log_debug "saned.socket status: $(systemctl is-active saned.socket 2>/dev/null || echo 'unknown')"
     else
         log_warn "saned.socket unit not found. saned may need manual configuration."
     fi
@@ -315,12 +278,9 @@ setup_scanner_sharing() {
     if ! dpkg -s avahi-daemon &>/dev/null; then
         log_info "Installing Avahi daemon for network scanner discovery..."
         sudo apt-get install -y avahi-daemon 2>&1 | tail -3
-    else
-        log_debug "Avahi daemon is already installed"
     fi
     sudo systemctl enable avahi-daemon || log_warn "Failed to enable avahi-daemon"
     sudo systemctl start avahi-daemon || log_warn "Failed to start avahi-daemon"
-    log_debug "Avahi service status: $(systemctl is-active avahi-daemon 2>/dev/null || echo 'unknown')"
 
     # Publish a SANE scanner service via Avahi so that other devices on the
     # network can automatically discover this scanner using DNS-SD / mDNS.
@@ -339,7 +299,6 @@ setup_scanner_sharing() {
   </service>
 </service-group>
 AVAHI_EOF
-    log_debug "Created Avahi service file: $avahi_service_file"
 
     # Reload Avahi so it picks up the new service file
     sudo systemctl reload avahi-daemon 2>/dev/null \
@@ -364,7 +323,6 @@ install_airsane() {
 
     # Install build dependencies
     local airsane_deps=(cmake g++ libjpeg-dev libpng-dev libavahi-client-dev libusb-1.0-0-dev)
-    log_debug "Installing AirSane build dependencies: ${airsane_deps[*]}"
     if ! sudo apt-get install -y "${airsane_deps[@]}" 2>&1 | tail -3; then
         log_warn "Failed to install AirSane build dependencies."
         return 1
@@ -372,7 +330,6 @@ install_airsane() {
 
     # Download AirSane source tarball
     local airsane_tarball="$TMP_DIR/airsane-${AIRSANE_VERSION}.tar.gz"
-    log_debug "AirSane source URLs to try: ${AIRSANE_URLS[*]}"
     if ! try_download "$airsane_tarball" "${AIRSANE_URLS[@]}"; then
         log_warn "Failed to download AirSane source code."
         return 1
@@ -392,7 +349,6 @@ install_airsane() {
             return 1
         fi
     fi
-    log_debug "AirSane source directory: $airsane_src_dir"
 
     # Build with cmake
     local airsane_build_dir="$TMP_DIR/AirSane-build"
@@ -420,7 +376,6 @@ install_airsane() {
         return 1
     fi
     cd "$TMP_DIR"
-    log_debug "AirSane installed to $(command -v airsaned 2>/dev/null || echo '/usr/local/bin/airsaned')"
 
     # Ensure the saned user (which AirSane runs as) can access the Brother USB scanner.
     # The sane-utils package creates the saned user; we add it to the scanner group
@@ -428,7 +383,6 @@ install_airsane() {
     if id saned &>/dev/null; then
         sudo usermod -a -G scanner saned 2>/dev/null || true
         sudo usermod -a -G lp saned 2>/dev/null || true
-        log_debug "Added saned user to scanner and lp groups"
     fi
 
     # Create udev rule so the Brother scanner is accessible by the scanner group
@@ -440,16 +394,12 @@ ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0660", GROUP="scanner",
 UDEV_EOF
         sudo udevadm control --reload-rules 2>/dev/null || true
         sudo udevadm trigger 2>/dev/null || true
-        log_debug "Created udev rule: $udev_rule"
-    else
-        log_debug "udev rule already exists: $udev_rule"
     fi
 
     # Enable and start AirSane service
     sudo systemctl daemon-reload
     sudo systemctl enable airsaned 2>/dev/null || log_warn "Failed to enable airsaned"
     sudo systemctl start airsaned 2>/dev/null || log_warn "Failed to start airsaned"
-    log_debug "airsaned status: $(systemctl is-active airsaned 2>/dev/null || echo 'unknown')"
 
     AIRSANE_INSTALLED=true
     log_info "AirSane installed. Scanner is now discoverable by Windows, macOS, iOS, and Android."
@@ -460,7 +410,6 @@ UDEV_EOF
 install_dependencies() {
     log_info "Installing required dependencies..."
     
-    log_debug "Running apt-get update..."
     sudo apt-get update
     
     # Resolve library package names that may differ across Debian/Raspbian versions
@@ -481,7 +430,6 @@ install_dependencies() {
         libncurses-dev
     )
 
-    log_debug "Final package list: ${packages[*]}"
 
     sudo apt-get install -y "${packages[@]}"
     
@@ -505,7 +453,6 @@ try_download() {
     local urls=("$@")
     
     for url in "${urls[@]}"; do
-        log_debug "Trying download: $url"
         local wget_err wget_args
         wget_args=(--timeout=60 --tries=3 -O "$output_file")
         # In non-debug mode, suppress wget output
@@ -526,12 +473,10 @@ try_download() {
                         rm -f "$output_file"
                         continue
                     fi
-                    log_debug "gzip integrity check passed"
                 fi
                 log_info "Downloaded successfully from: $url"
                 return 0
             fi
-            log_debug "Download from $url succeeded but file appears invalid (type: ${file_type}), trying next..."
             rm -f "$output_file"
         else
             log_debug "Download failed from: $url"
@@ -548,7 +493,6 @@ download_drivers() {
     log_info "Downloading Brother DCP-130C scanner driver..."
     
     log_info "Downloading brscan2 driver (${DRIVER_BRSCAN2_FILE})..."
-    log_debug "brscan2 driver URLs to try: ${DRIVER_BRSCAN2_URLS[*]}"
     if ! try_download brscan2.deb "${DRIVER_BRSCAN2_URLS[@]}"; then
         log_error "Failed to download brscan2 driver from all sources."
         log_error "URLs tried:"
@@ -558,7 +502,6 @@ download_drivers() {
         log_error "Please download ${DRIVER_BRSCAN2_FILE} manually and place it in ${TMP_DIR}/"
         exit 1
     fi
-    log_debug "brscan2 driver downloaded: $(ls -lh brscan2.deb)"
     
     log_info "Scanner driver downloaded successfully."
 }
@@ -580,7 +523,6 @@ install_drivers() {
         # Copy config files, calibration data, model info, brsaneconfig2
         sudo cp -a "$extract_dir/usr/local/Brother/sane/"* /usr/local/Brother/sane/
         log_info "Installed Brother scanner config files to /usr/local/Brother/sane/"
-        log_debug "Contents: $(ls /usr/local/Brother/sane/ 2>/dev/null)"
     else
         log_error "Brother config files not found in deb package"
         return 1
@@ -589,7 +531,6 @@ install_drivers() {
     # Create brsaneconfig2 symlink in PATH
     if [[ -x /usr/local/Brother/sane/brsaneconfig2 ]]; then
         sudo ln -sf /usr/local/Brother/sane/brsaneconfig2 /usr/bin/brsaneconfig2
-        log_debug "Created symlink: /usr/bin/brsaneconfig2"
     fi
 
     # Set up i386 support for brsaneconfig2 (the only i386 binary we need)
@@ -637,7 +578,6 @@ install_drivers() {
         # Fix Raspberry Pi /etc/ld.so.preload for i386 compatibility
         if [[ -f /etc/ld.so.preload ]] && grep -q 'libarmmem' /etc/ld.so.preload 2>/dev/null; then
             sudo sed -i 's|^[[:space:]]*/usr/lib/arm-linux-gnueabihf/libarmmem|# Commented for i386 compat: /usr/lib/arm-linux-gnueabihf/libarmmem|' /etc/ld.so.preload
-            log_debug "Commented out libarmmem preload for i386 compatibility"
         fi
 
         # Verify brsaneconfig2 can execute
@@ -672,8 +612,6 @@ check_lib_deps() {
         if [[ -n "$missing" ]]; then
             log_warn "  $(basename "$lib"): MISSING deps: $missing"
             has_errors=1
-        else
-            log_debug "  $(basename "$lib"): all dependencies OK"
         fi
     done
     return "$has_errors"
@@ -687,7 +625,6 @@ compile_arm_backend() {
     local build_dir="$TMP_DIR/arm_build"
 
     # Always recompile to pick up stub fixes (compilation is fast)
-    log_debug "Will compile/recompile native ARM SANE backend"
 
     # Check for compiler
     if ! command -v gcc &>/dev/null; then
@@ -711,8 +648,6 @@ compile_arm_backend() {
         if ! gzip -t "$src_tarball" 2>/dev/null; then
             log_warn "Existing source tarball is corrupt (${existing_size} bytes), re-downloading..."
             rm -f "$src_tarball"
-        else
-            log_debug "Existing source tarball passes gzip integrity check"
         fi
     fi
     if [[ ! -f "$src_tarball" ]]; then
@@ -757,7 +692,6 @@ compile_arm_backend() {
         log_warn "brscan2 source structure not as expected"
         return 1
     fi
-    log_debug "Source extracted to: $brscan_src"
 
     # Strip dead BRSANESUFFIX==1 code paths from brother_scanner.c.
     # The source has #if BRSANESUFFIX==2 / #elif BRSANESUFFIX==1 blocks
@@ -781,10 +715,8 @@ compile_arm_backend() {
             mv "${scanner_c}.stripped" "$scanner_c"
             local line_count_after
             line_count_after=$(wc -l < "$scanner_c")
-            log_debug "Stripped BRSANESUFFIX==1 dead code: $line_count_before → $line_count_after lines"
         else
             rm -f "${scanner_c}.stripped"
-            log_debug "Strip failed, compiling with original source"
         fi
     fi
 
@@ -797,7 +729,6 @@ compile_arm_backend() {
     local brother_log_c="$brscan_src/backend_src/brother_log.c"
     if [[ -f "$brother_log_c" ]]; then
         sed -i 's/(ltime%1000)/(long)(ltime%1000)/' "$brother_log_c"
-        log_debug "Patched brother_log.c: cast (ltime%1000) to (long) for time_t safety"
     fi
 
     local brother2_c="$brscan_src/backend_src/brother2.c"
@@ -879,7 +810,6 @@ compile_arm_backend() {
 \t}\
 }' "$devaccs_c"
 
-        log_debug "Injected ReadDeviceData stall detection + CPU yield into brother_devaccs.c"
     fi
 
     local scanner_c="$brscan_src/backend_src/brother_scanner.c"
@@ -903,7 +833,6 @@ a\
 \t\t\t\tbreak;
 }' "$scanner_c"
 
-        log_debug "Patched PageScan end-of-scan handling in brother_scanner.c"
     fi
 
     # Check for required headers
@@ -918,7 +847,6 @@ a\
         log_warn "SANE headers not found (install libsane-dev)"
         return 1
     fi
-    log_debug "Using SANE headers from: $(dirname "$(dirname "$sane_header")")"
 
     # Check for libusb-0.1 header (usb.h)
     if [[ ! -f /usr/include/usb.h ]] && [[ ! -f "$brscan_src/include/usb.h" ]]; then
@@ -955,7 +883,6 @@ a\
         log_debug "gcc output: $gcc_output"
         return 1
     fi
-    log_debug "brother2.o compiled"
 
     # Compile sane_strstatus
     gcc -c "${common_flags[@]}" -DBACKEND_NAME=brother2 \
@@ -969,7 +896,6 @@ a\
             log_warn "Failed to compile ${sf}.c"
             return 1
         fi
-        log_debug "${sf}.o compiled"
     done
 
     # Compile ARM stub for libbrscandec2 (scan data decode)
@@ -984,7 +910,6 @@ a\
         log_warn "Failed to compile libbrscandec2 stub"
         return 1
     }
-    log_debug "libbrscandec2.so.1.0.0 compiled (from DCP-130C/scandec_stubs.c)"
 
     # Compile ARM stub for libbrcolm2 (color matching — pass-through)
     log_info "Creating ARM color matching library..."
@@ -998,7 +923,6 @@ a\
         log_warn "Failed to compile libbrcolm2 stub"
         return 1
     }
-    log_debug "libbrcolm2.so.1.0.0 compiled (from DCP-130C/brcolor_stubs.c)"
 
     # Compile backend init stub (constructor logging + SIGSEGV handler)
     local init_src="$SCRIPT_DIR/DCP-130C/backend_init.c"
@@ -1006,9 +930,6 @@ a\
         gcc -c -fPIC -O2 -w -o "$build_dir/backend_init.o" "$init_src" || {
             log_warn "Failed to compile backend_init.c (non-fatal, skipping)"
         }
-        if [[ -f "$build_dir/backend_init.o" ]]; then
-            log_debug "backend_init.o compiled (from DCP-130C/backend_init.c)"
-        fi
     fi
 
     # Link the SANE backend shared library
@@ -1038,7 +959,6 @@ a\
     # Verify it's the right architecture
     local built_arch
     built_arch=$(file -b "$build_dir/libsane-brother2.so.1.0.7")
-    log_debug "Built backend: $built_arch"
     if echo "$built_arch" | grep -qi "Intel 80386\|x86-64"; then
         log_warn "Built library is not ARM (got: $built_arch)"
         log_warn "This shouldn't happen on a Raspberry Pi"
@@ -1054,7 +974,6 @@ a\
                     /usr/lib/libbrcolm2.so.1.0.0; do
         if [[ -f "$lib_path" ]] && file -b "$lib_path" 2>/dev/null | grep -qi "Intel 80386"; then
             sudo cp "$lib_path" "${lib_path}.i386.bak"
-            log_debug "Backed up i386 library: ${lib_path}.i386.bak"
         fi
     done
 
@@ -1075,13 +994,8 @@ a\
     sudo ldconfig 2>/dev/null || true
 
     log_info "Native ARM SANE backend installed successfully!"
-    log_debug "Libraries installed:"
-    log_debug "  $(file /usr/lib/sane/libsane-brother2.so.1.0.7)"
-    log_debug "  $(file /usr/lib/libbrscandec2.so.1.0.0)"
-    log_debug "  $(file /usr/lib/libbrcolm2.so.1.0.0)"
 
     # Verify library dependencies are resolvable
-    log_debug "Checking library dependencies..."
     if ! check_lib_deps /usr/lib/sane/libsane-brother2.so.1.0.7 \
                         /usr/lib/libbrscandec2.so.1.0.0 \
                         /usr/lib/libbrcolm2.so.1.0.0; then
@@ -1091,13 +1005,10 @@ a\
 
     # Verify exported symbols in stub libraries
     if command -v nm &>/dev/null; then
-        log_debug "Verifying exported symbols..."
         local scandec_syms
         scandec_syms=$(nm -D /usr/lib/libbrscandec2.so.1.0.0 2>/dev/null | grep -c " T ScanDec" || echo 0)
         local colm_syms
         colm_syms=$(nm -D /usr/lib/libbrcolm2.so.1.0.0 2>/dev/null | grep -c " T ColorMatch" || echo 0)
-        log_debug "  libbrscandec2: $scandec_syms ScanDec* exports"
-        log_debug "  libbrcolm2: $colm_syms ColorMatch* exports"
         if [[ "$scandec_syms" -lt 5 ]]; then
             log_warn "libbrscandec2 has fewer exports than expected ($scandec_syms, need >= 5)"
         fi
@@ -1127,9 +1038,6 @@ diagnose_usb_speed() {
         version=$(cat "$ddir/version" 2>/dev/null | tr -d ' ' || echo "?")
         product=$(cat "$ddir/product" 2>/dev/null || echo "Brother device")
 
-        log_debug "USB device: $product at $(basename "$ddir")"
-        log_debug "  Negotiated speed: ${speed} Mbit/s"
-        log_debug "  USB descriptor version: $version"
 
         if [[ "$speed" == "12" ]]; then
             log_info "USB speed: 12 Mbit/s (Full-Speed)."
@@ -1139,8 +1047,6 @@ diagnose_usb_speed() {
             log_info "  This cannot be changed — it is a silicon-level limitation."
         elif [[ "$speed" == "480" ]]; then
             log_info "USB speed: 480 Mbit/s (High-Speed). Unexpected for DCP-130C."
-        else
-            log_debug "USB speed: ${speed} Mbit/s"
         fi
 
         # Check host controller speed capability
@@ -1162,17 +1068,12 @@ diagnose_usb_speed() {
             fi
         fi
     done
-    if [[ "$found" -eq 0 ]]; then
-        log_debug "No Brother USB device found for speed diagnosis."
-    fi
 }
 
 # Detect scanner USB connection
 detect_scanner() {
     log_info "Detecting Brother DCP-130C scanner..."
     
-    log_debug "USB devices:"
-    log_debug "$(lsusb 2>/dev/null || echo 'lsusb not available')"
     
     # Check USB connection
     if lsusb | grep -i "Brother"; then
@@ -1205,8 +1106,6 @@ configure_scanner() {
         if ! grep -q '^brother2$' "$dll_conf"; then
             log_info "Adding brother2 backend to SANE configuration..."
             echo "brother2" | sudo tee -a "$dll_conf" > /dev/null
-        else
-            log_debug "brother2 backend already in $dll_conf"
         fi
     else
         log_warn "$dll_conf not found. Creating it with brother2 backend..."
@@ -1216,21 +1115,12 @@ configure_scanner() {
     # Add the scanner device using brsaneconfig2
     # The DCP-130C USB ID is 0x01a8 (from Brsane2.ini)
     log_info "Registering scanner device..."
-    log_debug "Running: $brsaneconfig -a name=$SCANNER_NAME model=$SCANNER_MODEL nodename=local_device"
-    sudo "$brsaneconfig" -a name="$SCANNER_NAME" model="$SCANNER_MODEL" nodename=local_device 2>&1 | while IFS= read -r line; do
-        log_debug "brsaneconfig2: $line"
-    done || log_warn "brsaneconfig2 returned non-zero exit code (this may be normal on ARM)"
+    sudo "$brsaneconfig" -a name="$SCANNER_NAME" model="$SCANNER_MODEL" nodename=local_device >/dev/null 2>&1 \
+        || log_warn "brsaneconfig2 returned non-zero exit code (this may be normal on ARM)"
 
     # Verify scanner configuration — show only configured devices, not the
     # full model list (which is 88+ lines of every supported Brother model)
-    local configured_devices
-    configured_devices=$("$brsaneconfig" -q 2>&1 | grep -A 999 '^Devices on network' || echo 'query failed')
-    if [[ -n "$configured_devices" ]]; then
-        log_debug "Configured devices:"
-        log_debug "$configured_devices"
-    else
-        log_debug "No configured devices found (brsaneconfig2 -q)"
-    fi
+
 
     log_info "Scanner configured successfully."
 
@@ -1243,9 +1133,8 @@ configure_scanner() {
         elif grep -q "^\[Driver\]" "$ini_file"; then
             sudo sed -i '/^\[Driver\]/a LogFile=1' "$ini_file"
         fi
-        log_debug "Brother debug logging enabled in Brsane2.ini"
 
-        # Ensure compression=1 is set in [Driver] section.
+        # Ensure compression=1 in Brsane2.ini [Driver] section.
         # When compression=1, the backend sends "C=RLENGTH" (PackBits) in the
         # scan start command. The scanner firmware decides whether to actually
         # compress — the DCP-130C ignores this for 24-bit Color but may use
@@ -1255,13 +1144,9 @@ configure_scanner() {
             cur_val=$(grep "^compression=" "$ini_file" | head -1 | cut -d= -f2)
             if [[ "$cur_val" != "1" ]]; then
                 sudo sed -i 's/^compression=.*/compression=1/' "$ini_file"
-                log_debug "Set compression=1 in Brsane2.ini (was $cur_val)"
-            else
-                log_debug "Brsane2.ini already has compression=1"
             fi
         elif grep -q "^\[Driver\]" "$ini_file"; then
             sudo sed -i '/^\[Driver\]/a compression=1' "$ini_file"
-            log_debug "Added compression=1 to Brsane2.ini [Driver] section"
         fi
     fi
 }
@@ -1274,7 +1159,6 @@ test_scan() {
     # usblp grabs USB interface 1 for printing; this blocks SANE's
     # usb_claim_interface() and can cause segfaults in older libusb-0.1.
     if lsmod 2>/dev/null | grep -q usblp; then
-        log_debug "usblp kernel module is loaded"
         # Find any Brother USB device (vendor 04f9) and unbind usblp from it
         local usblp_bound=false
         for devpath in /sys/bus/usb/devices/*/idVendor; do
@@ -1292,7 +1176,6 @@ test_scan() {
                             usblp_bound=true
                             local intf_name
                             intf_name=$(basename "$intf_dir")
-                            log_debug "usblp is bound to $intf_name — unbinding for SANE access"
                             echo "$intf_name" | sudo tee /sys/bus/usb/drivers/usblp/unbind > /dev/null 2>&1 || true
                         fi
                     done
@@ -1301,15 +1184,12 @@ test_scan() {
         done
         if $usblp_bound; then
             log_info "Unbound usblp from scanner to allow SANE access."
-        else
-            log_debug "usblp loaded but not bound to Brother scanner"
         fi
     fi
 
     local scan_cmd=""
     if command -v scanimage &>/dev/null; then
         scan_cmd="scanimage"
-        log_debug "Using native scanimage"
     fi
     if [[ -z "$scan_cmd" ]]; then
         log_warn "scanimage not found. Install sane-utils to test scanning."
@@ -1335,22 +1215,12 @@ test_scan() {
         local missing_so
         missing_so=$(echo "$scanners" | grep -oP 'lib[^:]+\.so[^:]*' | head -1)
         log_warn "Scanner command failed: missing library: ${missing_so:-unknown}"
-        log_debug "$scan_cmd -L output: $scanners"
     elif echo "$scanners" | grep -qi "device.*brother\|DCP-130C.*scanner"; then
         log_info "Scanner detected: $scanners"
     else
         log_warn "Scanner not detected by SANE."
         log_info "$scan_cmd -L output: ${scanners:-<empty>}"
         log_info "Running SANE diagnostics..."
-        local sane_debug_output
-        sane_debug_output=$(SANE_DEBUG_DLL=5 SANE_DEBUG_BROTHER2=5 $scan_cmd -L 2>&1 || true)
-
-        local error_lines
-        error_lines=$(echo "$sane_debug_output" | grep -iE 'error|fail|cannot|denied|not found' | grep -v '^\s*$' | head -10 || true)
-        if [[ -n "$error_lines" ]]; then
-            log_debug "SANE errors:"
-            while IFS= read -r line; do log_debug "  $line"; done <<< "$error_lines"
-        fi
     fi
 
     # Collect available devices — prefer USB (direct hardware access).
@@ -1386,7 +1256,6 @@ test_scan() {
             local -a scan_args=(-d "$try_device" --format=pnm --resolution=150 --mode "True Gray")
 
             log_info "Performing test scan with device '$try_device'..."
-            log_debug "Scan command: $scan_cmd ${scan_args[*]}"
             if timeout 120 "$scan_cmd" "${scan_args[@]}" > "$test_output" 2>"$test_stderr"; then
                 if [[ -s "$test_output" ]]; then
                     log_info "Test scan saved to: $test_output"
@@ -1419,7 +1288,6 @@ test_scan() {
                         echo "$scan_err" | while IFS= read -r line; do log_info "  $line"; done
                     fi
                     if [[ "$err_text" == *"Invalid argument"* ]]; then
-                        log_debug "Device '$try_device' returned 'Invalid argument'"
                         continue
                     fi
                 fi
@@ -1556,13 +1424,6 @@ display_info() {
 # Main installation process
 main() {
     log_info "Starting Brother DCP-130C scanner driver installation..."
-    if [[ "$DEBUG" == "1" ]]; then
-        log_debug "Debug mode is active"
-        log_debug "Script: $0"
-        log_debug "Date: $(date)"
-        log_debug "Shell: $BASH_VERSION"
-        log_debug "System: $(uname -a)"
-    fi
     echo
     
     check_root
