@@ -160,9 +160,14 @@ static void probe_usb_environment(void) {
                     "[BROTHER2] cpu: The DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
             fprintf(stderr, "%s [BROTHER2] data: The backend requests PackBits compression via Brsane2.ini compression=1.\n"
                     "[BROTHER2] data: This sends C=RLENGTH in the scan start command to the scanner.\n"
-                    "[BROTHER2] data: However, the DCP-130C firmware ignores this for 24-bit Color mode.\n"
-                    "[BROTHER2] data: Forcing compression is NOT possible — it is a scanner firmware decision.\n"
-                    "[BROTHER2] data: B&W/grayscale modes may honour the compression request.\n", debug_ts());
+                    "[BROTHER2] data: The SAME C=RLENGTH is sent for ALL scan modes (color, gray, B&W).\n"
+                    "[BROTHER2] data: However, the scanner firmware decides per-line whether to compress.\n"
+                    "[BROTHER2] data: Confirmed: True Gray mode = 3.9x compression (PackBits on every line).\n"
+                    "[BROTHER2] data: Confirmed: 24-bit Color mode = 1.0x (firmware sends all planes uncompressed).\n"
+                    "[BROTHER2] data: The line header byte from the scanner encodes both plane type (bits[4:2])\n"
+                    "[BROTHER2] data: and compression flag (bits[1:0]). For color planes (R/G/B), the firmware\n"
+                    "[BROTHER2] data: always clears the compression bits. This is a firmware-level decision\n"
+                    "[BROTHER2] data: that cannot be changed from the driver side.\n", debug_ts());
             /* Check actual compression setting in Brsane2.ini */
             {
                 FILE *ini = fopen(BROTHER_INI_PATH, "r");

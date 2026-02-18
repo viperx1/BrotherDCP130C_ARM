@@ -795,7 +795,7 @@ CEOF
 
 @test "backend_init: reports scanner compression info" {
     grep -q 'PackBits compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
-    grep -q 'scanner firmware decision' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'firmware-level decision' "$PROJECT_ROOT/DCP-130C/backend_init.c"
 }
 
 @test "backend_init: includes Windows comparison for transfer speed" {
@@ -805,7 +805,7 @@ CEOF
 
 @test "scanner: display_info explains compression used by scanner" {
     grep -q 'Data compression' "$PROJECT_ROOT/install_scanner.sh"
-    grep -q 'sends ALL data UNCOMPRESSED' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '3.9x compression' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'PackBits' "$PROJECT_ROOT/install_scanner.sh"
 }
 
@@ -823,12 +823,12 @@ CEOF
 }
 
 @test "scanner: display_info explains compression cannot be forced" {
-    grep -q 'Forcing compression is NOT possible' "$PROJECT_ROOT/install_scanner.sh"
-    grep -q 'scanner firmware decision' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'forcing color compression is' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'firmware-level decision' "$PROJECT_ROOT/install_scanner.sh"
 }
 
 @test "scanner: display_info explains backend requests PackBits via INI" {
-    grep -q 'C=RLENGTH.*Brsane2.ini' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'C=RLENGTH' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'compression=1' "$PROJECT_ROOT/install_scanner.sh"
 }
 
@@ -877,4 +877,43 @@ CEOF
 @test "scanner: display_info tips suggest True Gray mode with timing" {
     grep -q "True Gray.*3x less data" "$PROJECT_ROOT/install_scanner.sh"
     grep -q '30 sec.*88 sec' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- protocol-level compression analysis (confirmed by real-world testing) ---
+
+@test "backend_init: explains same C=RLENGTH sent for all modes" {
+    grep -q 'SAME C=RLENGTH.*sent for ALL scan modes' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: explains per-line header byte compression decision" {
+    grep -q 'line header byte' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'bits\[1:0\]' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: reports confirmed gray compression ratio" {
+    grep -q 'True Gray.*3.9x compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q '24-bit Color.*1.0x' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "scandec: compressed summary notes color does not compress" {
+    grep -q 'DCP-130C only compresses grayscale' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'firmware-level decision.*per-line header' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: uncompressed summary includes protocol analysis" {
+    grep -q 'same C=RLENGTH for all modes' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'line header byte.*bits\[1:0\]' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'True Gray achieves 3.9x compression' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scanner: display_info shows confirmed gray and color compression data" {
+    grep -q '3.9x compression' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '1.0x.*uncompressed' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '0.5 MB.*1.9 MB' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '6.0 MB' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains per-line header protocol" {
+    grep -q 'line header byte' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'same C=RLENGTH request' "$PROJECT_ROOT/install_scanner.sh"
 }

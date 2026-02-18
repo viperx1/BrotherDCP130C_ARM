@@ -618,7 +618,10 @@ BOOL ScanDecClose(void)
             fprintf(stderr,
                 "[SCANDEC] compression: %.0f%% of lines used compression in %s mode (PackBits=%lu, White=%lu, Raw=%lu)\n"
                 "[SCANDEC]   Scanner used PackBits run-length encoding for %s mode.\n"
-                "[SCANDEC]   Compression ratio: %.1fx — %.1f MB sent over USB for %.1f MB of pixel data.\n",
+                "[SCANDEC]   Compression ratio: %.1fx — %.1f MB sent over USB for %.1f MB of pixel data.\n"
+                "[SCANDEC]   Note: the DCP-130C only compresses grayscale/B&W data. 24-bit Color is always\n"
+                "[SCANDEC]   sent uncompressed (1.0x) despite the same C=RLENGTH compression request.\n"
+                "[SCANDEC]   This is a firmware-level decision encoded in the per-line header byte.\n",
                 pct_compressed,
                 g_stats.mode_name ? g_stats.mode_name : "this",
                 g_stats.lines_pack, g_stats.lines_white, g_stats.lines_noncomp,
@@ -634,7 +637,11 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   The backend requested PackBits (C=RLENGTH via Brsane2.ini compression=1)\n"
                 "[SCANDEC]   but the DCP-130C firmware ignores this for %s mode.\n"
                 "[SCANDEC]   Forcing compression is NOT possible — this is a scanner firmware decision.\n"
-                "[SCANDEC]   All %lu bytes were raw uncompressed pixel data over USB.\n",
+                "[SCANDEC]   All %lu bytes were raw uncompressed pixel data over USB.\n"
+                "[SCANDEC]   Protocol analysis: the scan command sends the same C=RLENGTH for all modes.\n"
+                "[SCANDEC]   The scanner firmware decides per-line via the line header byte (bits[1:0]).\n"
+                "[SCANDEC]   For color planes (R/G/B), the firmware always clears the compression bits.\n"
+                "[SCANDEC]   Confirmed: True Gray achieves 3.9x compression with the same C=RLENGTH request.\n",
                 mode, compress_ratio, mode, g_stats.bytes_in);
             /* Suggest testing other modes when color is uncompressed */
             if (g_stats.mode_bpp == 3)
