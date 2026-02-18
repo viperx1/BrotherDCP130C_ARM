@@ -733,3 +733,41 @@ CEOF
     run gzip -t "$TEST_TMPDIR/test.tar.gz"
     [[ "$status" -eq 0 ]]
 }
+
+# --- source download debug logging tests ---
+
+@test "scanner: try_download logs file size and type after download" {
+    grep -q 'file_size.*stat' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'file_type.*file -b' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Downloaded:.*bytes.*type:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: try_download logs wget errors on failure" {
+    grep -q 'wget error:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: try_download uses longer timeout for reliability" {
+    grep -q 'timeout=60' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'tries=3' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend logs source URLs being tried" {
+    grep -q 'brscan2 source URLs to try:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend logs existing tarball size" {
+    grep -q 'Existing source tarball:.*bytes' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend logs tarball details on extraction failure" {
+    grep -q 'Tarball size:.*bytes' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend cleans src_dir before extraction" {
+    grep -q 'Clean src_dir before extraction' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: compile_arm_backend lists failed URLs on download failure" {
+    grep -q 'Failed to download brscan2 source code from all URLs' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'URLs tried:' "$PROJECT_ROOT/install_scanner.sh"
+}

@@ -296,24 +296,37 @@ try_download() {
     
     for url in "${urls[@]}"; do
         log_debug "Trying download: $url"
-        if wget -q --timeout=30 --tries=2 -O "$output_file" "$url" 2>/dev/null; then
+        local wget_err wget_args
+        wget_args=(--timeout=60 --tries=3 -O "$output_file")
+        # In non-debug mode, suppress wget output
+        if [[ "$DEBUG" != "1" ]]; then
+            wget_args+=(-q)
+        fi
+        if wget_err=$( wget "${wget_args[@]}" "$url" 2>&1 ); then
+            local file_size file_type
+            file_size=$(stat -c%s "$output_file" 2>/dev/null || echo "0")
+            file_type=$(file -b "$output_file" 2>/dev/null || echo "unknown")
+            log_debug "Downloaded: $(basename "$output_file") — ${file_size} bytes, type: ${file_type}"
             # Verify we got an actual file (not an HTML error page)
-            if [[ -s "$output_file" ]] && file "$output_file" | grep -qi "debian\|archive\|data"; then
+            if [[ -s "$output_file" ]] && grep -qi "debian\|archive\|data\|gzip" <<< "$file_type"; then
                 # Extra integrity check for gzip archives (catches truncated downloads)
                 if [[ "$output_file" == *.tar.gz || "$output_file" == *.gz ]]; then
                     if ! gzip -t "$output_file" 2>/dev/null; then
-                        log_debug "Download from $url is a truncated/corrupt gzip file, trying next..."
+                        log_debug "Download from $url is a truncated/corrupt gzip file (${file_size} bytes), trying next..."
                         rm -f "$output_file"
                         continue
                     fi
+                    log_debug "gzip integrity check passed"
                 fi
                 log_info "Downloaded successfully from: $url"
                 return 0
             fi
-            log_debug "Download from $url succeeded but file appears invalid, trying next..."
+            log_debug "Download from $url succeeded but file appears invalid (type: ${file_type}), trying next..."
             rm -f "$output_file"
         else
             log_debug "Download failed from: $url"
+            log_debug "wget error: $(tail -n 3 <<< "$wget_err")"
+            rm -f "$output_file"
         fi
     done
     
@@ -477,34 +490,56 @@ compile_arm_backend() {
     # Download source
     log_info "Downloading brscan2 source code..."
     mkdir -p "$src_dir" "$build_dir"
+    log_debug "brscan2 source URLs to try: ${DRIVER_BRSCAN2_SRC_URLS[*]}"
 
     local src_tarball="$TMP_DIR/$DRIVER_BRSCAN2_SRC_FILE"
     # Validate existing tarball — remove if corrupt (e.g. truncated download)
-    if [[ -f "$src_tarball" ]] && ! gzip -t "$src_tarball" 2>/dev/null; then
-        log_warn "Existing source tarball is corrupt, re-downloading..."
-        rm -f "$src_tarball"
+    if [[ -f "$src_tarball" ]]; then
+        local existing_size
+        existing_size=$(stat -c%s "$src_tarball" 2>/dev/null || echo "0")
+        log_debug "Existing source tarball: ${existing_size} bytes"
+        if ! gzip -t "$src_tarball" 2>/dev/null; then
+            log_warn "Existing source tarball is corrupt (${existing_size} bytes), re-downloading..."
+            rm -f "$src_tarball"
+        else
+            log_debug "Existing source tarball passes gzip integrity check"
+        fi
     fi
     if [[ ! -f "$src_tarball" ]]; then
         if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
-            log_warn "Failed to download brscan2 source code"
+            log_warn "Failed to download brscan2 source code from all URLs"
+            log_warn "URLs tried:"
+            for url in "${DRIVER_BRSCAN2_SRC_URLS[@]}"; do
+                log_warn "  - $url"
+            done
             return 1
         fi
     fi
+
+    # Clean src_dir before extraction to avoid interference from prior runs
+    rm -rf "$src_dir"
+    mkdir -p "$src_dir"
 
     # Extract source (retry once on failure after re-downloading)
     local tar_err
     if ! tar_err=$(tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 2>&1); then
+        local tarball_size
+        tarball_size=$(stat -c%s "$src_tarball" 2>/dev/null || echo "0")
         log_debug "Extraction error: $tar_err"
+        log_debug "Tarball size: ${tarball_size} bytes, type: $(file -b "$src_tarball" 2>/dev/null)"
         log_warn "Failed to extract brscan2 source, re-downloading..."
         rm -f "$src_tarball"
+        rm -rf "$src_dir"
+        mkdir -p "$src_dir"
         if ! try_download "$src_tarball" "${DRIVER_BRSCAN2_SRC_URLS[@]}"; then
-            log_warn "Failed to download brscan2 source code"
+            log_warn "Failed to download brscan2 source code from all URLs"
             return 1
         fi
-        tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 || {
+        if ! tar_err=$(tar xzf "$src_tarball" -C "$src_dir" --strip-components=1 2>&1); then
+            log_debug "Retry extraction error: $tar_err"
             log_warn "Failed to extract brscan2 source after re-download"
             return 1
-        }
+        fi
     fi
 
     local brscan_src="$src_dir/brscan"
