@@ -18,9 +18,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <time.h>
 
 /* Brother USB vendor ID */
 #define BROTHER_VID "04f9"
+
+/*
+ * Format current wall-clock time as "HH:MM:SS.mmm" into a static buffer.
+ */
+static const char *debug_ts(void) {
+    static char buf[16];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (int)(ts.tv_nsec / 1000000));
+    return buf;
+}
 
 static void backend_segfault_handler(int sig) {
     const char msg[] = "\n[BROTHER2] FATAL: Segmentation fault in SANE brother2 backend!\n";
@@ -56,7 +72,7 @@ static int read_sysfs(const char *path, char *buf, int bufsz) {
 static void probe_usb_environment(void) {
     DIR *d = opendir("/sys/bus/usb/devices");
     if (!d) {
-        fprintf(stderr, "[BROTHER2] usb: cannot read /sys/bus/usb/devices\n");
+        fprintf(stderr, "%s [BROTHER2] usb: cannot read /sys/bus/usb/devices\n", debug_ts());
         return;
     }
 
@@ -120,18 +136,18 @@ static void probe_usb_environment(void) {
         else if (speed_mbit == 5000) speed_label = "USB 3.0 SuperSpeed (5 Gbit/s)";
         else if (strcmp(speed, "1.5") == 0) { speed_mbit = 1; speed_label = "USB 1.0 Low-Speed (1.5 Mbit/s)"; }
 
-        fprintf(stderr, "[BROTHER2] usb: found %s (04f9:%s) at %s, speed: %s\n",
-                product[0] ? product : "Brother device", pid, ent->d_name, speed_label);
+        fprintf(stderr, "%s [BROTHER2] usb: found %s (04f9:%s) at %s, speed: %s\n",
+                debug_ts(), product[0] ? product : "Brother device", pid, ent->d_name, speed_label);
         if (ver[0])
-            fprintf(stderr, "[BROTHER2] usb: device descriptor version: USB %s\n", ver);
+            fprintf(stderr, "%s [BROTHER2] usb: device descriptor version: USB %s\n", debug_ts(), ver);
 
         if (speed_mbit == 12) {
-            fprintf(stderr, "[BROTHER2] usb: NOTE — Full-Speed (12 Mbit/s) limits throughput to ~70 KB/s.\n");
+            fprintf(stderr, "%s [BROTHER2] usb: NOTE — Full-Speed (12 Mbit/s) limits throughput to ~70 KB/s.\n", debug_ts());
             if (usb_ver_major >= 2) {
-                fprintf(stderr, "[BROTHER2] usb: The DCP-130C is \"USB 2.0 Full-Speed\" — it is USB 2.0 compliant\n"
+                fprintf(stderr, "%s [BROTHER2] usb: The DCP-130C is \"USB 2.0 Full-Speed\" — it is USB 2.0 compliant\n"
                         "[BROTHER2] usb: but only supports Full-Speed (12 Mbit/s), NOT High-Speed (480 Mbit/s).\n"
                         "[BROTHER2] usb: This is BY DESIGN — the scanner hardware has no High-Speed capability.\n"
-                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput for this device.\n");
+                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput for this device.\n", debug_ts());
             }
         }
 
@@ -155,10 +171,10 @@ static void probe_usb_environment(void) {
                     const char *drv = strrchr(driver_target, '/');
                     drv = drv ? drv + 1 : driver_target;
                     if (strcmp(drv, "usblp") == 0) {
-                        fprintf(stderr, "[BROTHER2] usb: WARNING — usblp driver is bound to %s. "
+                        fprintf(stderr, "%s [BROTHER2] usb: WARNING — usblp driver is bound to %s. "
                                 "This can block SANE USB access. Run: "
                                 "echo '%s' | sudo tee /sys/bus/usb/drivers/usblp/unbind\n",
-                                ent2->d_name, ent2->d_name);
+                                debug_ts(), ent2->d_name, ent2->d_name);
                     }
                 }
             }
@@ -168,8 +184,8 @@ static void probe_usb_environment(void) {
     closedir(d);
 
     if (!found)
-        fprintf(stderr, "[BROTHER2] usb: no Brother device (vendor %s) found on USB bus\n",
-                BROTHER_VID);
+        fprintf(stderr, "%s [BROTHER2] usb: no Brother device (vendor %s) found on USB bus\n",
+                debug_ts(), BROTHER_VID);
 
     /* Check for QEMU binfmt_misc registration */
     DIR *binfmt = opendir("/proc/sys/fs/binfmt_misc");
@@ -179,16 +195,16 @@ static void probe_usb_environment(void) {
         while ((bf = readdir(binfmt)) != NULL) {
             if (strncmp(bf->d_name, "qemu-", 5) == 0) {
                 if (!qemu_found) {
-                    fprintf(stderr, "[BROTHER2] qemu: binfmt_misc QEMU handlers detected\n");
+                    fprintf(stderr, "%s [BROTHER2] qemu: binfmt_misc QEMU handlers detected\n", debug_ts());
                     qemu_found = 1;
                 }
             }
         }
         if (qemu_found) {
-            fprintf(stderr, "[BROTHER2] qemu: i386 binaries (e.g. brsaneconfig2) run via QEMU. "
+            fprintf(stderr, "%s [BROTHER2] qemu: i386 binaries (e.g. brsaneconfig2) run via QEMU. "
                     "This is normal for configuration but should NOT affect scan speed.\n"
                     "[BROTHER2] qemu: if QEMU processes access the USB device during scanning, "
-                    "contention may slow I/O. Check with: ps aux | grep qemu\n");
+                    "contention may slow I/O. Check with: ps aux | grep qemu\n", debug_ts());
         }
         closedir(binfmt);
     }
@@ -204,8 +220,8 @@ static void backend_init(void) {
 
     const char *env = getenv("BROTHER_DEBUG");
     if (env && env[0] == '1') {
-        fprintf(stderr, "[BROTHER2] SANE brother2 backend loaded "
-                "(BROTHER_DEBUG=1, diagnostics enabled)\n");
+        fprintf(stderr, "%s [BROTHER2] SANE brother2 backend loaded "
+                "(BROTHER_DEBUG=1, diagnostics enabled)\n", debug_ts());
         probe_usb_environment();
     }
 }
