@@ -64,6 +64,7 @@ static struct {
     double        write_ms;      /* total time in ScanDecWrite */
     struct timespec open_time;   /* when ScanDecOpen was called */
     struct timespec last_write;  /* timestamp of last ScanDecWrite */
+    struct timespec last_progress; /* timestamp of last progress report */
     double        max_gap_ms;    /* longest gap between writes */
     double        max_write_ms;  /* longest single ScanDecWrite call */
 } g_stats;
@@ -197,6 +198,7 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
     memset(&g_stats, 0, sizeof(g_stats));
     clock_gettime(CLOCK_MONOTONIC, &g_stats.open_time);
     g_stats.last_write = g_stats.open_time;
+    g_stats.last_progress = g_stats.open_time;
 
     p->dwOutLinePixCnt = p->dwInLinePixCnt;
 
@@ -315,9 +317,11 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
 
         switch (w->nInDataComp) {
         case SCIDC_WHITE:
+            if (g_debug) g_stats.lines_white++;
             memset(planeBuf, 0xFF, g_plane_pixels);
             break;
         case SCIDC_NONCOMP: {
+            if (g_debug) g_stats.lines_noncomp++;
             DWORD cpLen = w->dwLineDataSize;
             if (cpLen > g_plane_pixels) cpLen = g_plane_pixels;
             memcpy(planeBuf, w->pLineData, cpLen);
@@ -326,10 +330,12 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
             break;
         }
         case SCIDC_PACK:
+            if (g_debug) g_stats.lines_pack++;
             decode_packbits(w->pLineData, w->dwLineDataSize,
                             planeBuf, g_plane_pixels);
             break;
         default: {
+            if (g_debug) g_stats.lines_unknown++;
             DWORD cpLen = w->dwLineDataSize;
             if (cpLen > g_plane_pixels) cpLen = g_plane_pixels;
             memcpy(planeBuf, w->pLineData, cpLen);
@@ -365,9 +371,13 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
                 g_stats.max_write_ms = call_ms;
             if ((g_stats.lines_total % 100) == 0) {
                 double total_ms = elapsed_ms(&g_stats.open_time, &t_end);
+                double interval_ms = elapsed_ms(&g_stats.last_progress, &t_end);
+                g_stats.last_progress = t_end;
                 fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
-                        "%.2f ms/line avg, %.2f ms max gap between writes\n",
+                        "last 100 in %.0f ms (%.1f ms/line), "
+                        "%.2f ms/line decode avg, max gap %.1f ms\n",
                         g_stats.lines_total, total_ms,
+                        interval_ms, interval_ms / 100.0,
                         g_stats.write_ms / g_stats.lines_total,
                         g_stats.max_gap_ms);
             }
@@ -457,9 +467,13 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
             g_stats.max_write_ms = call_ms;
         if ((g_stats.lines_total % 100) == 0) {
             double total_ms = elapsed_ms(&g_stats.open_time, &t_end);
+            double interval_ms = elapsed_ms(&g_stats.last_progress, &t_end);
+            g_stats.last_progress = t_end;
             fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
-                    "%.2f ms/line avg, %.2f ms max gap between writes\n",
+                    "last 100 in %.0f ms (%.1f ms/line), "
+                    "%.2f ms/line decode avg, max gap %.1f ms\n",
                     g_stats.lines_total, total_ms,
+                    interval_ms, interval_ms / 100.0,
                     g_stats.write_ms / g_stats.lines_total,
                     g_stats.max_gap_ms);
         }
@@ -493,6 +507,7 @@ BOOL ScanDecClose(void)
         double total_ms = elapsed_ms(&g_stats.open_time, &now);
         double throughput = g_stats.bytes_out ?
             (g_stats.bytes_out / 1024.0) / (total_ms / 1000.0) : 0;
+        double backend_ms = total_ms - g_stats.write_ms;
         fprintf(stderr,
                 "[SCANDEC] === scan session summary ===\n"
                 "[SCANDEC]   total time:    %.1f ms\n"
@@ -500,6 +515,7 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   RGB planes:    %lu\n"
                 "[SCANDEC]   data in/out:   %lu / %lu bytes\n"
                 "[SCANDEC]   decode time:   %.1f ms total (%.3f ms/line avg)\n"
+                "[SCANDEC]   backend time:  %.1f ms (%.1f%% — USB I/O + protocol)\n"
                 "[SCANDEC]   max write:     %.3f ms (single call)\n"
                 "[SCANDEC]   max gap:       %.1f ms (between writes — I/O or backend wait)\n"
                 "[SCANDEC]   throughput:    %.1f KB/s\n",
@@ -511,6 +527,8 @@ BOOL ScanDecClose(void)
                 g_stats.bytes_in, g_stats.bytes_out,
                 g_stats.write_ms,
                 g_stats.lines_total ? g_stats.write_ms / g_stats.lines_total : 0,
+                backend_ms,
+                total_ms > 0 ? (backend_ms / total_ms) * 100.0 : 0,
                 g_stats.max_write_ms,
                 g_stats.max_gap_ms,
                 throughput);

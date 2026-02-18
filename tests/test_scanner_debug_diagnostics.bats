@@ -261,3 +261,102 @@ CEOF
         "$TEST_TMPDIR/test_main" 2>&1 >/dev/null)
     [[ -z "$stderr_out" ]]
 }
+
+# --- scandec RGB mode compression tracking ---
+
+@test "scandec: RGB mode tracks compression stats per-plane" {
+    cat > "$TEST_TMPDIR/test_rgb.c" << 'CEOF'
+#include <string.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0400; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    BYTE line[100], out[400]; memset(line, 128, 100);
+    /* 5 lines × 3 planes = 15 plane writes, all NONCOMP (2) */
+    for (int l = 0; l < 5; l++) {
+        for (int p = 2; p <= 4; p++) {
+            SCANDEC_WRITE w = {2, p, line, 100, out, 400, 0}; INT st;
+            ScanDecWrite(&w, &st);
+        }
+    }
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_rgb" "$TEST_TMPDIR/test_rgb.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_rgb" 2>&1 >/dev/null)
+    # Should see noncomp=15 (5 lines × 3 planes)
+    [[ "$stderr_out" == *"noncomp=15"* ]]
+    # RGB planes should be 15
+    [[ "$stderr_out" == *"RGB planes"*"15"* ]]
+}
+
+@test "scandec: summary shows backend time percentage" {
+    cat > "$TEST_TMPDIR/test_backend_time.c" << 'CEOF'
+#include <string.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0200; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    BYTE line[100], out[200]; memset(line, 128, 100);
+    SCANDEC_WRITE w = {2, 0, line, 100, out, 200, 0}; INT st;
+    ScanDecWrite(&w, &st);
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_backend_time" "$TEST_TMPDIR/test_backend_time.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_backend_time" 2>&1 >/dev/null)
+    [[ "$stderr_out" == *"backend time:"* ]]
+    [[ "$stderr_out" == *"USB I/O + protocol"* ]]
+}
+
+# --- install_scanner.sh patch tests ---
+
+@test "scanner: ReadDeviceData patch includes usleep for CPU yield" {
+    grep -q 'usleep(2000)' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: ReadDeviceData patch includes BROTHER_DEBUG stats" {
+    grep -q '_rdd_reads' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '_rdd_zero_reads' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q '_rdd_total_bytes' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: ReadDeviceData patch includes debug fprintf" {
+    grep -q 'ReadDeviceData EOF' "$PROJECT_ROOT/install_scanner.sh"
+}

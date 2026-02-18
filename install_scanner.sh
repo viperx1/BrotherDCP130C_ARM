@@ -534,42 +534,70 @@ compile_arm_backend() {
 
     local brother2_c="$brscan_src/backend_src/brother2.c"
 
-    # Stall detection inside ReadDeviceData (brother_devaccs.c).
+    # Stall detection + CPU yield inside ReadDeviceData (brother_devaccs.c).
     # The DCP-130C scanner sends all scan data then simply stops sending
     # without an explicit end-of-page marker. The backend loops forever
     # calling ReadDeviceData which returns 0 bytes with iReadStatus=2
     # ("reading"). After STALL_THRESHOLD consecutive zero-byte reads,
     # we force nResultSize=-1 which signals "end of data" to
     # ReadNonFixedData, causing bReadbufEnd=TRUE and ending the scan.
+    #
+    # CPU fix: The original code tight-loops on usb_bulk_read() when no
+    # data is available, burning 100% CPU. We add usleep(2000) (2 ms)
+    # after any zero-byte read to yield the CPU. At 150 DPI 24-bit
+    # color the scanner produces ~22 lines/sec (~46 ms/line), so a 2 ms
+    # sleep adds negligible overhead but drops CPU usage dramatically.
+    #
+    # Debug: When BROTHER_DEBUG=1 is set, counts total USB reads,
+    # zero-byte reads, and total bytes, printing a summary at EOF.
     local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
     if [[ -f "$devaccs_c" ]]; then
-        # Inject stall detection counters before the WriteLog at the
-        # start of ReadDeviceData.
+        # Inject stall detection counters + debug variables before the
+        # WriteLog at the start of ReadDeviceData.
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/i\
 {\
 \t#ifndef STALL_THRESHOLD\
 \t#define STALL_THRESHOLD 200\
 \t#endif\
 \tstatic int _rdd_zero_streak = 0;\
-\tstatic int _rdd_had_data = 0;' "$devaccs_c"
+\tstatic int _rdd_had_data = 0;\
+\tstatic unsigned long _rdd_reads = 0;\
+\tstatic unsigned long _rdd_zero_reads = 0;\
+\tstatic unsigned long _rdd_total_bytes = 0;\
+\tstatic int _rdd_debug = -1;\
+\tif (_rdd_debug < 0) {\
+\t\tconst char *_e = getenv("BROTHER_DEBUG");\
+\t\t_rdd_debug = (_e && _e[0] == '"'"'1'"'"');\
+\t}' "$devaccs_c"
 
-        # After the ReadEnd WriteLog, add stall detection:
-        # If we previously received data and now get STALL_THRESHOLD
-        # (200) consecutive zero-byte reads, force EOF.
+        # After the ReadEnd WriteLog, add stall detection + CPU yield:
+        # - Count every USB read for debug stats
+        # - On data: reset streak, accumulate bytes
+        # - On zero-byte: usleep(2000) to yield CPU, then check stall
+        # - On stall (200 consecutive zeros after data): force EOF
         sed -i '/WriteLog.*ReadDeviceData ReadEnd nResultSize/a\
+\t_rdd_reads++;\
 \tif (nResultSize > 0) {\
 \t\t_rdd_zero_streak = 0;\
 \t\t_rdd_had_data = 1;\
-\t} else if (_rdd_had_data) {\
-\t\t_rdd_zero_streak++;\
-\t\tif (_rdd_zero_streak >= STALL_THRESHOLD) {\
-\t\t\tnResultSize = -1;\
-\t\t\t_rdd_zero_streak = 0;\
+\t\t_rdd_total_bytes += nResultSize;\
+\t} else {\
+\t\t_rdd_zero_reads++;\
+\t\tusleep(2000);\
+\t\tif (_rdd_had_data) {\
+\t\t\t_rdd_zero_streak++;\
+\t\t\tif (_rdd_zero_streak >= STALL_THRESHOLD) {\
+\t\t\t\tif (_rdd_debug)\
+\t\t\t\t\tfprintf(stderr, "[BROTHER2] ReadDeviceData EOF: %lu reads (%lu zero), %lu bytes total\\n",\
+\t\t\t\t\t\t_rdd_reads, _rdd_zero_reads, _rdd_total_bytes);\
+\t\t\t\tnResultSize = -1;\
+\t\t\t\t_rdd_zero_streak = 0;\
+\t\t\t}\
 \t\t}\
 \t}\
 }' "$devaccs_c"
 
-        log_debug "Injected ReadDeviceData stall detection into brother_devaccs.c"
+        log_debug "Injected ReadDeviceData stall detection + CPU yield into brother_devaccs.c"
     fi
 
     local scanner_c="$brscan_src/backend_src/brother_scanner.c"
