@@ -1400,17 +1400,42 @@ except OSError as e:
                             log_info "SCANDEC debug output:"
                             echo "$scandec_out" | while IFS= read -r line; do log_info "  $line"; done
                         fi
+                        # Always show SCANDEC summary (close/page-end with totals) if present
+                        local scandec_summary
+                        scandec_summary=$(echo "$err_text" | grep -E "^\[SCANDEC\].*(ScanDecClose|ScanDecPageEnd)" | head -2)
+                        if [[ -n "$scandec_summary" ]]; then
+                            log_info "SCANDEC summary:"
+                            echo "$scandec_summary" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
                     fi
                     # Show ALL stderr on segfault (not just filtered lines)
                     if [[ $exit_code -eq 139 ]]; then
                         log_info "Full stderr from segfaulted scan (last 50 lines):"
                         tail -50 "$test_stderr" | while IFS= read -r line; do log_info "  $line"; done
                     elif [[ $exit_code -ne 124 ]]; then
-                        # Show only the scanimage error, not SANE debug noise
+                        # Show scanimage error lines
                         local scan_err
                         scan_err=$(echo "$err_text" | grep -v "^\[SCANDEC\]" | grep -i "scanimage\|failed\|error\|Invalid" | head -5)
                         if [[ -n "$scan_err" ]]; then
                             log_info "  $scan_err"
+                        fi
+
+                        # Show backend debug traces (ReadDeviceData, PageScan, sane_read)
+                        # These are essential for diagnosing I/O errors during active scans
+                        local backend_trace
+                        backend_trace=$(echo "$err_text" | grep '^\[BROTHER2-DBG\]' | tail -20 || true)
+                        if [[ -n "$backend_trace" ]]; then
+                            log_info "Scan progress trace:"
+                            echo "$backend_trace" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
+
+                        # Show BrMfc32.log for I/O error diagnosis
+                        local brother_log_err="/usr/local/Brother/sane/BrMfc32.log"
+                        if [[ -f "$brother_log_err" ]] && [[ -s "$brother_log_err" ]]; then
+                            log_info "Brother backend log (BrMfc32.log):"
+                            tail -10 "$brother_log_err" | while IFS= read -r bline; do
+                                log_info "  $bline"
+                            done
                         fi
                     fi
                     if [[ "$err_text" == *"Invalid argument"* ]]; then
