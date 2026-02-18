@@ -543,8 +543,8 @@ compile_arm_backend() {
     # ReadNonFixedData, causing bReadbufEnd=TRUE and ending the scan.
     local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
     if [[ -f "$devaccs_c" ]]; then
-        # Inject static counters before the WriteLog at the start of
-        # ReadDeviceData.
+        # Inject stall detection counters before the WriteLog at the
+        # start of ReadDeviceData.
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/i\
 {\
 \t#ifndef STALL_THRESHOLD\

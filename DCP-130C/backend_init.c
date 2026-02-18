@@ -1,10 +1,9 @@
 /*
  * Backend initialization stub — linked into libsane-brother2.so
  *
- * Installs a SIGSEGV handler that prints a diagnostic message before
- * the process dies, helping identify which library caused the crash.
- * The handler is replaced by the scandec_stubs.c handler when
- * libbrscandec2.so is dlopen()ed later.
+ * Installs a SIGSEGV handler so crashes in the SANE backend produce
+ * a visible error on stderr before the process dies (the default
+ * behavior is a silent crash).
  */
 #include <signal.h>
 #include <unistd.h>
