@@ -552,6 +552,11 @@ compile_arm_backend() {
     # zero-byte reads, and total bytes, printing a summary at EOF.
     local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
     if [[ -f "$devaccs_c" ]]; then
+        # Ensure <time.h> is included (needed for timestamp in EOF message)
+        if ! grep -q '#include <time.h>' "$devaccs_c"; then
+            sed -i '/#include "brother_mfccmd.h"/a #include <time.h>' "$devaccs_c"
+        fi
+
         # Inject stall detection counters + debug variables before the
         # WriteLog at the start of ReadDeviceData.
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/i\

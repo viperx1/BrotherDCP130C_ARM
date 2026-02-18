@@ -502,6 +502,11 @@ CEOF
     grep -q 'stall timeout' "$PROJECT_ROOT/install_scanner.sh"
 }
 
+@test "scanner: ReadDeviceData patch injects time.h include for timestamp" {
+    grep -q '#include <time.h>' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'brother_mfccmd.h' "$PROJECT_ROOT/install_scanner.sh"
+}
+
 @test "scanner: display_info includes performance notes" {
     grep -q 'Full-Speed' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'hardware limit' "$PROJECT_ROOT/install_scanner.sh"
