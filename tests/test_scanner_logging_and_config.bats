@@ -92,6 +92,14 @@ teardown() {
     [[ "$SCANNER_SHARED" == "false" ]]
 }
 
+@test "scanner: AIRSANE_INSTALLED defaults to false" {
+    [[ "$AIRSANE_INSTALLED" == "false" ]]
+}
+
+@test "scanner: AIRSANE_VERSION is set" {
+    [[ -n "$AIRSANE_VERSION" ]]
+}
+
 # --- Debug flag parsing ---
 
 @test "scanner: --debug flag is parsed from args" {

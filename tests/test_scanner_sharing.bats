@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 # Tests for scanner sharing configuration logic.
-# Verifies saned.conf modifications and Avahi service file creation.
+# Verifies saned.conf modifications, Avahi service file creation,
+# AirSane configuration, and udev rules.
 
 load test_helper
 
@@ -48,6 +49,40 @@ create_avahi_service_file() {
   </service>
 </service-group>
 AVAHI_EOF
+}
+
+# Simulate the udev rule creation from install_airsane()
+create_brother_udev_rule() {
+    local rule_file="$1"
+    cat > "$rule_file" << 'UDEV_EOF'
+# Brother DCP-130C scanner — allow scanner group access for saned/AirSane
+ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0666", GROUP="scanner", ENV{libsane_matched}="yes"
+UDEV_EOF
+}
+
+# Simulate the AirSane defaults file that make install creates
+create_airsane_defaults() {
+    local defaults_file="$1"
+    cat > "$defaults_file" << 'DEFAULTS_EOF'
+INTERFACE=*
+LISTEN_PORT=8090
+ACCESS_LOG=
+HOTPLUG=true
+RELOAD_DELAY=1
+MDNS_ANNOUNCE=true
+ANNOUNCE_SECURE=false
+ANNOUNCE_BASE_URL=
+UNIX_SOCKET=
+WEB_INTERFACE=true
+RESET_OPTION=true
+DISCLOSE_VERSION=true
+LOCAL_SCANNERS_ONLY=false
+RANDOM_PATHS=false
+COMPATIBLE_PATH=true
+OPTIONS_FILE=/etc/airsane/options.conf
+ACCESS_FILE=/etc/airsane/access.conf
+IGNORE_LIST=/etc/airsane/ignore.conf
+DEFAULTS_EOF
 }
 
 # --- saned.conf tests ---
@@ -143,4 +178,108 @@ EOF
     [[ "$status" -eq 0 ]]
     # Verify no output was produced (no log messages about configuring sharing)
     [[ -z "$output" ]]
+}
+
+# --- AirSane variables ---
+
+@test "scanner sharing: AIRSANE_VERSION is set" {
+    [[ -n "$AIRSANE_VERSION" ]]
+}
+
+@test "scanner sharing: AIRSANE_URLS has at least 1 entry" {
+    [[ ${#AIRSANE_URLS[@]} -ge 1 ]]
+}
+
+@test "scanner sharing: AIRSANE_URLS contain github.com" {
+    [[ "${AIRSANE_URLS[0]}" == *"github.com"* ]]
+}
+
+@test "scanner sharing: AIRSANE_URLS contain AirSane" {
+    [[ "${AIRSANE_URLS[0]}" == *"AirSane"* ]]
+}
+
+@test "scanner sharing: AIRSANE_INSTALLED defaults to false" {
+    [[ "$AIRSANE_INSTALLED" == "false" ]]
+}
+
+# --- Brother udev rule tests ---
+
+@test "scanner sharing: udev rule has Brother vendor ID 04f9" {
+    create_brother_udev_rule "$TEST_TMPDIR/60-brother-scanner.rules"
+    run grep '04f9' "$TEST_TMPDIR/60-brother-scanner.rules"
+    [[ "$status" -eq 0 ]]
+}
+
+@test "scanner sharing: udev rule has DCP-130C product ID 01a8" {
+    create_brother_udev_rule "$TEST_TMPDIR/60-brother-scanner.rules"
+    run grep '01a8' "$TEST_TMPDIR/60-brother-scanner.rules"
+    [[ "$status" -eq 0 ]]
+}
+
+@test "scanner sharing: udev rule sets scanner group" {
+    create_brother_udev_rule "$TEST_TMPDIR/60-brother-scanner.rules"
+    run grep 'GROUP="scanner"' "$TEST_TMPDIR/60-brother-scanner.rules"
+    [[ "$status" -eq 0 ]]
+}
+
+@test "scanner sharing: udev rule sets libsane_matched" {
+    create_brother_udev_rule "$TEST_TMPDIR/60-brother-scanner.rules"
+    run grep 'libsane_matched' "$TEST_TMPDIR/60-brother-scanner.rules"
+    [[ "$status" -eq 0 ]]
+}
+
+# --- AirSane defaults file tests ---
+
+@test "scanner sharing: AirSane defaults has MDNS_ANNOUNCE=true" {
+    create_airsane_defaults "$TEST_TMPDIR/airsane"
+    run grep '^MDNS_ANNOUNCE=true' "$TEST_TMPDIR/airsane"
+    [[ "$status" -eq 0 ]]
+}
+
+@test "scanner sharing: AirSane defaults listens on port 8090" {
+    create_airsane_defaults "$TEST_TMPDIR/airsane"
+    run grep '^LISTEN_PORT=8090' "$TEST_TMPDIR/airsane"
+    [[ "$status" -eq 0 ]]
+}
+
+@test "scanner sharing: AirSane defaults enables web interface" {
+    create_airsane_defaults "$TEST_TMPDIR/airsane"
+    run grep '^WEB_INTERFACE=true' "$TEST_TMPDIR/airsane"
+    [[ "$status" -eq 0 ]]
+}
+
+@test "scanner sharing: AirSane defaults enables hotplug" {
+    create_airsane_defaults "$TEST_TMPDIR/airsane"
+    run grep '^HOTPLUG=true' "$TEST_TMPDIR/airsane"
+    [[ "$status" -eq 0 ]]
+}
+
+# --- display_info output ---
+
+@test "scanner sharing: display_info mentions Windows when AirSane installed" {
+    SCANNER_SHARED=true
+    AIRSANE_INSTALLED=true
+    output=$(display_info 2>&1)
+    [[ "$output" == *"Windows"* ]]
+}
+
+@test "scanner sharing: display_info mentions macOS when AirSane installed" {
+    SCANNER_SHARED=true
+    AIRSANE_INSTALLED=true
+    output=$(display_info 2>&1)
+    [[ "$output" == *"macOS"* ]]
+}
+
+@test "scanner sharing: display_info mentions AirSane web interface" {
+    SCANNER_SHARED=true
+    AIRSANE_INSTALLED=true
+    output=$(display_info 2>&1)
+    [[ "$output" == *"8090"* ]]
+}
+
+@test "scanner sharing: display_info shows NOT INSTALLED when AirSane fails" {
+    SCANNER_SHARED=true
+    AIRSANE_INSTALLED=false
+    output=$(display_info 2>&1)
+    [[ "$output" == *"NOT INSTALLED"* ]]
 }

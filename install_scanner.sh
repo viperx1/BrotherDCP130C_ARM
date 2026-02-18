@@ -47,6 +47,14 @@ SCANNER_MODEL="DCP-130C"
 SCANNER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_scanner_install"
 SCANNER_SHARED=false
+AIRSANE_INSTALLED=false
+
+# AirSane eSCL/AirScan server — exposes SANE scanners to Windows, macOS, iOS, Android
+AIRSANE_VERSION="0.4.9"
+AIRSANE_URLS=(
+    "https://github.com/SimulPiscator/AirSane/archive/refs/tags/v${AIRSANE_VERSION}.tar.gz"
+    "https://github.com/SimulPiscator/AirSane/archive/v${AIRSANE_VERSION}.tar.gz"
+)
 
 # Driver filename
 DRIVER_BRSCAN2_FILE="brscan2-0.2.5-1.i386.deb"
@@ -339,6 +347,113 @@ AVAHI_EOF
         || log_warn "Failed to reload avahi-daemon"
 
     log_info "Scanner sharing configured. Other devices on the network can discover this scanner."
+
+    # --- AirSane eSCL server ---
+    # Install AirSane to expose the scanner via eSCL/AirScan protocol.
+    # This enables automatic discovery by Windows 10/11, macOS, iOS, and Android.
+    # saned alone only serves Linux SANE clients; AirSane adds cross-platform support.
+    install_airsane || log_warn "AirSane installation failed. Windows/macOS/iOS will not discover the scanner automatically."
+}
+
+# Build and install AirSane — an eSCL/AirScan server that wraps SANE scanners.
+# AirSane advertises via Avahi using _uscan._tcp (eSCL), making the scanner
+# discoverable by Windows 10/11, macOS, iOS, and Android out of the box.
+# Returns 0 on success, 1 on failure (non-fatal — saned still works for Linux).
+install_airsane() {
+    log_info "Installing AirSane eSCL server for Windows/macOS/iOS scanner discovery..."
+
+    # Install build dependencies
+    local airsane_deps=(cmake g++ libjpeg-dev libpng-dev libavahi-client-dev libusb-1.0-0-dev)
+    log_debug "Installing AirSane build dependencies: ${airsane_deps[*]}"
+    if ! sudo apt-get install -y "${airsane_deps[@]}" 2>&1 | tail -3; then
+        log_warn "Failed to install AirSane build dependencies."
+        return 1
+    fi
+
+    # Download AirSane source tarball
+    local airsane_tarball="$TMP_DIR/airsane-${AIRSANE_VERSION}.tar.gz"
+    log_debug "AirSane source URLs to try: ${AIRSANE_URLS[*]}"
+    if ! try_download "$airsane_tarball" "${AIRSANE_URLS[@]}"; then
+        log_warn "Failed to download AirSane source code."
+        return 1
+    fi
+
+    # Extract source
+    local airsane_src_dir="$TMP_DIR/AirSane-${AIRSANE_VERSION}"
+    if ! tar -xzf "$airsane_tarball" -C "$TMP_DIR" 2>&1; then
+        log_warn "Failed to extract AirSane source tarball."
+        return 1
+    fi
+    if [[ ! -d "$airsane_src_dir" ]]; then
+        # GitHub tarballs sometimes use different directory names
+        airsane_src_dir=$(find "$TMP_DIR" -maxdepth 1 -type d -name 'AirSane*' | head -1)
+        if [[ -z "$airsane_src_dir" || ! -d "$airsane_src_dir" ]]; then
+            log_warn "AirSane source directory not found after extraction."
+            return 1
+        fi
+    fi
+    log_debug "AirSane source directory: $airsane_src_dir"
+
+    # Build with cmake
+    local airsane_build_dir="$TMP_DIR/AirSane-build"
+    mkdir -p "$airsane_build_dir"
+    cd "$airsane_build_dir"
+
+    log_info "Building AirSane (this may take a few minutes)..."
+    if ! cmake "$airsane_src_dir" 2>&1 | tail -5; then
+        log_warn "AirSane cmake configuration failed."
+        cd "$TMP_DIR"
+        return 1
+    fi
+
+    if ! make -j"$(nproc)" 2>&1 | tail -5; then
+        log_warn "AirSane compilation failed."
+        cd "$TMP_DIR"
+        return 1
+    fi
+    log_info "AirSane built successfully."
+
+    # Install (creates binary, systemd service, config files)
+    if ! sudo make install 2>&1 | tail -5; then
+        log_warn "AirSane installation failed."
+        cd "$TMP_DIR"
+        return 1
+    fi
+    cd "$TMP_DIR"
+    log_debug "AirSane installed to $(command -v airsaned 2>/dev/null || echo '/usr/local/bin/airsaned')"
+
+    # Ensure the saned user (which AirSane runs as) can access the Brother USB scanner.
+    # The sane-utils package creates the saned user; we add it to the scanner group
+    # and create a udev rule granting the scanner group access to the device.
+    if id saned &>/dev/null; then
+        sudo usermod -a -G scanner saned 2>/dev/null || true
+        sudo usermod -a -G lp saned 2>/dev/null || true
+        log_debug "Added saned user to scanner and lp groups"
+    fi
+
+    # Create udev rule so the Brother scanner is accessible by the scanner group
+    local udev_rule="/etc/udev/rules.d/60-brother-scanner.rules"
+    if [[ ! -f "$udev_rule" ]]; then
+        sudo tee "$udev_rule" > /dev/null << 'UDEV_EOF'
+# Brother DCP-130C scanner — allow scanner group access for saned/AirSane
+ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="01a8", MODE="0666", GROUP="scanner", ENV{libsane_matched}="yes"
+UDEV_EOF
+        sudo udevadm control --reload-rules 2>/dev/null || true
+        sudo udevadm trigger 2>/dev/null || true
+        log_debug "Created udev rule: $udev_rule"
+    else
+        log_debug "udev rule already exists: $udev_rule"
+    fi
+
+    # Enable and start AirSane service
+    sudo systemctl daemon-reload
+    sudo systemctl enable airsaned 2>/dev/null || log_warn "Failed to enable airsaned"
+    sudo systemctl start airsaned 2>/dev/null || log_warn "Failed to start airsaned"
+    log_debug "airsaned status: $(systemctl is-active airsaned 2>/dev/null || echo 'unknown')"
+
+    AIRSANE_INSTALLED=true
+    log_info "AirSane installed. Scanner is now discoverable by Windows, macOS, iOS, and Android."
+    return 0
 }
 
 # Install required dependencies
@@ -1418,6 +1533,18 @@ display_info() {
         log_info "  - saned is listening on port 6566 (via systemd socket activation)"
         if [[ -n "$ip_addr" ]]; then
             log_info "  - Remote clients can add '$ip_addr' to /etc/sane.d/net.conf"
+        fi
+        if [[ "$AIRSANE_INSTALLED" == true ]]; then
+            log_info "  - AirSane eSCL server: RUNNING (port 8090)"
+            log_info "  - Windows 10/11: Go to Settings > Bluetooth & devices > Printers & Scanners > Add Device"
+            log_info "  - macOS / iOS: The scanner appears in Image Capture and other scanning apps"
+            log_info "  - Android: Use the Mopria Scan app to discover and scan"
+            if [[ -n "$ip_addr" ]]; then
+                log_info "  - AirSane web interface: http://${ip_addr}:8090/"
+            fi
+        else
+            log_info "  - AirSane: NOT INSTALLED (Windows/macOS/iOS will not discover the scanner)"
+            log_info "    Only Linux SANE clients can use the shared scanner."
         fi
     else
         log_info "Scanner sharing: DISABLED (local only)"
