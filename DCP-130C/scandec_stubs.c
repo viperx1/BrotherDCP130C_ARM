@@ -316,7 +316,7 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
         char hexbuf[16*3 + 1];
         DWORD hexlen = w->dwLineDataSize < 16 ? w->dwLineDataSize : 16;
         for (DWORD i = 0; i < hexlen; i++)
-            sprintf(hexbuf + i*3, "%02X ", w->pLineData[i]);
+            snprintf(hexbuf + i*3, 4, "%02X ", w->pLineData[i]);
         if (hexlen > 0) hexbuf[hexlen*3 - 1] = '\0';
         else hexbuf[0] = '\0';
         fprintf(stderr, "[SCANDEC] Write #%d: comp=%d kind=%d "

@@ -1195,7 +1195,7 @@ except OSError as e:
                     if [[ -s "$test_stderr" ]]; then
                         # SCANDEC summary (shows whether decoder received/produced data)
                         local scandec_summary
-                        scandec_summary=$(grep "^\[SCANDEC\]" "$test_stderr" | grep -E "ScanDecOpen|ScanDecClose|ScanDecPageEnd" || true)
+                        scandec_summary=$(grep -E "^\[SCANDEC\].*(ScanDecOpen|ScanDecClose|ScanDecPageEnd)" "$test_stderr" || true)
                         if [[ -n "$scandec_summary" ]]; then
                             log_info "SCANDEC summary:"
                             echo "$scandec_summary" | while IFS= read -r line; do log_info "  $line"; done
