@@ -522,8 +522,10 @@ BOOL ScanDecClose(void)
         double throughput = g_stats.bytes_out ?
             (g_stats.bytes_out / 1024.0) / (total_ms / 1000.0) : 0;
         double backend_ms = total_ms - g_stats.write_ms;
-        double tail_ms = elapsed_ms(&g_stats.last_write, &now);
-        double scan_ms = total_ms - g_stats.first_data_ms - tail_ms;
+        double tail_ms = g_stats.got_first
+            ? elapsed_ms(&g_stats.last_write, &now) : 0;
+        double scan_ms = g_stats.got_first
+            ? total_ms - g_stats.first_data_ms - tail_ms : 0;
         double scan_rate = (g_stats.lines_total && scan_ms > 0)
             ? scan_ms / g_stats.lines_total : 0;
         fprintf(stderr,
