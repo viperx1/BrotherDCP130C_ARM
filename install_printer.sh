@@ -42,7 +42,6 @@ log_debug() {
 }
 
 # Variables
-PRINTER_MODEL="DCP-130C"
 PRINTER_NAME="Brother_DCP_130C"
 TMP_DIR="/tmp/brother_dcp130c_install"
 PRINTER_SHARED=false
