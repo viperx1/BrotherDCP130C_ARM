@@ -556,36 +556,53 @@ compile_arm_backend() {
         log_debug "Injected bus-scan debug instrumentation into brother2.c"
     fi
 
-    # Add debug instrumentation inside OpenDevice (brother_devaccs.c)
-    # to trace USB claim/control operations that follow WriteLog.
+    # Add debug instrumentation and stall detection inside ReadDeviceData
+    # (brother_devaccs.c). The DCP-130C scanner sends all scan data then
+    # simply stops sending without an explicit end-of-page marker. The
+    # backend loops forever calling ReadDeviceData which returns 0 bytes
+    # with iReadStatus=2 ("reading"). After STALL_THRESHOLD consecutive
+    # zero-byte reads, we force nResultSize=-1 which signals "end of data"
+    # to ReadNonFixedData, causing bReadbufEnd=TRUE and ending the scan.
     local devaccs_c="$brscan_src/backend_src/brother_devaccs.c"
     if [[ -f "$devaccs_c" ]]; then
         log_debug "Injected OpenDevice debug instrumentation into brother_devaccs.c"
 
-        # Add ReadDeviceData tracing for USB read debugging.
-        # The scan timeout occurs during ReadDeviceData where
-        # usb_bulk_read returns 0 bytes repeatedly. We rate-limit
-        # the trace to avoid flooding stderr: log every 50th read
-        # call and always log transitions (nResultSize changing).
-        # Also inject a static counter and prev-result tracker.
+        # Inject static counters and stall detection before the WriteLog
+        # at the start of ReadDeviceData.
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/i\
 {\
 \tstatic int _rdd_count = 0;\
 \tstatic int _rdd_prev_result = -1;\
+\tstatic int _rdd_zero_streak = 0;\
+\tstatic int _rdd_had_data = 0;\
 \t_rdd_count++;' "$devaccs_c"
 
         sed -i '/WriteLog.*ReadDeviceData Start nReadSize/a\
 \tif (_rdd_count <= 3 || _rdd_count % 50 == 0)\
 \t\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData[%d]: nReadSize=%d iReadStatus=%d\\n", _rdd_count, nReadSize, iReadStatus); fflush(stderr);' "$devaccs_c"
 
+        # After the ReadEnd WriteLog, add stall detection:
+        # If we previously received data (_rdd_had_data) and now get
+        # STALL_THRESHOLD (200) consecutive zero-byte reads, force EOF.
         sed -i '/WriteLog.*ReadDeviceData ReadEnd nResultSize/a\
+\tif (nResultSize > 0) {\
+\t\t_rdd_zero_streak = 0;\
+\t\t_rdd_had_data = 1;\
+\t} else if (_rdd_had_data) {\
+\t\t_rdd_zero_streak++;\
+\t\tif (_rdd_zero_streak >= 200) {\
+\t\t\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData[%d]: STALL DETECTED — %d consecutive zero-byte reads after data, forcing EOF\\n", _rdd_count, _rdd_zero_streak); fflush(stderr);\
+\t\t\tnResultSize = -1;\
+\t\t\t_rdd_zero_streak = 0;\
+\t\t}\
+\t}\
 \tif (nResultSize != _rdd_prev_result || _rdd_count <= 3 || _rdd_count % 50 == 0) {\
 \t\tfprintf(stderr, "[BROTHER2-DBG] ReadDeviceData[%d]: nResultSize=%d\\n", _rdd_count, nResultSize); fflush(stderr);\
 \t\t_rdd_prev_result = nResultSize;\
 \t}\
 }' "$devaccs_c"
 
-        log_debug "Injected ReadDeviceData debug instrumentation into brother_devaccs.c"
+        log_debug "Injected ReadDeviceData stall detection into brother_devaccs.c"
     fi
 
     # Add scan-progress debug instrumentation into brother2.c and
@@ -1193,6 +1210,14 @@ except OSError as e:
 
                     # Structured timeout diagnostics
                     if [[ -s "$test_stderr" ]]; then
+                        # Check if stall detection triggered (it should now!)
+                        local stall_msg
+                        stall_msg=$(grep '^\[BROTHER2-DBG\].*STALL DETECTED' "$test_stderr" || true)
+                        if [[ -n "$stall_msg" ]]; then
+                            log_info "Stall detection triggered:"
+                            echo "$stall_msg" | while IFS= read -r line; do log_info "  $line"; done
+                        fi
+
                         # SCANDEC summary (shows whether decoder received/produced data)
                         local scandec_summary
                         scandec_summary=$(grep -E "^\[SCANDEC\].*(ScanDecOpen|ScanDecClose|ScanDecPageEnd)" "$test_stderr" || true)
