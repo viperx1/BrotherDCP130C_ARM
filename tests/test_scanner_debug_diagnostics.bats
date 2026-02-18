@@ -547,3 +547,88 @@ CEOF
     [[ "$stderr_out" == *"advice:"* ]]
     [[ "$stderr_out" == *"Full-Speed USB"* ]]
 }
+
+# --- timestamp tests ---
+
+@test "scandec: debug output includes wall-clock timestamps" {
+    cat > "$TEST_TMPDIR/test_ts.c" << 'CEOF'
+#include <string.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0200; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    BYTE line[100], out[200]; memset(line, 128, 100);
+    SCANDEC_WRITE w = {2, 0, line, 100, out, 200, 0}; INT st;
+    ScanDecWrite(&w, &st);
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_ts" "$TEST_TMPDIR/test_ts.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_ts" 2>&1 >/dev/null)
+    # Timestamp format: HH:MM:SS.mmm [SCANDEC]
+    [[ "$stderr_out" =~ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\ \[SCANDEC\] ]]
+}
+
+@test "backend_init: debug output includes wall-clock timestamps" {
+    cat > "$TEST_TMPDIR/test_main.c" << 'CEOF'
+int main(void) { return 0; }
+CEOF
+    gcc -o "$TEST_TMPDIR/test_main" "$TEST_TMPDIR/test_main.c"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_PRELOAD="$TEST_TMPDIR/libbackend_test.so" \
+        "$TEST_TMPDIR/test_main" 2>&1 >/dev/null)
+    # Timestamp format: HH:MM:SS.mmm [BROTHER2]
+    [[ "$stderr_out" =~ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\ \[BROTHER2\] ]]
+}
+
+@test "brcolor: debug output includes wall-clock timestamps" {
+    cat > "$TEST_TMPDIR/test_brcolor.c" << 'CEOF'
+typedef int BOOL; typedef unsigned char BYTE; typedef char *LPSTR;
+#pragma pack(1)
+typedef struct { int nRgbLine, nPaperType, nMachineId; LPSTR lpLutName; } CMATCH_INIT;
+#pragma pack()
+extern BOOL ColorMatchingInit(CMATCH_INIT d);
+extern void ColorMatchingEnd(void);
+int main(void) {
+    CMATCH_INIT ci = {100, 1, 1, 0};
+    ColorMatchingInit(ci);
+    ColorMatchingEnd();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_brcolor" "$TEST_TMPDIR/test_brcolor.c" \
+        "$TEST_TMPDIR/libbrcolm_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_brcolor" 2>&1 >/dev/null)
+    # Timestamp format: HH:MM:SS.mmm [BRCOLOR]
+    [[ "$stderr_out" =~ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\ \[BRCOLOR\] ]]
+}
+
+@test "scandec: summary includes scanner buffer drain explanation" {
+    grep -q 'scanner head may finish physically' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'buffers scan data internally' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'min USB xfer' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scanner: ReadDeviceData EOF message includes timestamp" {
+    grep -q 'tm_hour.*tm_min.*tm_sec' "$PROJECT_ROOT/install_scanner.sh"
+}

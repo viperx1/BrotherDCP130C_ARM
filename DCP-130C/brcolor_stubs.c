@@ -18,6 +18,7 @@
  */
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 typedef int           BOOL;
 typedef unsigned char BYTE;
@@ -29,6 +30,21 @@ typedef char         *LPSTR;
 static int g_colm_debug = 0;
 static unsigned long g_colm_calls = 0;
 static unsigned long g_colm_bytes = 0;
+
+/*
+ * Format current wall-clock time as "HH:MM:SS.mmm" into a static buffer.
+ */
+static const char *debug_ts(void) {
+    static char buf[16];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (int)(ts.tv_nsec / 1000000));
+    return buf;
+}
 
 #pragma pack(1)
 typedef struct {
@@ -46,9 +62,9 @@ BOOL ColorMatchingInit(CMATCH_INIT d)
     g_colm_calls = 0;
     g_colm_bytes = 0;
     if (g_colm_debug) {
-        fprintf(stderr, "[BRCOLOR] ColorMatchingInit: rgbLine=%d paperType=%d "
+        fprintf(stderr, "%s [BRCOLOR] ColorMatchingInit: rgbLine=%d paperType=%d "
                 "machineId=%d (pass-through, no ICC applied)\n",
-                d.nRgbLine, d.nPaperType, d.nMachineId);
+                debug_ts(), d.nRgbLine, d.nPaperType, d.nMachineId);
     }
     (void)d;
     return TRUE;
@@ -57,8 +73,8 @@ BOOL ColorMatchingInit(CMATCH_INIT d)
 void ColorMatchingEnd(void)
 {
     if (g_colm_debug) {
-        fprintf(stderr, "[BRCOLOR] ColorMatchingEnd: %lu calls, %lu bytes processed "
-                "(pass-through)\n", g_colm_calls, g_colm_bytes);
+        fprintf(stderr, "%s [BRCOLOR] ColorMatchingEnd: %lu calls, %lu bytes processed "
+                "(pass-through)\n", debug_ts(), g_colm_calls, g_colm_bytes);
     }
 }
 

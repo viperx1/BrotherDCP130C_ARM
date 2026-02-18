@@ -589,8 +589,12 @@ compile_arm_backend() {
 \t\t\tif (_rdd_zero_streak >= STALL_THRESHOLD) {\
 \t\t\t\tif (_rdd_debug) {\
 \t\t\t\t\tunsigned long _data_reads = _rdd_reads - _rdd_zero_reads;\
-\t\t\t\t\tfprintf(stderr, "[BROTHER2] ReadDeviceData EOF: %lu reads (%lu zero), "\
+\t\t\t\t\ttime_t _now = time(NULL);\
+\t\t\t\t\tstruct tm _tm;\
+\t\t\t\t\tlocaltime_r(&_now, &_tm);\
+\t\t\t\t\tfprintf(stderr, "%02d:%02d:%02d [BROTHER2] ReadDeviceData EOF: %lu reads (%lu zero), "\
 \t\t\t\t\t\t"%lu bytes total (avg %lu bytes/read), stall timeout %d ms\\n",\
+\t\t\t\t\t\t_tm.tm_hour, _tm.tm_min, _tm.tm_sec,\
 \t\t\t\t\t\t_rdd_reads, _rdd_zero_reads, _rdd_total_bytes,\
 \t\t\t\t\t\t_data_reads > 0 ? _rdd_total_bytes / _data_reads : 0,\
 \t\t\t\t\t\tSTALL_THRESHOLD * 2);\

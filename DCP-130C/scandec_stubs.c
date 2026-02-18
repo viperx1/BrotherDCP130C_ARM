@@ -49,6 +49,22 @@ static double elapsed_ms(struct timespec *start, struct timespec *end) {
     return timespec_ms(end) - timespec_ms(start);
 }
 
+/*
+ * Format current wall-clock time as "HH:MM:SS.mmm" into a static buffer.
+ * Returns pointer to the static buffer (not thread-safe, fine for debug).
+ */
+static const char *debug_ts(void) {
+    static char buf[16];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (int)(ts.tv_nsec / 1000000));
+    return buf;
+}
+
 /* Scan statistics for debug reporting */
 static struct {
     unsigned long lines_total;
@@ -85,7 +101,7 @@ static void scandec_init(void) {
     const char *env = getenv("BROTHER_DEBUG");
     if (env && env[0] == '1') {
         g_debug = 1;
-        fprintf(stderr, "[SCANDEC] debug diagnostics enabled (BROTHER_DEBUG=1)\n");
+        fprintf(stderr, "%s [SCANDEC] debug diagnostics enabled (BROTHER_DEBUG=1)\n", debug_ts());
     }
 }
 
@@ -254,8 +270,9 @@ BOOL ScanDecOpen(SCANDEC_OPEN *p)
     if (g_debug) {
         const char *mode = (g_bpp == 3) ? "24-bit RGB" :
                            (g_bpp == 1) ? "8-bit gray" : "1-bit B&W";
-        fprintf(stderr, "[SCANDEC] ScanDecOpen: %lux%lu px, reso %dx%d→%dx%d, "
+        fprintf(stderr, "%s [SCANDEC] ScanDecOpen: %lux%lu px, reso %dx%d→%dx%d, "
                 "mode=%s, outLine=%lu bytes\n",
+                debug_ts(),
                 (unsigned long)p->dwInLinePixCnt,
                 (unsigned long)p->dwOutLinePixCnt,
                 p->nInResoX, p->nInResoY,
@@ -387,9 +404,10 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
                 double total_ms = elapsed_ms(&g_stats.open_time, &t_end);
                 double interval_ms = elapsed_ms(&g_stats.last_progress, &t_end);
                 g_stats.last_progress = t_end;
-                fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
+                fprintf(stderr, "%s [SCANDEC] progress: %lu lines, %.1f ms elapsed, "
                         "last 100 in %.1f ms (%.1f ms/line), "
                         "%.2f ms/line decode avg, max gap %.1f ms\n",
+                        debug_ts(),
                         g_stats.lines_total, total_ms,
                         interval_ms, interval_ms / 100.0,
                         g_stats.write_ms / g_stats.lines_total,
@@ -483,9 +501,10 @@ DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st)
             double total_ms = elapsed_ms(&g_stats.open_time, &t_end);
             double interval_ms = elapsed_ms(&g_stats.last_progress, &t_end);
             g_stats.last_progress = t_end;
-            fprintf(stderr, "[SCANDEC] progress: %lu lines, %.1f ms elapsed, "
+            fprintf(stderr, "%s [SCANDEC] progress: %lu lines, %.1f ms elapsed, "
                     "last 100 in %.1f ms (%.1f ms/line), "
                     "%.2f ms/line decode avg, max gap %.1f ms\n",
+                    debug_ts(),
                     g_stats.lines_total, total_ms,
                     interval_ms, interval_ms / 100.0,
                     g_stats.write_ms / g_stats.lines_total,
@@ -503,8 +522,9 @@ DWORD ScanDecPageEnd(SCANDEC_WRITE *w, INT *st)
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double total_ms = elapsed_ms(&g_stats.open_time, &now);
-        fprintf(stderr, "[SCANDEC] ScanDecPageEnd: %lu lines in %.1f ms "
+        fprintf(stderr, "%s [SCANDEC] ScanDecPageEnd: %lu lines in %.1f ms "
                 "(%.1f lines/sec)\n",
+                debug_ts(),
                 g_stats.lines_total, total_ms,
                 g_stats.lines_total ? g_stats.lines_total / (total_ms / 1000.0) : 0);
     }
@@ -528,12 +548,15 @@ BOOL ScanDecClose(void)
             ? total_ms - g_stats.first_data_ms - tail_ms : 0;
         double scan_rate = (g_stats.lines_total && scan_ms > 0)
             ? scan_ms / g_stats.lines_total : 0;
+        /* Estimate minimum transfer time based on data size and USB bandwidth */
+        double min_xfer_sec = g_stats.bytes_out > 0
+            ? g_stats.bytes_out / (70.0 * 1024.0) : 0;  /* ~70 KB/s Full-Speed */
         fprintf(stderr,
-                "[SCANDEC] === scan session summary ===\n"
-                "[SCANDEC]   total time:    %.1f ms\n"
+                "%s [SCANDEC] === scan session summary ===\n"
+                "[SCANDEC]   total time:    %.1f ms (%.1f sec)\n"
                 "[SCANDEC]   lines:         %lu (white=%lu noncomp=%lu pack=%lu unknown=%lu)\n"
                 "[SCANDEC]   RGB planes:    %lu\n"
-                "[SCANDEC]   data in/out:   %lu / %lu bytes\n"
+                "[SCANDEC]   data in/out:   %lu / %lu bytes (%.1f MB)\n"
                 "[SCANDEC]   decode time:   %.1f ms total (%.3f ms/line avg)\n"
                 "[SCANDEC]   backend time:  %.1f ms (%.1f%% — USB I/O + protocol)\n"
                 "[SCANDEC]   max write:     %.3f ms (single call)\n"
@@ -542,13 +565,16 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   first data:    %.1f ms after open (scanner warm-up)\n"
                 "[SCANDEC]   tail latency:  %.1f ms after last data (stall detection)\n"
                 "[SCANDEC]   scan rate:     %.1f ms/line (%.1f lines/sec during active scan)\n"
-                "[SCANDEC]   throughput:    %.1f KB/s\n",
-                total_ms,
+                "[SCANDEC]   throughput:    %.1f KB/s\n"
+                "[SCANDEC]   min USB xfer:  %.1f sec for %.1f MB at ~70 KB/s Full-Speed\n",
+                debug_ts(),
+                total_ms, total_ms / 1000.0,
                 g_stats.lines_total,
                 g_stats.lines_white, g_stats.lines_noncomp,
                 g_stats.lines_pack, g_stats.lines_unknown,
                 g_stats.rgb_planes,
                 g_stats.bytes_in, g_stats.bytes_out,
+                g_stats.bytes_out / (1024.0 * 1024.0),
                 g_stats.write_ms,
                 g_stats.lines_total ? g_stats.write_ms / g_stats.lines_total : 0,
                 backend_ms,
@@ -561,7 +587,9 @@ BOOL ScanDecClose(void)
                 tail_ms,
                 scan_rate,
                 scan_rate > 0 ? 1000.0 / scan_rate : 0,
-                throughput);
+                throughput,
+                min_xfer_sec,
+                g_stats.bytes_out / (1024.0 * 1024.0));
         /* Human-readable diagnosis */
         double decode_pct = total_ms > 0
             ? (g_stats.write_ms / total_ms) * 100.0 : 0;
@@ -576,6 +604,14 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   - Lower resolutions (e.g. 150 DPI) scan faster than higher ones.\n"
                 "[SCANDEC]   - Grayscale mode transfers 3x less data than 24-bit color.\n"
                 "[SCANDEC]   - Ensure no other process contends for the USB device (check: lsof /dev/bus/usb/*).\n");
+            if (min_xfer_sec > 0) {
+                fprintf(stderr,
+                    "[SCANDEC] note: the scanner head may finish physically before the USB transfer\n"
+                    "[SCANDEC]   completes. The DCP-130C buffers scan data internally and continues\n"
+                    "[SCANDEC]   transmitting over USB after the head returns home. %.1f MB of data\n"
+                    "[SCANDEC]   requires at least %.0f seconds to transfer at Full-Speed USB.\n",
+                    g_stats.bytes_out / (1024.0 * 1024.0), min_xfer_sec);
+            }
         } else if (g_stats.lines_total > 0) {
             fprintf(stderr,
                 "[SCANDEC] diagnosis: decode uses %.1f%% of scan time "
