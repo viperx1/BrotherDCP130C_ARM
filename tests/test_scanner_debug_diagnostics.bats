@@ -672,8 +672,8 @@ CEOF
 }
 
 @test "scanner: display_info explains scanner buffer drain behavior" {
-    grep -q 'scanner head may finish physically' "$PROJECT_ROOT/install_scanner.sh"
-    grep -q 'buffers scan data internally' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'scanner head finishes physically' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'buffers data internally' "$PROJECT_ROOT/install_scanner.sh"
 }
 
 @test "scanner: display_info explains CPU does not affect scan speed" {
@@ -770,4 +770,47 @@ CEOF
 @test "scanner: compile_arm_backend lists failed URLs on download failure" {
     grep -q 'Failed to download brscan2 source code from all URLs' "$PROJECT_ROOT/install_scanner.sh"
     grep -q 'URLs tried:' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- compression and data transfer analysis tests ---
+
+@test "scandec: summary includes compression ratio" {
+    grep -q 'compression:.*ratio' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'compress_ratio' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: summary includes wire throughput" {
+    grep -q 'USB wire' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: diagnosis explains compression modes used by scanner" {
+    grep -q 'scanner DOES compress data before sending' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'PackBits run-length encoding' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "scandec: diagnosis includes Windows comparison" {
+    grep -q 'original Windows driver had the same USB bandwidth limit' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+    grep -q 'physical USB transfer speed is' "$PROJECT_ROOT/DCP-130C/scandec_stubs.c"
+}
+
+@test "backend_init: reports scanner compression info" {
+    grep -q 'PackBits.*compression' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'White lines are sent as single-byte' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: includes Windows comparison for transfer speed" {
+    grep -q 'original Windows driver had the SAME USB speed limit' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'physical USB transfer speed is identical' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "scanner: display_info explains compression used by scanner" {
+    grep -q 'Data compression:' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'scanner DOES compress data before sending' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'PackBits' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains why scanning seems slower than Windows" {
+    grep -q 'Why scanning seems slower than on Windows:' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'USB transfer speed is identical on all platforms' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'progress bar' "$PROJECT_ROOT/install_scanner.sh"
 }

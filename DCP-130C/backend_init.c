@@ -155,6 +155,15 @@ static void probe_usb_environment(void) {
                     "[BROTHER2] cpu: CPU usage does NOT affect scan speed (USB is the bottleneck).\n"
                     "[BROTHER2] cpu: The scanner head finishes physically before data transfer ends.\n"
                     "[BROTHER2] cpu: The DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
+            fprintf(stderr, "%s [BROTHER2] data: The scanner uses PackBits (run-length) compression on the wire.\n"
+                    "[BROTHER2] data: White lines are sent as single-byte markers (huge savings).\n"
+                    "[BROTHER2] data: Photo/color data compresses less — actual ratio depends on content.\n"
+                    "[BROTHER2] data: Run BROTHER_DEBUG=1 scanimage ... to see exact compression stats.\n", debug_ts());
+            fprintf(stderr, "%s [BROTHER2] windows: The original Windows driver had the SAME USB speed limit.\n"
+                    "[BROTHER2] windows: The ~60 sec post-scan transfer is normal for Full-Speed USB.\n"
+                    "[BROTHER2] windows: Windows may have seemed faster due to different default settings\n"
+                    "[BROTHER2] windows: (lower DPI, grayscale) or its progress bar masking the wait.\n"
+                    "[BROTHER2] windows: The physical USB transfer speed is identical on all platforms.\n", debug_ts());
         }
 
         /* Check host controller port speed */

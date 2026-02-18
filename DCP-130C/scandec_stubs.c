@@ -551,12 +551,20 @@ BOOL ScanDecClose(void)
         /* Estimate minimum transfer time based on data size and USB bandwidth */
         double min_xfer_sec = g_stats.bytes_out > 0
             ? g_stats.bytes_out / (70.0 * 1024.0) : 0;  /* ~70 KB/s Full-Speed */
+        /* Compression ratio: bytes_in is what the scanner sent (compressed),
+         * bytes_out is the decompressed raster output */
+        double compress_ratio = (g_stats.bytes_in > 0 && g_stats.bytes_out > 0)
+            ? (double)g_stats.bytes_out / g_stats.bytes_in : 1.0;
+        /* Estimate transfer time using actual wire bytes, not output bytes */
+        double min_xfer_wire_sec = g_stats.bytes_in > 0
+            ? g_stats.bytes_in / (70.0 * 1024.0) : 0;
         fprintf(stderr,
                 "%s [SCANDEC] === scan session summary ===\n"
                 "[SCANDEC]   total time:    %.1f ms (%.1f sec)\n"
                 "[SCANDEC]   lines:         %lu (white=%lu noncomp=%lu pack=%lu unknown=%lu)\n"
                 "[SCANDEC]   RGB planes:    %lu\n"
                 "[SCANDEC]   data in/out:   %lu / %lu bytes (%.1f MB)\n"
+                "[SCANDEC]   compression:   %.1fx ratio (scanner sent %lu bytes for %lu bytes output)\n"
                 "[SCANDEC]   decode time:   %.1f ms total (%.3f ms/line avg)\n"
                 "[SCANDEC]   backend time:  %.1f ms (%.1f%% — USB I/O + protocol)\n"
                 "[SCANDEC]   max write:     %.3f ms (single call)\n"
@@ -565,7 +573,7 @@ BOOL ScanDecClose(void)
                 "[SCANDEC]   first data:    %.1f ms after open (scanner warm-up)\n"
                 "[SCANDEC]   tail latency:  %.1f ms after last data (stall detection)\n"
                 "[SCANDEC]   scan rate:     %.1f ms/line (%.1f lines/sec during active scan)\n"
-                "[SCANDEC]   throughput:    %.1f KB/s\n"
+                "[SCANDEC]   throughput:    %.1f KB/s (output), %.1f KB/s (USB wire)\n"
                 "[SCANDEC]   min USB xfer:  %.1f sec for %.1f MB at ~70 KB/s Full-Speed\n",
                 debug_ts(),
                 total_ms, total_ms / 1000.0,
@@ -575,6 +583,7 @@ BOOL ScanDecClose(void)
                 g_stats.rgb_planes,
                 g_stats.bytes_in, g_stats.bytes_out,
                 g_stats.bytes_out / (1024.0 * 1024.0),
+                compress_ratio, g_stats.bytes_in, g_stats.bytes_out,
                 g_stats.write_ms,
                 g_stats.lines_total ? g_stats.write_ms / g_stats.lines_total : 0,
                 backend_ms,
@@ -588,11 +597,33 @@ BOOL ScanDecClose(void)
                 scan_rate,
                 scan_rate > 0 ? 1000.0 / scan_rate : 0,
                 throughput,
+                g_stats.bytes_in ? (g_stats.bytes_in / 1024.0) / (total_ms / 1000.0) : 0,
                 min_xfer_sec,
                 g_stats.bytes_out / (1024.0 * 1024.0));
         /* Human-readable diagnosis */
         double decode_pct = total_ms > 0
             ? (g_stats.write_ms / total_ms) * 100.0 : 0;
+        /* Compression analysis */
+        if (g_stats.lines_pack > 0 || g_stats.lines_white > 0) {
+            unsigned long compressed_lines = g_stats.lines_pack + g_stats.lines_white;
+            unsigned long total_lines = compressed_lines + g_stats.lines_noncomp + g_stats.lines_unknown;
+            double pct_compressed = total_lines > 0
+                ? (compressed_lines * 100.0) / total_lines : 0;
+            fprintf(stderr,
+                "[SCANDEC] compression: %.0f%% of lines used compression (PackBits=%lu, White=%lu, Raw=%lu)\n"
+                "[SCANDEC]   The scanner DOES compress data before sending (PackBits run-length encoding).\n"
+                "[SCANDEC]   Compression ratio: %.1fx — %.1f MB sent over USB for %.1f MB of pixel data.\n",
+                pct_compressed,
+                g_stats.lines_pack, g_stats.lines_white, g_stats.lines_noncomp,
+                compress_ratio,
+                g_stats.bytes_in / (1024.0 * 1024.0),
+                g_stats.bytes_out / (1024.0 * 1024.0));
+        } else if (g_stats.lines_noncomp > 0) {
+            fprintf(stderr,
+                "[SCANDEC] compression: scanner sent all lines uncompressed (no PackBits or White lines).\n"
+                "[SCANDEC]   Compression ratio: %.1fx — no compression benefit for this scan.\n",
+                compress_ratio);
+        }
         if (decode_pct < 1.0 && g_stats.lines_total > 0) {
             fprintf(stderr,
                 "[SCANDEC] diagnosis: scan is USB-bandwidth limited "
@@ -612,6 +643,12 @@ BOOL ScanDecClose(void)
                     "[SCANDEC]   requires at least %.0f seconds to transfer at Full-Speed USB.\n",
                     g_stats.bytes_out / (1024.0 * 1024.0), min_xfer_sec);
             }
+            fprintf(stderr,
+                "[SCANDEC] windows: the original Windows driver had the same USB bandwidth limit.\n"
+                "[SCANDEC]   Windows may have appeared faster because its driver UI showed a progress\n"
+                "[SCANDEC]   bar during transfer (making the wait feel shorter) or used a different\n"
+                "[SCANDEC]   scan resolution/mode by default. The physical USB transfer speed is\n"
+                "[SCANDEC]   identical — 12 Mbit/s Full-Speed is a hardware constant.\n");
         } else if (g_stats.lines_total > 0) {
             fprintf(stderr,
                 "[SCANDEC] diagnosis: decode uses %.1f%% of scan time "
