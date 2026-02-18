@@ -568,8 +568,14 @@ BOOL ScanDecClose(void)
         if (decode_pct < 1.0 && g_stats.lines_total > 0) {
             fprintf(stderr,
                 "[SCANDEC] diagnosis: scan is USB-bandwidth limited "
-                "(decode < 1%% of time). %.1f KB/s is typical for USB 1.1 full-speed.\n",
+                "(decode < 1%% of time). %.1f KB/s is normal for USB 1.1.\n",
                 throughput);
+            fprintf(stderr,
+                "[SCANDEC] advice: this is a hardware limit of the DCP-130C's USB 1.1 interface.\n"
+                "[SCANDEC]   - The scanner itself is the bottleneck, not the software.\n"
+                "[SCANDEC]   - Lower resolutions (e.g. 150 DPI) scan faster than higher ones.\n"
+                "[SCANDEC]   - Grayscale mode transfers 3x less data than 24-bit color.\n"
+                "[SCANDEC]   - Ensure no other process contends for the USB device (check: lsof /dev/bus/usb/*).\n");
         } else if (g_stats.lines_total > 0) {
             fprintf(stderr,
                 "[SCANDEC] diagnosis: decode uses %.1f%% of scan time "

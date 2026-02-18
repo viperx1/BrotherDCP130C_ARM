@@ -262,6 +262,18 @@ CEOF
     [[ -z "$stderr_out" ]]
 }
 
+@test "backend_init: probes USB environment with BROTHER_DEBUG=1" {
+    cat > "$TEST_TMPDIR/test_main.c" << 'CEOF'
+int main(void) { return 0; }
+CEOF
+    gcc -o "$TEST_TMPDIR/test_main" "$TEST_TMPDIR/test_main.c"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_PRELOAD="$TEST_TMPDIR/libbackend_test.so" \
+        "$TEST_TMPDIR/test_main" 2>&1 >/dev/null)
+    # Should report either a found device or "no Brother device found"
+    [[ "$stderr_out" == *"[BROTHER2] usb:"* ]]
+}
+
 # --- scandec RGB mode compression tracking ---
 
 @test "scandec: RGB mode tracks compression stats per-plane" {
@@ -480,4 +492,50 @@ CEOF
 
 @test "scanner: ReadDeviceData EOF message includes stall timeout" {
     grep -q 'stall timeout' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info includes performance notes" {
+    grep -q 'USB 1.1' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'hardware limit' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'BROTHER_DEBUG=1' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scandec: diagnosis includes actionable advice for USB-limited scan" {
+    cat > "$TEST_TMPDIR/test_advice.c" << 'CEOF'
+#include <string.h>
+#include <unistd.h>
+typedef int BOOL; typedef int INT; typedef unsigned char BYTE;
+typedef unsigned long DWORD; typedef void *HANDLE;
+typedef struct {
+    INT nInResoX, nInResoY, nOutResoX, nOutResoY, nColorType;
+    DWORD dwInLinePixCnt; INT nOutDataKind; BOOL bLongBoundary;
+    DWORD dwOutLinePixCnt, dwOutLineByte, dwOutWriteMaxSize;
+} SCANDEC_OPEN;
+typedef struct {
+    INT nInDataComp, nInDataKind; BYTE *pLineData; DWORD dwLineDataSize;
+    BYTE *pWriteBuff; DWORD dwWriteBuffSize; BOOL bReverWrite;
+} SCANDEC_WRITE;
+extern BOOL ScanDecOpen(SCANDEC_OPEN *p);
+extern BOOL ScanDecClose(void);
+extern DWORD ScanDecWrite(SCANDEC_WRITE *w, INT *st);
+int main(void) {
+    SCANDEC_OPEN op; memset(&op, 0, sizeof(op));
+    op.nColorType = 0x0200; op.dwInLinePixCnt = 100;
+    ScanDecOpen(&op);
+    /* Simulate USB-limited scan: delay between open and write so decode_pct < 1% */
+    usleep(10000);  /* 10ms delay simulates USB I/O wait */
+    BYTE line[100], out[200]; memset(line, 128, 100);
+    SCANDEC_WRITE w = {2, 0, line, 100, out, 200, 0}; INT st;
+    ScanDecWrite(&w, &st);
+    ScanDecClose();
+    return 0;
+}
+CEOF
+    gcc -o "$TEST_TMPDIR/test_advice" "$TEST_TMPDIR/test_advice.c" \
+        "$TEST_TMPDIR/libscandec_test.so" -Wl,-rpath,"$TEST_TMPDIR"
+    local stderr_out
+    stderr_out=$(BROTHER_DEBUG=1 LD_LIBRARY_PATH="$TEST_TMPDIR" \
+        "$TEST_TMPDIR/test_advice" 2>&1 >/dev/null)
+    [[ "$stderr_out" == *"advice:"* ]]
+    [[ "$stderr_out" == *"hardware limit"* ]]
 }

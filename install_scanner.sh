@@ -1116,6 +1116,16 @@ display_info() {
     log_info "To check SANE configuration:"
     log_info "  brsaneconfig2 -q"
     echo
+    log_info "Performance notes:"
+    log_info "  The DCP-130C uses USB 1.1 (12 Mbit/s), which limits scan throughput"
+    log_info "  to ~70 KB/s. A full-page 150 DPI color scan takes ~90 seconds."
+    log_info "  This is a hardware limit — the scanner itself is the bottleneck."
+    log_info "  Tips for faster scans:"
+    log_info "    - Use grayscale mode (3x less data than color)"
+    log_info "    - Use 150 DPI instead of 300 DPI (4x less data)"
+    log_info "    - Ensure usblp is unbound: echo '<intf>' | sudo tee /sys/bus/usb/drivers/usblp/unbind"
+    log_info "  For debug diagnostics, scan with: sudo BROTHER_DEBUG=1 scanimage ..."
+    echo
     log_info "If the scanner is not detected, try:"
     log_info "  1. Disconnect and reconnect the USB cable"
     log_info "  2. Run: sudo scanimage -L"
