@@ -841,6 +841,57 @@ a\
     return 0
 }
 
+# Diagnose USB speed for Brother scanner.
+# Reads sysfs speed attribute to report negotiated link rate and
+# explains whether High-Speed (480 Mbit/s) is possible.
+diagnose_usb_speed() {
+    local found=0
+    for devpath in /sys/bus/usb/devices/*/idVendor; do
+        local ddir
+        ddir=$(dirname "$devpath")
+        local vid
+        vid=$(cat "$ddir/idVendor" 2>/dev/null) || continue
+        [[ "$vid" == "04f9" ]] || continue
+        found=1
+
+        local speed version product
+        speed=$(cat "$ddir/speed" 2>/dev/null || echo "?")
+        version=$(cat "$ddir/version" 2>/dev/null | tr -d ' ' || echo "?")
+        product=$(cat "$ddir/product" 2>/dev/null || echo "Brother device")
+
+        log_debug "USB device: $product at $(basename "$ddir")"
+        log_debug "  Negotiated speed: ${speed} Mbit/s"
+        log_debug "  USB descriptor version: $version"
+
+        if [[ "$speed" == "12" ]]; then
+            log_info "USB speed: 12 Mbit/s (Full-Speed)."
+            log_info "  The DCP-130C is a 'USB 2.0 Full-Speed' device."
+            log_info "  It is USB 2.0 compliant but only has a Full-Speed transceiver."
+            log_info "  High-Speed (480 Mbit/s) is NOT supported by this hardware."
+            log_info "  This cannot be changed — it is a silicon-level limitation."
+        elif [[ "$speed" == "480" ]]; then
+            log_info "USB speed: 480 Mbit/s (High-Speed). Unexpected for DCP-130C."
+        else
+            log_debug "USB speed: ${speed} Mbit/s"
+        fi
+
+        # Check host controller speed capability
+        local parent_speed
+        local parent_dir
+        parent_dir=$(dirname "$ddir")
+        parent_speed=$(cat "$parent_dir/speed" 2>/dev/null || echo "")
+        if [[ -n "$parent_speed" ]]; then
+            log_debug "  Host port speed: ${parent_speed} Mbit/s"
+            if [[ "$parent_speed" == "480" || "$parent_speed" == "5000" || "$parent_speed" == "10000" ]]; then
+                log_debug "  Host supports High-Speed — device is the bottleneck."
+            fi
+        fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+        log_debug "No Brother USB device found for speed diagnosis."
+    fi
+}
+
 # Detect scanner USB connection
 detect_scanner() {
     log_info "Detecting Brother DCP-130C scanner..."
@@ -852,6 +903,7 @@ detect_scanner() {
     if lsusb | grep -i "Brother"; then
         log_info "Brother device detected on USB."
         lsusb | grep -i "Brother"
+        diagnose_usb_speed
     else
         log_warn "Brother device not detected on USB. Please ensure the scanner is connected and powered on."
     fi
@@ -1128,10 +1180,26 @@ display_info() {
     log_info "Performance notes:"
     log_info "  The DCP-130C is a USB 2.0 Full-Speed device (12 Mbit/s)."
     log_info "  'Full-Speed' means 12 Mbit/s — NOT High-Speed (480 Mbit/s)."
+    log_info "  This is a hardware limit of the scanner's USB transceiver."
+    log_info "  Forcing USB 2.0 High-Speed (480 Mbit/s) is NOT possible — the"
+    log_info "  scanner only has a Full-Speed PHY. This cannot be changed by"
+    log_info "  software, cables, or host controller settings."
     log_info "  This limits scan throughput to ~70 KB/s by design."
     log_info "  A full-page 150 DPI color scan takes ~90 seconds."
-    log_info "  This is a hardware limit — the scanner itself is the bottleneck."
-    log_info "  Tips for faster scans:"
+    echo
+    log_info "CPU usage during scanning:"
+    log_info "  scanimage may show high CPU usage during scans. This is caused by"
+    log_info "  the USB bulk-read polling loop in the SANE backend — it repeatedly"
+    log_info "  calls usb_bulk_read() waiting for data from the scanner."
+    log_info "  The scanner head may finish physically around line 400-500 but the"
+    log_info "  DCP-130C buffers scan data internally and continues transmitting"
+    log_info "  over USB after the head returns home. scanimage keeps reading until"
+    log_info "  all buffered data is received. This is normal and expected."
+    log_info "  A 2 ms yield (usleep) is injected after zero-byte reads to reduce"
+    log_info "  CPU usage. The CPU load does NOT affect scan speed — the bottleneck"
+    log_info "  is the 12 Mbit/s USB link, not the host CPU."
+    echo
+    log_info "Tips for faster scans:"
     log_info "    - Use grayscale mode (3x less data than color)"
     log_info "    - Use 150 DPI instead of 300 DPI (4x less data)"
     log_info "    - Ensure usblp is unbound: echo '<intf>' | sudo tee /sys/bus/usb/drivers/usblp/unbind"

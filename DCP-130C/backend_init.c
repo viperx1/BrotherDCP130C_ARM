@@ -146,8 +146,36 @@ static void probe_usb_environment(void) {
             if (usb_ver_major >= 2) {
                 fprintf(stderr, "%s [BROTHER2] usb: The DCP-130C is \"USB 2.0 Full-Speed\" — it is USB 2.0 compliant\n"
                         "[BROTHER2] usb: but only supports Full-Speed (12 Mbit/s), NOT High-Speed (480 Mbit/s).\n"
-                        "[BROTHER2] usb: This is BY DESIGN — the scanner hardware has no High-Speed capability.\n"
-                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput for this device.\n", debug_ts());
+                        "[BROTHER2] usb: This is a silicon-level limit — the scanner has no High-Speed PHY.\n"
+                        "[BROTHER2] usb: Forcing USB 2.0 High-Speed is NOT possible with this device.\n"
+                        "[BROTHER2] usb: ~70 KB/s is the expected maximum throughput.\n", debug_ts());
+            }
+            fprintf(stderr, "%s [BROTHER2] cpu: high CPU during scans is normal — the USB bulk-read\n"
+                    "[BROTHER2] cpu: loop polls for data. A 2 ms yield reduces CPU load.\n"
+                    "[BROTHER2] cpu: CPU usage does NOT affect scan speed (USB is the bottleneck).\n"
+                    "[BROTHER2] cpu: the scanner head finishes physically before data transfer ends —\n"
+                    "[BROTHER2] cpu: the DCP-130C buffers data internally and keeps sending over USB.\n", debug_ts());
+        }
+
+        /* Check host controller port speed */
+        {
+            char parent_path[512], parent_speed[16];
+            /* Parent hub/port: strip last component after the final '.' or '-' */
+            snprintf(parent_path, sizeof(parent_path), "%s", ent->d_name);
+            char *sep = strrchr(parent_path, '.');
+            if (!sep) sep = strrchr(parent_path, '-');
+            if (sep) {
+                *sep = '\0';
+                char hpath[512];
+                snprintf(hpath, sizeof(hpath), "/sys/bus/usb/devices/%s/speed", parent_path);
+                if (read_sysfs(hpath, parent_speed, sizeof(parent_speed)) > 0) {
+                    int host_speed = atoi(parent_speed);
+                    fprintf(stderr, "%s [BROTHER2] usb: host port speed: %s Mbit/s", debug_ts(), parent_speed);
+                    if (host_speed >= 480)
+                        fprintf(stderr, " — host supports High-Speed; device is the bottleneck\n");
+                    else
+                        fprintf(stderr, "\n");
+                }
             }
         }
 

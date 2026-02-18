@@ -637,3 +637,66 @@ CEOF
 @test "scanner: ReadDeviceData EOF message includes timestamp" {
     grep -q 'tm_hour.*tm_min.*tm_sec' "$PROJECT_ROOT/install_scanner.sh"
 }
+
+# --- USB speed diagnosis tests ---
+
+@test "scanner: diagnose_usb_speed function exists" {
+    grep -q 'diagnose_usb_speed()' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: diagnose_usb_speed reads sysfs speed attribute" {
+    grep -q '/sys/bus/usb/devices/\*/idVendor' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'speed' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: diagnose_usb_speed explains Full-Speed is hardware limited" {
+    grep -q 'Full-Speed transceiver' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'silicon-level limitation' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: diagnose_usb_speed checks host controller speed" {
+    grep -q 'Host port speed' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Host supports High-Speed' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains USB 2.0 High-Speed cannot be forced" {
+    grep -q 'Forcing USB 2.0 High-Speed.*NOT possible' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'Full-Speed PHY' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+# --- CPU usage analysis tests ---
+
+@test "scanner: display_info explains CPU usage during scanning" {
+    grep -q 'CPU usage during scanning' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'USB bulk-read polling loop' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains scanner buffer drain behavior" {
+    grep -q 'scanner head may finish physically' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'buffers scan data internally' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "scanner: display_info explains CPU does not affect scan speed" {
+    grep -q 'CPU load does NOT affect scan speed' "$PROJECT_ROOT/install_scanner.sh"
+    grep -q 'USB link.*not the host CPU' "$PROJECT_ROOT/install_scanner.sh"
+}
+
+@test "backend_init: reports CPU usage explanation for Full-Speed devices" {
+    grep -q 'cpu:.*high CPU during scans is normal' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'cpu:.*CPU usage does NOT affect scan speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: explains scanner buffer drain behavior" {
+    grep -q 'scanner head finishes physically' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'buffers data internally' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: checks host controller port speed" {
+    grep -q 'host port speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'host supports High-Speed' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
+
+@test "backend_init: explains forcing High-Speed is not possible" {
+    grep -q 'Forcing USB 2.0 High-Speed is NOT possible' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+    grep -q 'no High-Speed PHY' "$PROJECT_ROOT/DCP-130C/backend_init.c"
+}
